@@ -468,7 +468,7 @@ export function Community() {
       <Stack gap={16}>
         <div style={headerStyle}>
           <div>
-            <div style={titleStyle}>Dataset Commons</div>
+            <div style={titleStyle}>Open Datasets</div>
             <span style={hintStyle}>
               Assemble datasets together, vote items in, train LoRAs, and track contributor shares.
             </span>
@@ -502,7 +502,7 @@ export function Community() {
 
         {loadState === 'not-permitted' && (
           <Alert color="warning" title="Community storage isn't available yet" data-testid="dc-community-unavailable">
-            Dataset Commons reads datasets, votes, and tracked credit from shared community storage, and this
+            Open Datasets reads datasets, votes, and tracked credit from shared community storage, and this
             session doesn't have that access yet — so instead of showing an empty community, it shows this.{' '}
             {viewerId == null ? (
               <Button size="sm" onClick={() => requestSignIn()} data-testid="dc-community-signin">

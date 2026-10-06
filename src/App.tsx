@@ -565,7 +565,7 @@ export function App() {
       <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
         <Card padding="lg" style={cardStyle}>
           <Stack gap={16}>
-            <strong style={titleStyle}>Dataset Commons</strong>
+            <strong style={titleStyle}>Open Datasets</strong>
             <SegmentedControl
               fullWidth
               aria-label="Generation sample"
@@ -592,7 +592,7 @@ export function App() {
       <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
         <Card padding="lg" style={cardStyle}>
           <Stack gap={16}>
-            <strong style={titleStyle}>Dataset Commons</strong>
+            <strong style={titleStyle}>Open Datasets</strong>
             <SegmentedControl
               fullWidth
               aria-label="Generation sample"
@@ -618,7 +618,7 @@ export function App() {
     <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
       <Card padding="lg" style={cardStyle}>
         <Stack gap={16}>
-          <strong style={titleStyle}>Dataset Commons</strong>
+          <strong style={titleStyle}>Open Datasets</strong>
 
           {/* Mode toggle: txt2img (primary, runnable today) ⇄ Comfy on Civitai
               (secondary sample, invite-only beta). Switching swaps the input

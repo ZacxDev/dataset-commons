@@ -1,4 +1,4 @@
-# Dataset Commons
+# Open Datasets
 
 A Civitai **page money-path** App (Vite + React + TypeScript), wired to
 the published App SDK (`@civitai/blocks-react` + `@civitai/app-sdk`). It mounts

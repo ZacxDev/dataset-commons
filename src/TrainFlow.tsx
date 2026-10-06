@@ -249,7 +249,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           }),
         ).catch(() => {
           persistedRunLinkRef.current = null;
-          setNotice('The run finished, but recording its LoRA link in Dataset Commons failed. Refresh before publishing.');
+          setNotice('The run finished, but recording its LoRA link in Open Datasets failed. Refresh before publishing.');
         });
       }
       // Trainer-fee ledger credit: once, keyed by the workflow id, once the run
@@ -431,7 +431,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
         persistedSnapshotRef.current = frozen.snapshotId;
       } catch {
         setPhase('quoted');
-        setNotice('Could not record the frozen snapshot in Dataset Commons, so the training run was not submitted. No Buzz was charged.');
+        setNotice('Could not record the frozen snapshot in Open Datasets, so the training run was not submitted. No Buzz was charged.');
         return;
       }
     }
