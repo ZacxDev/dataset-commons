@@ -1,0 +1,136 @@
+// Test/dev-only transport wiring. NOT imported by production code (App.tsx uses
+// the SDK hooks, which read the build-time env allowlist via getTransport()).
+//
+// The SDK's IframeTransport is a process-wide singleton: the FIRST getTransport()
+// call decides its origin allowlist. In production that allowlist comes from
+// VITE_BLOCK_ALLOWED_PARENT_ORIGINS (baked in at build). But the mock host (dev
+// harness AND vitest) replies from `window.location.origin`, and the transport
+// DROPS any inbound message whose origin isn't allowlisted — so in harness/test
+// mode we MUST initialize the transport with `window.location.origin` allowed
+// BEFORE any hook (or the mock host) runs. That's what this does.
+
+import { getTransport } from '@civitai/blocks-react';
+import { resetTransport } from '@civitai/blocks-react/testing';
+// 🔴 `createLiveHost` lives on `/live`, NOT `/testing` (moved in
+// @civitai/blocks-react@0.55.0). The split is the warning: everything on
+// `/testing` is a mock, while `createLiveHost` forwards the real App-Block
+// protocol to the real backend and a successful generation DEBITS THE TOKEN
+// HOLDER'S OWN BUZZ. Keep these two imports on separate lines so the money
+// path is visible at the import site.
+import { createLiveHost } from '@civitai/blocks-react/live';
+
+/**
+ * Dev harness modes. Selected by `VITE_HARNESS_MODE` (the `dev:harness` and
+ * `dev:live` npm scripts set it):
+ *
+ *  - `'mock'`  (default) — the SDK mock host. Synthetic, no real Buzz, no
+ *    network. Safe to spam.
+ *  - `'live'`  — talk to a REAL host with a REAL block token (spends REAL Buzz
+ *    and real compute) via the SDK's `createLiveHost`, which forwards the
+ *    App postMessage protocol to the real Civitai backend (Bearer = the
+ *    pasted dev token). Needs a `VITE_LIVE_BLOCK_TOKEN`; until you paste one,
+ *    live mode FAILS SAFE (see {@link resolveLiveConfig}) — it never silently
+ *    spends.
+ */
+export type HarnessMode = 'mock' | 'live';
+
+/** Read the configured harness mode (defaults to `'mock'`). */
+export function getHarnessMode(): HarnessMode {
+  return import.meta.env.VITE_HARNESS_MODE === 'live' ? 'live' : 'mock';
+}
+
+/**
+ * Initialize the SDK transport with the current page origin allowlisted, so the
+ * mock host's `window.location.origin` replies are accepted. Call this once,
+ * before rendering, in the dev harness entry. Idempotent at the singleton level
+ * (the first call wins).
+ */
+export function installHarnessTransport() {
+  getTransport({ allowedParentOrigins: [window.location.origin] });
+}
+
+/**
+ * Reset + re-initialize the transport for a single test. Call in `beforeEach`
+ * so each test gets a fresh singleton whose allowlist contains the jsdom origin
+ * (`window.location.origin`). Without the reset, the first test's singleton
+ * leaks into the next.
+ */
+export function resetHarnessTransport() {
+  resetTransport();
+  getTransport({ allowedParentOrigins: [window.location.origin] });
+}
+
+/**
+ * The result of trying to wire LIVE mode. `ready: false` means no dev block
+ * token was provided — the harness must show {@link reason} and NOT mount a
+ * real money path. `ready: true` carries the token + backend base URL used to
+ * build the real {@link createLiveHost} (see {@link installLiveHost}).
+ */
+export type LiveConfig =
+  | { ready: false; reason: string }
+  | { ready: true; token: string; backendBaseUrl: string };
+
+/**
+ * Resolve live-mode config from env. FAIL-SAFE by design: live mode forwards
+ * the protocol to the REAL backend and SPENDS REAL BUZZ, so it refuses to mount
+ * unless a dev block token (`VITE_LIVE_BLOCK_TOKEN`) is present — returning
+ * `{ ready: false }` with a clear reason otherwise. The token is a short-lived
+ * RS256 JWT minted by the server dev-token endpoint (`POST /api/v1/blocks/dev-token`,
+ * invite-gated); it goes in `VITE_LIVE_BLOCK_TOKEN` in the git-ignored
+ * `.env.development.local` — never in `.env.example` or `.env.production`, which
+ * `civitai app submit` UPLOADS. `civitai app dev-token <slug> --env >> .env.development.local`.
+ */
+export function resolveLiveConfig(): LiveConfig {
+  const token = import.meta.env.VITE_LIVE_BLOCK_TOKEN as string | undefined;
+  // SAME-ORIGIN by design. createLiveHost fetches `${backendBaseUrl}/api/...`;
+  // with an empty base it fetches `/api/...` against THIS dev server, which the
+  // vite `server.proxy` (vite.config.ts) forwards to civitai with a rewritten
+  // Origin. That makes the request same-origin (no CORS preflight, N1) AND lets
+  // the proxy satisfy civitai's tRPC origin gate (N2) — the two failures that
+  // broke direct `https://civitai.com` fetches from localhost. The proxy TARGET
+  // is overridden by VITE_LIVE_HOST_ORIGIN (read in vite.config.ts), not here.
+  // createLiveHost accepts '' (it strips trailing slashes and prefixes paths).
+  const backendBaseUrl = '';
+
+  if (!token) {
+    return {
+      ready: false,
+      reason: 'Set one up below to run against your own account.',
+    };
+  }
+  return { ready: true, token, backendBaseUrl };
+}
+
+/**
+ * Mount the SDK's real LIVE host (`createLiveHost`) for `dev:live`. It forwards
+ * the App postMessage protocol to the real Civitai backend using the
+ * pasted dev token (Bearer), so a successful submit SPENDS REAL BUZZ against
+ * real compute. Like the mock host, it replies from `window.location.origin`,
+ * so the SDK transport must allow this origin first ({@link installHarnessTransport}).
+ *
+ * The live host SERVES the resource pickers locally (it opens an in-harness
+ * catalog overlay backed by `/api/v1/blocks/models` and resolves a real
+ * BlockCheckpointInfo / BlockResourceInfo), so `useCheckpointPicker` /
+ * `useResourcePicker` work in `dev:live` exactly as in prod. It does NOT support
+ * SET_USER_CHECKPOINT, the App-Storage KV protocol, or in-band Buzz purchase —
+ * those reply "not supported in live v1" (use mock mode for them).
+ *
+ * Returns the `uninstall()` teardown.
+ */
+export function installLiveHost(config: { token: string; backendBaseUrl: string }): () => void {
+  // Same origin requirement as the mock host: createLiveHost fires its replies
+  // from window.location.origin, which the SDK transport drops unless allowed.
+  installHarnessTransport();
+  const host = createLiveHost({
+    blockToken: config.token,
+    backendBaseUrl: config.backendBaseUrl,
+    // Pass a BOUND fetch. The SDK's live host + its in-harness picker overlay
+    // fetch the catalog through this `fetchImpl`; a bare `globalThis.fetch`
+    // reference called detached throws "Illegal invocation" in the browser
+    // (a DOM binding requirement), which breaks the picker's catalog load. A
+    // small arrow wrapper preserves the `window` receiver so the picker
+    // populates. Harmless on the platform (prod is the host, not this).
+    fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
+  });
+  return host.install();
+}

@@ -1,0 +1,56 @@
+:root {
+  /* DARK ONLY by default (Archive Lab): the app never follows the browser/OS
+     scheme. Light exists solely under the explicit in-app override selector
+     `[data-theme='light']` below. */
+  color-scheme: dark;
+}
+
+/* Archive Lab token overrides (spec §8), scoped to the Train surface root.
+   Dark is the unqualified base; the light block applies ONLY when the user
+   explicitly toggles the override in-app. Amber (--civitai-color-warning) is
+   reserved for ledger/earnings surfaces. */
+[data-dc-archive] {
+  --civitai-color-primary: #22b8cf;
+  --civitai-color-primary-hover: #3bc9de;
+  --civitai-color-warning: #e8a33d;
+  --dc-archive-bg: #0f151b;
+  --dc-archive-surface: #16202a;
+  color-scheme: dark;
+}
+
+[data-dc-archive][data-theme='light'] {
+  --civitai-color-primary: #0b7285;
+  --civitai-color-primary-hover: #1098ad;
+  --dc-archive-bg: #f1f5f8;
+  --dc-archive-surface: #ffffff;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+}
+
+body {
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* Focus affordance for any raw textarea/button (the W6 /ui pack styles its own
+   controls). Use the pack's brand accent so the outline matches, not a clashing
+   gold; --civitai-color-primary is defined by the stylesheet
+   @civitai/blocks-react/ui injects. Every --civitai-color-* token referenced
+   anywhere under templates/ is checked against that pack's published token set
+   by internal/scaffold/design_tokens_guard_test.go — see its testdata ledger. */
+textarea:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--civitai-color-primary);
+  outline-offset: 2px;
+}

@@ -1,37 +1,1072 @@
-import { useBlockContext } from '@civitai/blocks-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-// Starter block: prints the slot context (model + viewer info) so the
-// developer can verify the iframe handshake is alive before doing anything
-// real. Replace with your actual UI.
+import {
+  useBlockBreakpoint,
+  useBlockContext,
+  useBlockResize,
+  useBlockToken,
+  useBuzzBalance,
+  useBuzzWorkflow,
+  useCheckpointPicker,
+  useRequestConsent,
+  useRequestSignIn,
+  useResourcePicker,
+} from '@civitai/blocks-react';
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Group,
+  SegmentedControl,
+  Stack,
+  Textarea,
+  injectBlocksStyles,
+} from '@civitai/blocks-react/ui';
+import type { BlockWorkflowSnapshot, BuzzAccountType } from '@civitai/app-sdk/blocks';
+
+import {
+  ACCOUNT_CHOICES,
+  PROMPT_MAX,
+  accountLabel,
+  buildWorkflowBody,
+  firstImageUrl,
+  formatCost,
+  hasBudgetedScope,
+  isBusyPhase,
+  phaseForSnapshot,
+  phaseForSubmitError,
+  spentAccountLabel,
+  submitErrorReason,
+  isTerminalStatus,
+  type AccountChoice,
+  type GenPhase,
+} from './generation.js';
+import {
+  DEFAULT_CHECKPOINT,
+  LORA_STRENGTH_MAX,
+  LORA_STRENGTH_MIN,
+  MAX_LORAS,
+  addLora,
+  checkpointFromPick,
+  loraFromPick,
+  removeLora,
+  setLoraWeight,
+  type CheckpointOption,
+  type LoraOption,
+} from './models.js';
+import { STARTER_COMFY_RECIPE, buildComfyBody } from './comfy.js';
+import { Community } from './Community.js';
+import { TrainFlow } from './TrainFlow.js';
+
+/**
+ * Which sample the page is driving.
+ *  - `txt2img` — the PRIMARY, runnable-today path (hardcoded-default checkpoint +
+ *    host checkpoint/LoRA pickers).
+ *  - `comfy`  — the SECONDARY Comfy on Civitai (customComfy) sample: a
+ *    code-reviewed recipe (`starter-comfy-txt2img`), which IS registered
+ *    server-side. On THIS arm the app sends only the recipe id + a prompt and
+ *    the server owns the graph — but an app CAN ship its own graph;
+ *    that is the separate INLINE arm, built and unit-tested in comfy.ts. Comfy is
+ *    invite-only beta on live civitai.com (works end-to-end against the mock host).
+ */
+type GenMode = 'txt2img' | 'comfy' | 'train' | 'community';
+
+// Inject the W6 component pack's stylesheet at module init (before first paint)
+// to avoid the documented one-frame FOUC (the pack's components also call
+// useBlocksStyles() internally, but injecting up front means the first paint is
+// already styled). Idempotent.
+injectBlocksStyles();
+
+/**
+ * Dataset Commons — a full-page (W10) money-path App whose ENTIRE interface is
+ * built from the `@civitai/blocks-react/ui` W6 component pack (Button, Textarea,
+ * Card, Stack, Group, Alert, Badge). It exercises the page money path end-to-end:
+ * estimate -> (lazy consent) -> submit -> poll -> real Buzz spend, using the
+ * published SDK hooks (NEVER raw postMessage to the parent with a wildcard origin
+ * — the SDK does the origin-checked messaging safely).
+ *
+ * Page-native constraints:
+ *  - slot = app.page (entity=none) via the top-level `page:{}` manifest object.
+ *  - scopes = ['ai:write:budgeted'] ONLY. The viewer's per-pool balance is read
+ *    via the host-mediated `useBuzzBalance()` bridge (GET_BUZZ_BALANCE) — the
+ *    host resolves the viewer from the block token, so NO `buzz:read:self` scope
+ *    is needed and the block never touches the balance API directly. The app does
+ *    NOT render a balance readout: your app runs inside the Civitai chrome, which
+ *    already shows the viewer's balance — duplicating it is noise. The balance is
+ *    read only to annotate the "Spend from" account picker. (Insufficient Buzz is
+ *    still ALSO surfaced from a `failed` snapshot, as a backstop.)
+ *  - budget comes from manifest `page.buzzBudgetPerGen`; a page is stateless.
+ *  - a page has no HOST model context (entity=none), so the app ships a curated
+ *    default checkpoint (DEFAULT_CHECKPOINT) and lets the user change it via the
+ *    HOST's resource picker (`useCheckpointPicker` / `useResourcePicker`). The
+ *    block never browses a catalog itself — the host serves the picker (in
+ *    dev:live AND on the real platform). A pick is DISCOVERY ONLY — the server
+ *    re-validates + re-prices it at estimate/submit.
+ *  - on top of the checkpoint the user can add up to MAX_LORAS LoRAs, each with
+ *    an adjustable weight; they ride along as `additionalResources` in the body.
+ *    LoRA picks + weights are ALSO discovery only — the server re-validates
+ *    (LoRA-only? base-model compatible? entitled?) + re-prices before any spend.
+ *  - `ai:write:budgeted` is consent-gated -> withheld at mint, requested lazily
+ *    on first Generate via useRequestConsent; the grant arrives as a
+ *    TOKEN_REFRESH carrying the scope, which we observe + retry.
+ *
+ * Per-account Buzz: the viewer can pick which pool (Blue/Green/Yellow) funds the
+ * generation, or leave it on Auto (the default — host-chosen order, UNCHANGED
+ * behavior: Auto threads no `accountType`). A pick is a *preference*: the server
+ * clamps it to what the viewer holds + the app's content-rating domain, and
+ * REJECTS a pool the domain forbids (handled gracefully -> a friendly note +
+ * reset to Auto). After a gen, `snapshot.spentAccountType` tells you which pool
+ * primarily funded it (can be blue/free).
+ */
 export function App() {
-  const ctx = useBlockContext();
+  const { ready, viewer, theme } = useBlockContext();
+  const token = useBlockToken();
+  const { estimate, submit, poll } = useBuzzWorkflow();
+  const { requestConsent } = useRequestConsent();
+  const { requestSignIn } = useRequestSignIn();
+  // The host-mediated pickers. `open(...)` asks the HOST to open its own native
+  // resource modal; the block never sees a catalog, only the chosen resource.
+  // Identical protocol in dev:harness (mock pick), dev:live (host-served
+  // overlay), and on the real platform. A pick is DISCOVERY ONLY.
+  const { open: openCheckpointPicker } = useCheckpointPicker();
+  const { open: openResourcePicker } = useResourcePicker();
+  // The viewer's per-pool Buzz balance, read host-side (no scope needed). NOT
+  // rendered as a balance readout — the surrounding Civitai chrome already shows
+  // the viewer's balance, so an in-app copy is redundant. It is read for ONE
+  // purpose: annotating which account can actually fund a generation in the
+  // "Spend from" picker below. It NEVER blocks generation (a missing/errored
+  // balance still lets the user generate; the server is the real gate).
+  const { balance, refetch: refetchBalance } = useBuzzBalance();
+
+  const anon = ready && !viewer;
+  const granted = hasBudgetedScope(token.scopes);
+
+  const rootRef = useRef<HTMLDivElement>(null);
+  useBlockResize(rootRef);
+
+  // WIDTH-ADAPTIVE LAYOUT. `useBlockBreakpoint` reports the width tier of THIS
+  // BLOCK'S OWN BOX — a container query, not a viewport media query — because a
+  // block renders inside whatever slot the host gave it and SLOT WIDTH IS NOT
+  // MONOTONIC IN VIEWPORT WIDTH (the `model.sidebar_top` slot is ~360px on a
+  // phone and only ~430px on a 1440px desktop). Any viewport-based test —
+  // a viewport media query, or the window's own width read from JS — asks about
+  // the browser window, which is a question nobody here needed answered.
+  //
+  // Scale (CSS px, Civitai's own — NOT Mantine's stock em scale, which agrees on
+  // `sm` alone): xs 480 · sm 768 · md 1024 · lg 1184 · xl 1440. The same numbers
+  // are published as the `--civitai-bp-*` custom properties.
+  //
+  // 🔴 THOSE TOKENS CANNOT BE USED IN A QUERY CONDITION. `@media (min-width:
+  // var(--civitai-bp-sm))` is silently DEAD — a media/container query prelude is
+  // evaluated before custom properties are substituted, so the rule simply never
+  // applies: no error, no warning, no console noise. Write the pixel value out,
+  // or branch in JS the way this component does. (An `internal/scaffold` guard in
+  // the CLI repo fails on a `var()` inside any `@media`/`@container` prelude in
+  // these templates, for exactly this reason.)
+  //
+  // Re-render safety: the hook stores the resolved TIER, not the width, so
+  // dragging a window edge 200px inside one tier re-renders this block zero
+  // times. Full guide: https://developer.civitai.com/apps/guide/responsive
+  const bp = useBlockBreakpoint(rootRef);
+  // ONE structural decision, deliberately. `below('sm')` is the "am I in a narrow
+  // slot?" question every block eventually asks; everything else here is fluid
+  // CSS already. `measured` is not gated on because the fallback (`'base'`, i.e.
+  // narrow) is the safe branch for a block — see the hook's own docs for when to
+  // gate on it instead.
+  const narrow = bp.below('sm');
+
+  const [mode, setMode] = useState<GenMode>('txt2img');
+  const [prompt, setPrompt] = useState('');
+  const [touched, setTouched] = useState(false);
+  const [account, setAccount] = useState<AccountChoice>('auto');
+  const [phase, setPhase] = useState<GenPhase>('idle');
+  const [estimatedCost, setEstimatedCost] = useState<number | null>(null);
+  const [actualCost, setActualCost] = useState<number | null>(null);
+  const [spentAccount, setSpentAccount] = useState<BuzzAccountType | null>(null);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // The selected checkpoint. Starts on the curated DEFAULT (works at first paint,
+  // before the user opens the picker); the host picker replaces it. A pick is
+  // DISCOVERY ONLY — the server re-validates + re-prices it.
+  const [checkpoint, setCheckpoint] = useState<CheckpointOption>(DEFAULT_CHECKPOINT);
+  // The LoRAs the user has layered on top of the checkpoint, with their weights.
+  // Drives `additionalResources` in the body. All mutations go through the pure
+  // models.ts helpers (dedup, MAX_LORAS cap, weight clamp). DISCOVERY ONLY.
+  const [loras, setLoras] = useState<LoraOption[]>([]);
+  // True while a host picker modal is open, so the trigger button shows progress
+  // and we don't fire a second open over the first.
+  const [pickerBusy, setPickerBusy] = useState(false);
+
+  // True once the user clicked Generate while the scope was missing — so when
+  // the consent grant lands (granted flips true) we auto-resume the submit.
+  const consentPendingRef = useRef(false);
+  // Cancellation token for the in-flight poll loop.
+  const pollCancelRef = useRef<{ cancelled: boolean } | null>(null);
+
+  // Latest poll fn in a ref so the poll loop always calls the current hook
+  // instance without re-subscribing.
+  const pollRef = useRef(poll);
+  pollRef.current = poll;
+
+  useEffect(() => {
+    return () => {
+      if (pollCancelRef.current) pollCancelRef.current.cancelled = true;
+    };
+  }, []);
+
+  // Refetch the balance after a successful generation debits it.
+  useEffect(() => {
+    if (phase === 'succeeded') refetchBalance();
+  }, [phase, refetchBalance]);
+
+  // The server rejected the picked pool for this app's content-rating domain.
+  // Surface a friendly note and fall back to Auto so the retry just works.
+  const handleAccountRejected = useCallback(() => {
+    setAccount('auto');
+    setError(
+      "That Buzz account can't be used for this app's content rating — switched back to Auto. Try again.",
+    );
+  }, []);
+
+  // Apply a (submit- or poll-returned) snapshot to UI state.
+  const applySnapshot = useCallback(
+    (snap: BlockWorkflowSnapshot) => {
+      setActualCost(snap.cost?.total ?? null);
+      const url = firstImageUrl(snap);
+      if (url) setImageUrl(url);
+      const next = phaseForSnapshot(snap);
+      setPhase(next);
+      if (next === 'succeeded') {
+        // The pool that PRIMARILY funded the gen (largest debit) — can be blue
+        // (free/earned), not necessarily the paid account. Informational only.
+        setSpentAccount(snap.spentAccountType ?? null);
+      }
+      if (next === 'failed' || next === 'insufficient') {
+        setError(snap.error ?? 'Generation failed.');
+      }
+      if (next === 'account-rejected') {
+        handleAccountRejected();
+      }
+    },
+    [handleAccountRejected],
+  );
+
+  /**
+   * Drive a single workflow to terminal with an adaptive-backoff poll loop.
+   * `submit()` does NOT auto-poll (SDK contract) — the caller owns the loop.
+   *
+   * Robustness contract: a `poll()` THROW is a transport/infra blip (a network
+   * hiccup, a not-yet-rolled-out backend pod 401ing for a few seconds, …) — NOT
+   * a workflow failure. A workflow that the orchestrator actually failed comes
+   * back as a 'failed'/'expired'/'canceled' SNAPSHOT, never a throw. So we retry
+   * a throw with bounded backoff instead of failing the generation (which would
+   * mark a server-side SUCCESS as FAILED — the round-5 dogfood bug). Only after
+   * MAX_TRANSIENT_ERRORS consecutive failures (the backend is genuinely
+   * unreachable, not just blipping) do we give up with a clear transport error.
+   * The error counter resets on any successful poll, so a long generation that
+   * hits the occasional blip never accumulates toward the cap.
+   */
+  const runPollLoop = useCallback(
+    (workflowId: string) => {
+      if (pollCancelRef.current) pollCancelRef.current.cancelled = true;
+      const tok = { cancelled: false };
+      pollCancelRef.current = tok;
+
+      // Backoff between normal (snapshot-returning) polls.
+      const SCHEDULE_MS = [2000, 2000, 3000, 5000, 8000];
+      // Shorter backoff between retries of a transient transport error, so a
+      // brief blip recovers fast.
+      const RETRY_MS = [500, 1000, 2000, 4000];
+      // Give up only after this many CONSECUTIVE transport failures (~30s of
+      // retries) — a genuinely-down backend, not a transient blip.
+      const MAX_TRANSIENT_ERRORS = 8;
+      let attempt = 0;
+      let consecutiveErrors = 0;
+
+      const tick = async () => {
+        if (tok.cancelled) return;
+        let snap: BlockWorkflowSnapshot;
+        try {
+          snap = await pollRef.current(workflowId);
+        } catch {
+          // Transient hiccup — retry with bounded backoff. A real terminal
+          // failure surfaces as a 'failed'/'expired' snapshot, not a throw.
+          if (tok.cancelled) return;
+          consecutiveErrors += 1;
+          if (consecutiveErrors > MAX_TRANSIENT_ERRORS) {
+            // Backend unreachable after repeated retries — surface a transport
+            // error (distinct from a workflow failure) and stop.
+            setPhase('failed');
+            setError(
+              "Couldn't reach the generation service after several retries. " +
+                'Your generation may still be running — refresh to check.',
+            );
+            return;
+          }
+          const delay = RETRY_MS[Math.min(consecutiveErrors - 1, RETRY_MS.length - 1)];
+          setTimeout(tick, delay);
+          return;
+        }
+        if (tok.cancelled) return;
+        // A successful poll clears the transient-error streak.
+        consecutiveErrors = 0;
+        applySnapshot(snap);
+        if (isTerminalStatus(snap.status)) return;
+        const delay = SCHEDULE_MS[Math.min(attempt, SCHEDULE_MS.length - 1)];
+        attempt += 1;
+        setTimeout(tick, delay);
+      };
+
+      setTimeout(tick, 0);
+    },
+    [applySnapshot],
+  );
+
+  // The estimate->submit->poll sequence, factored out so both the direct click
+  // and the post-consent auto-resume can call it.
+  const runGeneration = useCallback(async () => {
+    setError(null);
+    setImageUrl(null);
+    setActualCost(null);
+    setSpentAccount(null);
+    // The ONLY difference between the two samples is the body: a textToImage body
+    // (checkpoint + LoRAs) vs a customComfy recipe body (server-owned graph).
+    // Everything downstream — estimate/consent/submit/poll — is shared. Auto
+    // ('auto') threads NO accountType — today's default host funding order.
+    const body =
+      mode === 'comfy'
+        ? buildComfyBody(prompt, account)
+        : buildWorkflowBody(prompt, checkpoint, loras, account);
+
+    // Classify a submit/estimate error into a terminal phase. The `'gated'`
+    // (Comfy on Civitai invite-only-beta) panel is COMFY-MODE-SCOPED via
+    // phaseForSubmitError: the real gate strings ("Apps are not enabled" flag
+    // gate, "Apps authoring is not enabled" author gate, and the pre-deploy
+    // unknown-recipe enum rejection) are SHARED with the txt2img path, so a
+    // txt2img failure must NEVER render the Comfy-specific copy — it falls through
+    // to the failed/insufficient/account-rejected classification, unchanged from
+    // before the Comfy sample.
+    const classifyError = (msg: string | null | undefined): GenPhase =>
+      phaseForSubmitError(msg, mode === 'comfy');
+
+    // 1) Estimate (best-effort — a failed estimate doesn't block submit; the
+    //    host re-prices at submit anyway). A gate / disallowed-account /
+    //    insufficient estimate DOES short-circuit (submitting would fail-closed).
+    setPhase('estimating');
+    try {
+      const est = await estimate(body);
+      if (est.status === 'failed' || est.error) {
+        const estPhase = classifyError(est.error);
+        if (estPhase === 'gated') {
+          setPhase('gated');
+          return;
+        }
+        if (estPhase === 'account-rejected') {
+          setPhase('account-rejected');
+          handleAccountRejected();
+          return;
+        }
+        if (estPhase === 'insufficient') {
+          setPhase('insufficient');
+          setError(est.error ?? 'Not enough Buzz.');
+          return;
+        }
+        setEstimatedCost(null);
+      } else {
+        setEstimatedCost(est.cost?.total ?? null);
+      }
+    } catch {
+      setEstimatedCost(null);
+    }
+
+    // 2) Submit (the real spend).
+    setPhase('submitting');
+    let snap: BlockWorkflowSnapshot;
+    try {
+      snap = await submit(body);
+    } catch (err) {
+      // NOT `err.message` — under blocks-react ^0.44 that is a generic template
+      // and the server's reason rides on `.snapshot.error`. See submitErrorReason.
+      const msg = submitErrorReason(err);
+      const failPhase = classifyError(msg);
+      setPhase(failPhase);
+      if (failPhase === 'account-rejected') handleAccountRejected();
+      else if (failPhase !== 'gated') setError(msg);
+      return;
+    }
+
+    // A host can return an instant terminal snapshot (cached / instant-fail).
+    applySnapshot(snap);
+    if (isTerminalStatus(snap.status)) return;
+
+    // 3) Poll to terminal.
+    setPhase('polling');
+    if (snap.workflowId) runPollLoop(snap.workflowId);
+  }, [
+    mode,
+    prompt,
+    checkpoint,
+    loras,
+    account,
+    estimate,
+    submit,
+    applySnapshot,
+    runPollLoop,
+    handleAccountRejected,
+  ]);
+
+  // The actual gate: sign-in -> consent -> generate. Wired straight to the
+  // Generate button — the cost is already shown on the button, so there's no
+  // separate confirm step (consent is the real, host-driven spend gate).
+  const proceed = useCallback(() => {
+    // Anon: convert the click into a host login prompt. Generate is server-gated
+    // anyway (an anon token carries no budgeted scope).
+    if (!viewer) {
+      requestSignIn();
+      return;
+    }
+    // Lazy consent: if the budgeted scope isn't granted yet, ask the host to
+    // open its consent UI and remember the intent. The grant arrives as a
+    // TOKEN_REFRESH (granted flips true) -> the effect below auto-resumes.
+    if (!granted) {
+      consentPendingRef.current = true;
+      setPhase('needs-consent');
+      requestConsent({ scopes: ['ai:write:budgeted'] });
+      return;
+    }
+    void runGeneration();
+  }, [viewer, granted, requestSignIn, requestConsent, runGeneration]);
+
+  // Auto-resume after a consent grant.
+  useEffect(() => {
+    if (granted && consentPendingRef.current) {
+      consentPendingRef.current = false;
+      void runGeneration();
+    }
+  }, [granted, runGeneration]);
+
+  // Switch the sample being driven. Cancels any in-flight poll and clears the
+  // transient result state so the two samples never show each other's output.
+  const switchMode = useCallback((next: GenMode) => {
+    if (pollCancelRef.current) pollCancelRef.current.cancelled = true;
+    consentPendingRef.current = false;
+    setMode(next);
+    setPhase('idle');
+    setError(null);
+    setImageUrl(null);
+    setEstimatedCost(null);
+    setActualCost(null);
+    setSpentAccount(null);
+  }, []);
+
+  // --- Host pickers (checkpoint + LoRA) ---
+  //
+  // Both open the HOST's native resource modal via the SDK hooks. The block
+  // never sees a catalog, a list, or any resource the user didn't pick. Every
+  // pick is DISCOVERY ONLY — the server re-validates + re-prices the id at
+  // estimate/submit, so threading a pick into the body is money-safe.
+
+  // Open the host's Checkpoint picker, pre-filtered to the current base-model
+  // family + pre-highlighting the current pick. On a selection, map it into the
+  // checkpoint state. A dismissal (`selected` undefined) leaves the pick as-is.
+  const onChangeModel = useCallback(async () => {
+    setPickerBusy(true);
+    try {
+      const { selected } = await openCheckpointPicker({
+        baseModelGroup: checkpoint.baseModel,
+        currentVersionId: checkpoint.versionId,
+      });
+      if (selected) setCheckpoint(checkpointFromPick(selected));
+    } finally {
+      setPickerBusy(false);
+    }
+  }, [openCheckpointPicker, checkpoint.baseModel, checkpoint.versionId]);
+
+  // Open the host's resource picker filtered to LoRAs, in the checkpoint's
+  // base-model family. Append the pick (deduped + MAX_LORAS-capped via addLora).
+  // A dismissal (`null`) is a no-op.
+  const onAddLora = useCallback(async () => {
+    setPickerBusy(true);
+    try {
+      const picked = await openResourcePicker({
+        resourceType: 'LORA',
+        baseModelGroup: checkpoint.baseModel,
+      });
+      if (picked) setLoras((cur) => addLora(cur, loraFromPick(picked)));
+    } finally {
+      setPickerBusy(false);
+    }
+  }, [openResourcePicker, checkpoint.baseModel]);
+
+  const onRemoveLora = (versionId: number) => setLoras((cur) => removeLora(cur, versionId));
+  const onLoraWeight = (versionId: number, weight: number) =>
+    setLoras((cur) => setLoraWeight(cur, versionId, weight));
+  // Whether the LoRA list can still take another. (The picker can return a dup;
+  // addLora drops it, but we also disable Add at the cap.)
+  const loraCapReached = loras.length >= MAX_LORAS;
+
+  const promptError =
+    touched && prompt.trim().length === 0 ? 'Enter a prompt to generate.' : undefined;
+  const busy = isBusyPhase(phase);
+  const isComfy = mode === 'comfy';
+
+  // The Model row's CONTENT, hoisted so the two layouts below share one copy of
+  // it. Only the container differs between the wide and narrow branches.
+  const modelRow = (
+    <>
+      <span style={currentModelStyle} title={checkpoint.label} data-testid="pm-model-label">
+        {checkpoint.label}
+        {checkpoint.baseModel ? ` (${checkpoint.baseModel})` : ''}
+      </span>
+      <Button
+        variant="light"
+        size="sm"
+        loading={pickerBusy}
+        onClick={() => void onChangeModel()}
+        data-testid="pm-change-model"
+      >
+        Change model
+      </Button>
+    </>
+  );
+
+  // ---- Render ----
+
+  if (!ready) {
+    return (
+      // Theme the block's OWN root; that's what the pack's CSS reads.
+      <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
+        <Card padding="lg">
+          <Group gap={10}>
+            <Badge color="info" variant="light">
+              loading
+            </Badge>
+            <span>Connecting to host…</span>
+          </Group>
+        </Card>
+      </div>
+    );
+  }
+
+  // Generate is one click: validate the prompt, then run the gate
+  // (sign-in -> consent -> spend). The button already shows the live cost, so
+  // there's no separate confirm step — consent is the real host-driven gate.
+  const onGenerateClick = () => {
+    setTouched(true);
+    if (prompt.trim().length === 0) return;
+    proceed();
+  };
+
+  // Dataset Commons community screens (Explore/detail/contribute/ledger).
+  if (mode === 'community') {
+    return (
+      <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
+        <Card padding="lg" style={cardStyle}>
+          <Stack gap={16}>
+            <strong style={titleStyle}>Dataset Commons</strong>
+            <SegmentedControl
+              fullWidth
+              aria-label="Generation sample"
+              value={mode}
+              onChange={(v) => switchMode(v as GenMode)}
+              data={[
+                { value: 'txt2img', label: 'Generate' },
+                { value: 'comfy', label: 'Comfy' },
+                { value: 'train', label: 'Train a LoRA' },
+                { value: 'community', label: 'Datasets & ledger' },
+              ]}
+            />
+            <Community />
+          </Stack>
+        </Card>
+      </div>
+    );
+  }
+
+  // The Dataset Commons Train surface (Option A′): its own screen body under
+  // the same shell/title/mode switch, so the generation sample stays untouched.
+  if (mode === 'train') {
+    return (
+      <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
+        <Card padding="lg" style={cardStyle}>
+          <Stack gap={16}>
+            <strong style={titleStyle}>Dataset Commons</strong>
+            <SegmentedControl
+              fullWidth
+              aria-label="Generation sample"
+              value={mode}
+              onChange={(v) => switchMode(v as GenMode)}
+              data={[
+                { value: 'txt2img', label: 'Generate' },
+                { value: 'comfy', label: 'Comfy' },
+                { value: 'train', label: 'Train a LoRA' },
+                { value: 'community', label: 'Datasets & ledger' },
+              ]}
+            />
+            <TrainFlow />
+          </Stack>
+        </Card>
+      </div>
+    );
+  }
 
   return (
-    <main
-      style={{
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
-        padding: 16,
-        color: '#1a1b1e',
-      }}
-    >
-      <h1 style={{ fontSize: 18, marginTop: 0 }}>Civitai App Block — starter</h1>
-      <p style={{ color: '#495057', fontSize: 14 }}>
-        This is the starter template. Replace <code>src/App.tsx</code> with your
-        block's UI. The host has already initialised the message bridge — use
-        the hooks from <code>@civitai/blocks-react</code> to talk to civitai.
-      </p>
-      <h2 style={{ fontSize: 14, marginTop: 24 }}>Slot context</h2>
-      <pre
-        style={{
-          background: '#f8f9fa',
-          padding: 12,
-          borderRadius: 6,
-          fontSize: 12,
-          overflowX: 'auto',
-        }}
-      >
-        {JSON.stringify(ctx, null, 2)}
-      </pre>
-    </main>
+    // `data-block-tier` is not required by anything — it is here so you can see
+    // the tier in devtools (and assert it in a test) while you build a layout.
+    <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
+      <Card padding="lg" style={cardStyle}>
+        <Stack gap={16}>
+          <strong style={titleStyle}>Dataset Commons</strong>
+
+          {/* Mode toggle: txt2img (primary, runnable today) ⇄ Comfy on Civitai
+              (secondary sample, invite-only beta). Switching swaps the input
+              controls + the body-builder while REUSING the one estimate ->
+              consent -> submit -> poll driver + the account picker below. */}
+          <SegmentedControl
+            fullWidth
+            aria-label="Generation sample"
+            value={mode}
+            onChange={(v) => switchMode(v as GenMode)}
+            disabled={busy}
+            data={[
+              { value: 'txt2img', label: 'Text to image' },
+              { value: 'comfy', label: 'Comfy on Civitai recipe (sample · invite-only beta)' },
+              { value: 'train', label: 'Train a LoRA' },
+              { value: 'community', label: 'Datasets & ledger' },
+            ]}
+          />
+
+          {isComfy && (
+            <Alert color="info" title="Comfy on Civitai recipe (sample · invite-only beta)" data-testid="pm-comfy-beta">
+              A bounded, <strong>server-owned</strong> graph. The app only picks a registered{' '}
+              <code>recipe</code> id (<code>{STARTER_COMFY_RECIPE}</code>) + a prompt; the server
+              owns the graph and a hard per-job Buzz ceiling. Invite-only beta on live civitai.com —
+              works end-to-end against the <strong>mock host</strong> (<code>npm run dev:harness</code>).
+              Request tester access at{' '}
+              <a href="https://github.com/civitai/cli/issues/new" target="_blank" rel="noreferrer">
+                github.com/civitai/cli
+              </a>
+              .
+            </Alert>
+          )}
+
+          <Textarea
+            label="Prompt"
+            description="Describe what you want to generate."
+            placeholder="a serene mountain lake at golden hour, highly detailed"
+            value={prompt}
+            minRows={4}
+            maxLength={PROMPT_MAX}
+            required
+            error={promptError}
+            onChange={(e) => setPrompt(e.target.value)}
+            onBlur={() => setTouched(true)}
+          />
+
+          {/* Model + LoRA controls are the TXT2IMG sample's surface. The Comfy
+              on Civitai sample sends a server-owned recipe (no client
+              checkpoint/LoRA axis), so these are hidden in comfy mode — just
+              prompt + account. */}
+          {!isComfy && (
+            <>
+              {/* Model control. A page carries no host model context, so the app
+                  starts on DEFAULT_CHECKPOINT and lets the user CHANGE it via the
+                  HOST's checkpoint picker (useCheckpointPicker) — the block never
+                  browses a catalog. Every pick is DISCOVERY ONLY: the server
+                  re-validates + re-prices it at estimate/submit. */}
+              <div style={fieldStyle}>
+                <span style={fieldLabelStyle}>Model</span>
+                <span style={fieldDescStyle}>
+                  The checkpoint to generate with. The server validates + prices every generation.
+                </span>
+                {/* THE RESPONSIVE EXAMPLE. Side by side when the block has room;
+                    stacked, with a full-width button, when it doesn't. This is a
+                    STRUCTURAL swap (a different element), which is the kind of
+                    change CSS alone handles badly and `useBlockBreakpoint` is
+                    for — pure sizing/spacing should stay in fluid CSS. */}
+                {narrow ? (
+                  <Stack gap={8} align="stretch" data-testid="pm-model-row" data-layout="stacked">
+                    {modelRow}
+                  </Stack>
+                ) : (
+                  <Group
+                    justify="space-between"
+                    align="center"
+                    gap={8}
+                    wrap={false}
+                    data-testid="pm-model-row"
+                    data-layout="row"
+                  >
+                    {modelRow}
+                  </Group>
+                )}
+              </div>
+
+              {/* LoRA control. Add up to MAX_LORAS LoRAs on top of the checkpoint
+                  via the HOST's resource picker (useResourcePicker, type=LORA),
+                  each with an adjustable weight (a themed native range input — the
+                  W6 pack ships no Slider). Every LoRA + weight is DISCOVERY ONLY:
+                  the server re-validates (LoRA-only? base-model compatible?
+                  entitled?) + re-prices the whole body at estimate/submit. */}
+              <LoraSelector
+                selected={loras}
+                capReached={loraCapReached}
+                pickerBusy={pickerBusy}
+                onAdd={() => void onAddLora()}
+                onRemove={onRemoveLora}
+                onWeight={onLoraWeight}
+              />
+            </>
+          )}
+
+          {!anon && (
+            <AccountPicker value={account} onChange={setAccount} balance={balance} disabled={busy} />
+          )}
+
+          {anon ? (
+            <Button fullWidth onClick={() => requestSignIn()} data-testid="pm-signin">
+              Sign in to generate
+            </Button>
+          ) : (
+            <Button
+              fullWidth
+              loading={busy}
+              disabled={prompt.trim().length === 0}
+              onClick={onGenerateClick}
+              data-testid="pm-generate"
+            >
+              {busy
+                ? phaseLabel(phase)
+                : estimatedCost != null
+                  ? `Generate · ${formatCost(estimatedCost)} Buzz`
+                  : 'Generate'}
+            </Button>
+          )}
+
+          {phase === 'needs-consent' && (
+            <Alert color="info" title="Grant access to generate">
+              Confirm in the Civitai dialog. If you dismissed it, click Generate again.
+            </Alert>
+          )}
+
+          {phase === 'insufficient' && (
+            <Alert color="warning" title="Not enough Buzz" data-testid="pm-insufficient">
+              Top up your Buzz balance and try again.
+            </Alert>
+          )}
+
+          {phase === 'account-rejected' && error && (
+            <Alert
+              color="warning"
+              title="Buzz account not available"
+              withCloseButton
+              onClose={() => setError(null)}
+              data-testid="pm-account-rejected"
+            >
+              {error}
+            </Alert>
+          )}
+
+          {phase === 'gated' && (
+            <Alert color="info" title="Comfy on Civitai recipes are in invite-only beta" data-testid="pm-gated">
+              Your account isn&apos;t in the tester cohort yet, so this recipe can&apos;t run on live
+              civitai.com. Request access at{' '}
+              <a href="https://github.com/civitai/cli" target="_blank" rel="noreferrer">
+                github.com/civitai/cli
+              </a>
+              . Meanwhile it works end-to-end in the mock harness (<code>npm run dev:harness</code>).
+            </Alert>
+          )}
+
+          {phase === 'failed' && error && (
+            <Alert
+              color="error"
+              title="Generation failed"
+              withCloseButton
+              onClose={() => setError(null)}
+            >
+              {error}
+            </Alert>
+          )}
+
+          {phase === 'succeeded' && imageUrl && (
+            <Stack gap={8}>
+              <Alert color="success" title="Done" data-testid="pm-spent">
+                Spent <strong>{formatCost(actualCost)}</strong> Buzz
+                <SpentAccountNote spentAccount={spentAccount} />.
+              </Alert>
+              <img src={imageUrl} alt="Generated result" style={imageStyle} />
+            </Stack>
+          )}
+        </Stack>
+      </Card>
+    </div>
   );
 }
+
+/**
+ * The LoRA selector: an "Add LoRA" button (opens the HOST resource picker) + the
+ * selected rows, each with a weight control + Remove. Built from the W6 pack
+ * (Group/Stack/Badge/Button) plus a themed native range input (the pack ships no
+ * Slider). Every pick + weight is DISCOVERY ONLY — server-revalidated + re-priced.
+ */
+function LoraSelector({
+  selected,
+  capReached,
+  pickerBusy,
+  onAdd,
+  onRemove,
+  onWeight,
+}: {
+  selected: readonly LoraOption[];
+  capReached: boolean;
+  pickerBusy: boolean;
+  onAdd: () => void;
+  onRemove: (versionId: number) => void;
+  onWeight: (versionId: number, weight: number) => void;
+}) {
+  return (
+    <div style={fieldStyle}>
+      <span style={fieldLabelStyle}>
+        LoRAs{' '}
+        <Badge color="info" variant="light">
+          {selected.length}/{MAX_LORAS}
+        </Badge>
+      </span>
+      <span style={fieldDescStyle}>
+        Optional. Layer up to {MAX_LORAS} LoRAs on the checkpoint, each with a weight. The server
+        validates compatibility + prices every generation.
+      </span>
+
+      {/* Selected LoRAs, each with a weight control + remove. */}
+      {selected.length > 0 && (
+        <Stack gap={8} style={loraListStyle}>
+          {selected.map((l) => (
+            <div key={l.versionId} style={loraRowStyle} data-testid="pm-lora-row">
+              <div style={loraRowHeadStyle}>
+                <span style={loraNameStyle} title={l.label}>
+                  {l.label}
+                  {l.baseModel ? ` (${l.baseModel})` : ''}
+                </span>
+                <Button
+                  variant="subtle"
+                  size="sm"
+                  color="error"
+                  onClick={() => onRemove(l.versionId)}
+                  aria-label={`Remove ${l.label}`}
+                >
+                  Remove
+                </Button>
+              </div>
+              <label style={loraWeightRowStyle}>
+                <span style={loraWeightLabelStyle}>weight</span>
+                <input
+                  type="range"
+                  min={LORA_STRENGTH_MIN}
+                  max={LORA_STRENGTH_MAX}
+                  step={0.05}
+                  value={l.weight}
+                  onChange={(e) => onWeight(l.versionId, Number(e.target.value))}
+                  aria-label={`${l.label} weight`}
+                  data-testid="pm-lora-weight"
+                  style={loraRangeStyle}
+                />
+                <span style={loraWeightValueStyle}>{l.weight.toFixed(2)}</span>
+              </label>
+            </div>
+          ))}
+        </Stack>
+      )}
+
+      {/* Add a LoRA — opens the host's resource picker filtered to LoRAs. */}
+      <span style={loraAddWrapStyle}>
+        <Button
+          variant="light"
+          size="sm"
+          disabled={capReached}
+          loading={pickerBusy}
+          onClick={onAdd}
+          data-testid="pm-lora-add"
+        >
+          + Add LoRA
+        </Button>
+        {capReached && <span style={fieldDescStyle}>Max {MAX_LORAS} LoRAs selected.</span>}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Choose which Buzz pool funds the generation. Auto (default) omits `accountType`
+ * from the submit body entirely — today's host-chosen behavior. Pools with a 0
+ * balance are annotated but stay selectable (the server still preferred-first
+ * falls back, and a picked-but-empty pool is harmless).
+ */
+function AccountPicker({
+  value,
+  onChange,
+  balance,
+  disabled,
+}: {
+  value: AccountChoice;
+  onChange: (v: AccountChoice) => void;
+  balance: { blue: number; green: number; yellow: number } | null;
+  disabled: boolean;
+}) {
+  return (
+    <div style={fieldStyle}>
+      <span style={fieldLabelStyle}>Spend from</span>
+      <span style={fieldDescStyle}>
+        Which Buzz account to fund this generation. Auto lets the server choose; a pick is a
+        preference the server clamps to what you hold + this app's rating.
+      </span>
+      <div role="radiogroup" aria-label="Buzz account" style={pickerRowStyle}>
+        {ACCOUNT_CHOICES.map((choice) => {
+          const selected = value === choice;
+          const zero = choice !== 'auto' && balance != null && balance[choice] === 0;
+          return (
+            <button
+              key={choice}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              disabled={disabled}
+              onClick={() => onChange(choice)}
+              data-testid={`pm-account-${choice}`}
+              style={pickerBtnStyle(selected, disabled)}
+              title={zero ? 'You have 0 Buzz in this account' : undefined}
+            >
+              {accountLabel(choice)}
+              {zero ? ' · 0' : ''}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** " from your Yellow account" — reads the succeeded snapshot's spentAccountType. */
+function SpentAccountNote({ spentAccount }: { spentAccount: BuzzAccountType | null }) {
+  const label = spentAccountLabel(spentAccount ?? undefined);
+  if (!label) return null;
+  return (
+    <>
+      {' '}
+      from your <strong>{label}</strong> account
+    </>
+  );
+}
+
+function phaseLabel(phase: GenPhase): string {
+  if (phase === 'estimating') return 'Estimating…';
+  if (phase === 'submitting') return 'Submitting…';
+  if (phase === 'polling') return 'Generating…';
+  return 'Working…';
+}
+
+// The pack themes everything via data-theme; the block root only needs layout +
+// a themed page background so the iframe surface matches the card.
+const shell: React.CSSProperties = {
+  minHeight: '100dvh',
+  width: '100%',
+  display: 'flex',
+  justifyContent: 'center',
+  alignItems: 'flex-start',
+  padding: 24,
+  boxSizing: 'border-box',
+  background: 'var(--civitai-color-surface-2)',
+  color: 'var(--civitai-color-text)',
+};
+
+const cardStyle: React.CSSProperties = { width: '100%', maxWidth: 640 };
+const titleStyle: React.CSSProperties = { fontSize: 20 };
+const imageStyle: React.CSSProperties = { width: '100%', borderRadius: 8, display: 'block' };
+
+// Field chrome — read the same pack CSS vars the pack's own inputs use, so the
+// Model + LoRA controls match the Textarea/TextInput surface across themes.
+const fieldStyle: React.CSSProperties = { display: 'grid', gap: 4 };
+const fieldLabelStyle: React.CSSProperties = { fontSize: 14, fontWeight: 600 };
+const fieldDescStyle: React.CSSProperties = {
+  fontSize: 12,
+  color: 'var(--civitai-color-text-dimmed, var(--civitai-color-text))',
+  opacity: 0.8,
+};
+const currentModelStyle: React.CSSProperties = {
+  flex: 1,
+  minWidth: 0,
+  padding: '10px 12px',
+  borderRadius: 8,
+  border: '1px solid var(--civitai-color-border)',
+  background: 'var(--civitai-color-surface)',
+  color: 'var(--civitai-color-text)',
+  fontSize: 14,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+};
+
+// The account-picker chrome reads the same pack CSS vars as the Model/LoRA
+// controls so it matches the surface across themes.
+const pickerRowStyle: React.CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: 6,
+  marginTop: 4,
+};
+function pickerBtnStyle(selected: boolean, disabled: boolean): React.CSSProperties {
+  return {
+    padding: '6px 14px',
+    borderRadius: 999,
+    border: '1px solid ' + (selected ? 'var(--civitai-color-primary)' : 'var(--civitai-color-border)'),
+    background: selected ? 'var(--civitai-color-primary)' : 'var(--civitai-color-surface)',
+    color: selected ? 'var(--civitai-color-primary-fg, #fff)' : 'var(--civitai-color-text)',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    opacity: disabled ? 0.6 : 1,
+  };
+}
+
+// The W6 pack ships no Slider, so each LoRA's weight uses a themed native range
+// input. These read the same pack CSS vars so the LoRA list matches the surface.
+const loraListStyle: React.CSSProperties = { marginTop: 4 };
+const loraRowStyle: React.CSSProperties = {
+  display: 'grid',
+  gap: 6,
+  padding: '8px 10px',
+  borderRadius: 8,
+  border: '1px solid var(--civitai-color-border)',
+  background: 'var(--civitai-color-surface)',
+};
+const loraRowHeadStyle: React.CSSProperties = {
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  gap: 8,
+};
+const loraNameStyle: React.CSSProperties = {
+  fontSize: 13,
+  fontWeight: 600,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+};
+const loraWeightRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 8 };
+const loraWeightLabelStyle: React.CSSProperties = { fontSize: 12, opacity: 0.8, minWidth: 44 };
+const loraRangeStyle: React.CSSProperties = { flex: 1, accentColor: 'var(--civitai-color-primary)' };
+const loraWeightValueStyle: React.CSSProperties = {
+  fontSize: 12,
+  fontVariantNumeric: 'tabular-nums',
+  minWidth: 36,
+  textAlign: 'right',
+};
+const loraAddWrapStyle: React.CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: 6,
+  alignItems: 'center',
+  marginTop: 4,
+};
