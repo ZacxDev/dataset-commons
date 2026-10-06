@@ -70,3 +70,37 @@ button:focus-visible {
   outline: 2px solid var(--civitai-color-primary);
   outline-offset: 2px;
 }
+
+/* Responsive layout (full-width desktop, stacked mobile). Breakpoints are
+   written as raw px on purpose: a var() inside a media-query prelude is dead.
+   Tiers mirror Civitai's block scale (sm 768 · md 1024 · lg 1184 · xl 1440). */
+.od-grid-cards {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
+}
+@media (min-width: 768px) {
+  .od-grid-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1184px) {
+  .od-grid-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.od-grid-items {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
+}
+@media (min-width: 768px) {
+  .od-grid-items { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1440px) {
+  .od-grid-items { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.od-detail-layout {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+}
+@media (min-width: 1024px) {
+  .od-detail-layout { grid-template-columns: minmax(0, 1fr) 400px; align-items: start; }
+}

@@ -975,13 +975,13 @@ const shell: React.CSSProperties = {
   display: 'flex',
   justifyContent: 'center',
   alignItems: 'flex-start',
-  padding: 24,
+  padding: 'clamp(12px, 3vw, 40px)',
   boxSizing: 'border-box',
   background: 'var(--dc-archive-bg, var(--civitai-color-surface-2))',
   color: 'var(--civitai-color-text)',
 };
 
-const cardStyle: React.CSSProperties = { width: '100%', maxWidth: 640 };
+const cardStyle: React.CSSProperties = { width: '100%', maxWidth: 'none' };
 const titleStyle: React.CSSProperties = { fontSize: 20 };
 const imageStyle: React.CSSProperties = { width: '100%', borderRadius: 8, display: 'block' };
 

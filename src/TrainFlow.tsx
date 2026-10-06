@@ -523,7 +523,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           Included = net-positive votes. Vote weights freeze when you train — later votes never
           rewrite this snapshot. Shares below are of any Buzz this LoRA tracks.
         </span>
-        <Stack gap={8}>
+        <div className="od-grid-items">
           {items.map((it) => {
             const snapItem = preview.items.find((s) => s.itemId === it.itemId);
             const isIn = snapItem?.included ?? false;
@@ -593,7 +593,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
               </div>
             );
           })}
-        </Stack>
+        </div>
         {props.allowLocalUploads !== false && (
           <span>
             <Button variant="light" size="sm" onClick={() => void onUploadClick()} data-testid="dc-upload">

@@ -575,7 +575,8 @@ export function Community() {
                 </span>
               </div>
             ) : (
-              explored.map((dataset) => (
+              <div className="od-grid-cards">
+              {explored.map((dataset) => (
                 <div key={dataset.datasetId} style={cardStyle} data-testid="dc-dataset-card">
                   <div style={itemHeadStyle}>
                     <span style={cardTitleStyle}>{dataset.name}</span>
@@ -598,7 +599,8 @@ export function Community() {
                     </Button>
                   </span>
                 </div>
-              ))
+              ))}
+              </div>
             )}
             <span style={hintStyle}>{COSMETIC_TRUST_LINE}</span>
           </Stack>
@@ -785,7 +787,7 @@ function DatasetForm(props: {
   };
 
   return (
-    <div style={cardStyle} data-testid="dc-dataset-form">
+    <div style={{ ...cardStyle, maxWidth: 760 }} data-testid="dc-dataset-form">
       <span style={cardTitleStyle}>{props.title}</span>
       <label style={labelStyle}>
         Name
@@ -1044,7 +1046,8 @@ function DatasetDetail(props: {
           No items yet — contribute the first image below.
         </span>
       ) : (
-        dataset.items.map((item) => {
+        <div className="od-grid-items">
+        {dataset.items.map((item) => {
           const gatedImage = item.imageId != null ? gatedImages.get(item.imageId) : undefined;
           const isContributor = viewerId != null && item.contributorId === viewerId;
           return (
@@ -1110,7 +1113,8 @@ function DatasetDetail(props: {
               )}
             </div>
           );
-        })
+        })}
+        </div>
       )}
 
       {viewerId == null ? (
@@ -1546,6 +1550,7 @@ const cardStyle: React.CSSProperties = {
   border: '1px solid var(--civitai-color-border, transparent)',
   borderRadius: 6,
   padding: 12,
+  background: 'var(--civitai-color-surface, transparent)',
 };
 const subCardStyle: React.CSSProperties = { ...cardStyle, background: 'var(--civitai-color-surface, transparent)' };
 const toolbarStyle: React.CSSProperties = { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' };
@@ -1566,7 +1571,7 @@ const itemHeadStyle: React.CSSProperties = {
 const inputStyle: React.CSSProperties = {
   padding: '6px 8px',
   borderRadius: 6,
-  border: '1px solid var(--civitai-color-border, #888)',
+  border: '1px solid var(--civitai-color-border, #243746)',
   background: 'var(--civitai-color-surface, transparent)',
   color: 'var(--civitai-color-text)',
   minWidth: 160,

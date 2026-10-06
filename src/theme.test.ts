@@ -9,6 +9,7 @@ const indexHtml = readFileSync(new URL('../index.html', import.meta.url), 'utf8'
 const indexCss = readFileSync(new URL('./index.css', import.meta.url), 'utf8');
 const trainFlow = readFileSync(new URL('./TrainFlow.tsx', import.meta.url), 'utf8');
 const appTsx = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
+const communityTsx = readFileSync(new URL('./Community.tsx', import.meta.url), 'utf8');
 
 describe('Archive Lab theme', () => {
   it('the boot document never follows the OS scheme', () => {
@@ -43,6 +44,18 @@ describe('Archive Lab theme', () => {
     // Boot skeleton paints the same deepened base before the bundle lands.
     expect(indexHtml).toContain('background: #0b1116;');
     expect(indexHtml).toContain('background: #121c24;');
+  });
+
+  it('the layout is full-width on desktop with responsive card/item grids', () => {
+    // Shell card no longer caps at 640px; grids take over per-view density.
+    expect(appTsx).toContain("maxWidth: 'none'");
+    expect(indexCss).toContain('.od-grid-cards');
+    expect(indexCss).toContain('.od-grid-items');
+    expect(indexCss).toContain('@media (min-width: 1184px)');
+    expect(indexCss).toContain('@media (min-width: 1024px)');
+    expect(communityTsx).toContain('className="od-grid-cards"');
+    expect(communityTsx).toContain('className="od-grid-items"');
+    expect(trainFlow).toContain('className="od-grid-items"');
   });
 
   it('the Train surface roots at data-theme=dark and toggles light explicitly', () => {
