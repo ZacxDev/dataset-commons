@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 const indexHtml = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const indexCss = readFileSync(new URL('./index.css', import.meta.url), 'utf8');
 const trainFlow = readFileSync(new URL('./TrainFlow.tsx', import.meta.url), 'utf8');
+const appTsx = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
 
 describe('Archive Lab theme', () => {
   it('the boot document never follows the OS scheme', () => {
@@ -23,10 +24,25 @@ describe('Archive Lab theme', () => {
 
   it('Archive Lab tokens are scoped overrides, amber reserved for the ledger', () => {
     expect(indexCss).toContain("[data-dc-archive]");
-    expect(indexCss).toContain('--civitai-color-primary: #22b8cf');
+    expect(indexCss).toContain('--civitai-color-primary: #25c2d8');
     expect(indexCss).toContain('--civitai-color-warning: #e8a33d');
     // Light exists ONLY under the explicit override selector.
     expect(indexCss).toContain("[data-dc-archive][data-theme='light']");
+  });
+
+  it('Sharpened palette deepens the base and unifies shell + archive surfaces', () => {
+    expect(indexCss).toContain('--dc-archive-bg: #0b1116');
+    expect(indexCss).toContain('--civitai-color-surface: #121c24');
+    expect(indexCss).toContain('--civitai-color-surface-2: #1a2833');
+    expect(indexCss).toContain('--civitai-color-text: #eef3f5');
+    expect(indexCss).toContain('--civitai-color-text-dimmed: #9aa7b1');
+    // The app shell roots carry the archive scope too, so the mode switch and
+    // generation sample use the same cyan/surface family as Community/Train.
+    expect(appTsx).toContain('data-dc-archive="true"');
+    expect(appTsx).toContain("background: 'var(--dc-archive-bg, var(--civitai-color-surface-2))'");
+    // Boot skeleton paints the same deepened base before the bundle lands.
+    expect(indexHtml).toContain('background: #0b1116;');
+    expect(indexHtml).toContain('background: #121c24;');
   });
 
   it('the Train surface roots at data-theme=dark and toggles light explicitly', () => {

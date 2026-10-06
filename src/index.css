@@ -1,28 +1,44 @@
 :root {
-  /* DARK ONLY by default (Archive Lab): the app never follows the browser/OS
-     scheme. Light exists solely under the explicit in-app override selector
-     `[data-theme='light']` below. */
+  /* DARK ONLY by default (Archive Lab — Sharpened): the app never follows the
+     browser/OS scheme. Light exists solely under the explicit in-app override
+     selector `[data-theme='light']` below. */
   color-scheme: dark;
 }
 
-/* Archive Lab token overrides (spec §8), scoped to the Train surface root.
+/* Archive Lab — Sharpened token overrides (spec §8; theme pick A, 2026-10-06),
+   scoped to every app surface root via [data-dc-archive] so the shell and the
+   community/train surfaces share ONE palette family: a deeper charcoal base,
+   cyan reserved strictly for the primary action, and amber
+   (--civitai-color-warning) reserved for ledger/earnings surfaces only.
    Dark is the unqualified base; the light block applies ONLY when the user
-   explicitly toggles the override in-app. Amber (--civitai-color-warning) is
-   reserved for ledger/earnings surfaces. */
+   explicitly toggles the override in-app. */
 [data-dc-archive] {
-  --civitai-color-primary: #22b8cf;
-  --civitai-color-primary-hover: #3bc9de;
+  --civitai-color-primary: #25c2d8;
+  --civitai-color-primary-hover: #58d6e8;
   --civitai-color-warning: #e8a33d;
-  --dc-archive-bg: #0f151b;
-  --dc-archive-surface: #16202a;
+  --civitai-color-surface: #121c24;
+  --civitai-color-surface-2: #1a2833;
+  --civitai-color-text: #eef3f5;
+  --civitai-color-text-dimmed: #9aa7b1;
+  --civitai-color-border: #243746;
+  --dc-archive-bg: #0b1116;
+  --dc-archive-surface: #121c24;
+  --dc-archive-surface-2: #1a2833;
+  --dc-archive-ledger: #e8a33d;
   color-scheme: dark;
 }
 
 [data-dc-archive][data-theme='light'] {
   --civitai-color-primary: #0b7285;
   --civitai-color-primary-hover: #1098ad;
+  --civitai-color-surface: #ffffff;
+  --civitai-color-surface-2: #e8eef2;
+  --civitai-color-text: #16202a;
+  --civitai-color-text-dimmed: #5a6b76;
+  --civitai-color-border: #c9d4db;
   --dc-archive-bg: #f1f5f8;
   --dc-archive-surface: #ffffff;
+  --dc-archive-surface-2: #e8eef2;
   color-scheme: light;
 }
 

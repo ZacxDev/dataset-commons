@@ -537,7 +537,7 @@ export function App() {
   if (!ready) {
     return (
       // Theme the block's OWN root; that's what the pack's CSS reads.
-      <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
+      <div ref={rootRef} data-theme={theme} data-dc-archive="true" data-block-tier={bp.tier} style={shell}>
         <Card padding="lg">
           <Group gap={10}>
             <Badge color="info" variant="light">
@@ -562,7 +562,7 @@ export function App() {
   // Dataset Commons community screens (Explore/detail/contribute/ledger).
   if (mode === 'community') {
     return (
-      <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
+      <div ref={rootRef} data-theme={theme} data-dc-archive="true" data-block-tier={bp.tier} style={shell}>
         <Card padding="lg" style={cardStyle}>
           <Stack gap={16}>
             <strong style={titleStyle}>Open Datasets</strong>
@@ -589,7 +589,7 @@ export function App() {
   // the same shell/title/mode switch, so the generation sample stays untouched.
   if (mode === 'train') {
     return (
-      <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
+      <div ref={rootRef} data-theme={theme} data-dc-archive="true" data-block-tier={bp.tier} style={shell}>
         <Card padding="lg" style={cardStyle}>
           <Stack gap={16}>
             <strong style={titleStyle}>Open Datasets</strong>
@@ -615,7 +615,7 @@ export function App() {
   return (
     // `data-block-tier` is not required by anything — it is here so you can see
     // the tier in devtools (and assert it in a test) while you build a layout.
-    <div ref={rootRef} data-theme={theme} data-block-tier={bp.tier} style={shell}>
+    <div ref={rootRef} data-theme={theme} data-dc-archive="true" data-block-tier={bp.tier} style={shell}>
       <Card padding="lg" style={cardStyle}>
         <Stack gap={16}>
           <strong style={titleStyle}>Open Datasets</strong>
@@ -977,7 +977,7 @@ const shell: React.CSSProperties = {
   alignItems: 'flex-start',
   padding: 24,
   boxSizing: 'border-box',
-  background: 'var(--civitai-color-surface-2)',
+  background: 'var(--dc-archive-bg, var(--civitai-color-surface-2))',
   color: 'var(--civitai-color-text)',
 };
 
