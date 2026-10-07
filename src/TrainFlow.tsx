@@ -81,6 +81,8 @@ export interface TrainFlowProps {
   trainerId?: string;
   /** When false, items are the live dataset: captions/votes are read-only. */
   lockItemMetadata?: boolean;
+  /** Hide the built-in light/dark toggle (the host view already renders one). */
+  hideThemeToggle?: boolean;
   /** Owner overrides only make sense for the dataset owner. Default true (mock). */
   canOwnerOverride?: boolean;
   /** Local uploads extend the mock dataset only; live datasets contribute elsewhere. */
@@ -496,14 +498,16 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     <Stack gap={16} data-testid="dc-train">
       <span style={sectionTitleStyle}>Train a LoRA from this dataset</span>
       <span>
-        <Button
-          variant="subtle"
-          size="sm"
-          onClick={() => setDcTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-          data-testid="dc-theme-toggle"
-        >
-          {dcTheme === 'dark' ? 'Light override' : 'Back to dark (default)'}
-        </Button>
+        {props.hideThemeToggle !== true && (
+          <Button
+            variant="subtle"
+            size="sm"
+            onClick={() => setDcTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+            data-testid="dc-theme-toggle"
+          >
+            {dcTheme === 'dark' ? 'Light override' : 'Back to dark (default)'}
+          </Button>
+        )}
       </span>
       <span style={hintStyle}>
         In-app training on Civitai's trainer. The estimate is the real price — if the trainer
@@ -523,6 +527,9 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           Included = net-positive votes. Vote weights freeze when you train — later votes never
           rewrite this snapshot. Shares below are of any Buzz this LoRA tracks.
         </span>
+        {props.lockItemMetadata === true && (
+          <span style={hintStyle}>Captions and votes are locked from the live dataset record — they freeze exactly as shown.</span>
+        )}
         <div className="od-grid-items">
           {items.map((it) => {
             const snapItem = preview.items.find((s) => s.itemId === it.itemId);

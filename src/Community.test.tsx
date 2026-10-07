@@ -26,9 +26,9 @@ import { installMockMoneyHost } from './mock-buzz.js';
 // own scenario (the same surface the dev harness uses), never by mocking hooks.
 
 async function openCommunity(user: ReturnType<typeof userEvent.setup>) {
+  void user;
   render(<App />);
-  await screen.findByTestId('pm-generate');
-  await user.click(screen.getByRole('tab', { name: /datasets & ledger/i }));
+  // Single-view shell: the datasets view is the cold-open, no tab to click.
   return screen.findByTestId('dc-community');
 }
 

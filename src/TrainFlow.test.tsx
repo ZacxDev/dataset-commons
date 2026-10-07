@@ -2,7 +2,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { App } from './App.js';
+import { TrainFlow } from './TrainFlow.js';
 import { installMockMoneyHost } from './mock-buzz.js';
 
 // Component/e2e tests for the Train flow (Option A′) against the REAL SDK
@@ -12,9 +12,11 @@ import { installMockMoneyHost } from './mock-buzz.js';
 // snapshot carry the trained-epoch field the publish handoff reads.
 
 async function openTrain(user: ReturnType<typeof userEvent.setup>) {
-  render(<App />);
-  await screen.findByTestId('pm-generate');
-  await user.click(screen.getByRole('tab', { name: /train a lora/i }));
+  void user;
+  // The standalone Train tab is gone (consolidated into the datasets view);
+  // these tests drive the TrainFlow surface directly, as the dataset Train
+  // route renders it.
+  render(<TrainFlow />);
   return screen.findByTestId('dc-train');
 }
 
@@ -206,9 +208,8 @@ describe('TrainFlow (Option A′)', () => {
   it('anon viewer gets sign-in on the train surface, not a price button', async () => {
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({ viewer: null });
-    render(<App />);
-    expect(await screen.findByTestId('pm-signin')).toBeInTheDocument();
-    await user.click(screen.getByRole('tab', { name: /train a lora/i }));
+    void user;
+    render(<TrainFlow />);
     expect(await screen.findByTestId('dc-signin')).toBeInTheDocument();
     expect(screen.queryByTestId('dc-estimate')).not.toBeInTheDocument();
   });

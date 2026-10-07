@@ -535,7 +535,7 @@ export function Community() {
               <input
                 style={inputStyle}
                 value={query}
-                placeholder="Search datasets, owners, targets…"
+                placeholder="Search datasets…"
                 onChange={(e) => setQuery(e.target.value)}
                 data-testid="dc-explore-search"
               />
@@ -577,7 +577,7 @@ export function Community() {
             ) : (
               <div className="od-grid-cards">
               {explored.map((dataset) => (
-                <div key={dataset.datasetId} style={cardStyle} data-testid="dc-dataset-card">
+                <div key={dataset.datasetId} style={{ ...cardStyle, cursor: 'pointer' }} data-testid="dc-dataset-card" onClick={() => setRoute({ name: 'dataset', datasetId: dataset.datasetId })}>
                   <div style={itemHeadStyle}>
                     <span style={cardTitleStyle}>{dataset.name}</span>
                     <Badge color="info" variant="light">{dataset.netVotes} net votes</Badge>
@@ -670,6 +670,7 @@ export function Community() {
               datasetId={selectedDataset.datasetId}
               trainerId={viewerId != null ? contributorKey(viewerId) : viewerName}
               lockItemMetadata
+              hideThemeToggle
               canOwnerOverride={viewerId != null && selectedDataset.ownerId === viewerId}
               allowLocalUploads={false}
               onSnapshotConfirmed={persistSnapshot}
@@ -1006,9 +1007,20 @@ function DatasetDetail(props: {
       {dataset.targetNote && <span style={hintStyle}>Target: {dataset.targetNote}</span>}
 
       <div style={rowStyle}>
-        <Button onClick={() => (viewerId == null ? props.onSignIn() : props.onTrain())} data-testid="dc-open-train">
-          Train a LoRA from this dataset
-        </Button>
+        {dataset.items.length === 0 ? (
+          <Button
+            onClick={() =>
+              document.getElementById('dc-contribute-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+            }
+            data-testid="dc-add-first-image"
+          >
+            Add the first image
+          </Button>
+        ) : (
+          <Button onClick={() => (viewerId == null ? props.onSignIn() : props.onTrain())} data-testid="dc-open-train">
+            Train a LoRA from this dataset
+          </Button>
+        )}
         {isOwner && (
           <Button variant="light" onClick={props.onEdit} data-testid="dc-edit-dataset">
             Edit dataset
@@ -1117,6 +1129,7 @@ function DatasetDetail(props: {
         </div>
       )}
 
+      <div id="dc-contribute-anchor">
       {viewerId == null ? (
         <Alert color="info" title="Sign in to contribute" data-testid="dc-contribute-guest">
           You can read everything here. Contributing, voting, and training need a Civitai sign-in.{' '}
@@ -1127,6 +1140,7 @@ function DatasetDetail(props: {
       ) : (
         <ContributeForm onContribute={props.onContribute} />
       )}
+      </div>
     </Stack>
   );
 }
