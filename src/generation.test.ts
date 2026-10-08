@@ -1,0 +1,416 @@
+import { describe, expect, it } from 'vitest';
+
+import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
+
+import {
+  PROMPT_MAX,
+  accountLabel,
+  buildWorkflowBody,
+  clampPrompt,
+  firstImageUrl,
+  formatCost,
+  hasBudgetedScope,
+  isBusyPhase,
+  isDisallowedAccountError,
+  isFeatureGated,
+  isInsufficientBuzz,
+  isTerminalStatus,
+  phaseForError,
+  phaseForSnapshot,
+  phaseForSubmitError,
+  spentAccountLabel,
+  submitErrorReason,
+} from './generation.js';
+import { DEFAULT_CHECKPOINT, type LoraOption } from './models.js';
+
+// A couple of pure-logic tests so authors inherit a working test setup. Run with
+// `npm test`. Add cases here as you grow the app's logic.
+
+describe('formatCost', () => {
+  it('renders an integer with separators', () => {
+    expect(formatCost(1234)).toBe('1,234');
+  });
+  it('renders a dash for null / undefined / non-finite', () => {
+    expect(formatCost(null)).toBe('—');
+    expect(formatCost(undefined)).toBe('—');
+    expect(formatCost(NaN)).toBe('—');
+    expect(formatCost(Infinity)).toBe('—');
+  });
+  it('rounds fractional costs and separates large ones', () => {
+    expect(formatCost(1234.6)).toBe('1,235');
+    expect(formatCost(1_234_567)).toBe((1_234_567).toLocaleString());
+  });
+});
+
+describe('hasBudgetedScope', () => {
+  it('true only when ai:write:budgeted is present', () => {
+    expect(hasBudgetedScope(['ai:write:budgeted'])).toBe(true);
+    expect(hasBudgetedScope([])).toBe(false);
+    expect(hasBudgetedScope(undefined)).toBe(false);
+  });
+});
+
+describe('isInsufficientBuzz', () => {
+  it('catches common phrasings, false for unrelated', () => {
+    expect(isInsufficientBuzz('Insufficient Buzz')).toBe(true);
+    expect(isInsufficientBuzz('prompt rejected by audit')).toBe(false);
+    expect(isInsufficientBuzz(null)).toBe(false);
+    expect(isInsufficientBuzz(undefined)).toBe(false);
+  });
+  it('catches each budget/balance phrasing the sniff covers', () => {
+    // Each substring the heuristic keys on should independently match.
+    expect(isInsufficientBuzz('not enough funds')).toBe(true);
+    expect(isInsufficientBuzz('over your per-gen budget')).toBe(true);
+    expect(isInsufficientBuzz('your balance is too low')).toBe(true);
+    expect(isInsufficientBuzz('needs more buzz')).toBe(true);
+  });
+});
+
+describe('clampPrompt', () => {
+  it('trims to the server cap', () => {
+    expect(clampPrompt('x'.repeat(PROMPT_MAX + 100)).length).toBe(PROMPT_MAX);
+  });
+});
+
+describe('buildWorkflowBody', () => {
+  it('builds a textToImage body with the chosen checkpoint + trimmed prompt', () => {
+    expect(buildWorkflowBody('  a cat  ', DEFAULT_CHECKPOINT)).toEqual({
+      kind: 'textToImage',
+      modelId: DEFAULT_CHECKPOINT.modelId,
+      modelVersionId: DEFAULT_CHECKPOINT.versionId,
+      params: { prompt: 'a cat' },
+    });
+  });
+  it('threads the picked checkpoint into modelId/modelVersionId', () => {
+    const pick = { versionId: 290640, modelId: 257749, label: 'Pony V6 XL', baseModel: 'Pony' };
+    const body = buildWorkflowBody('x', pick);
+    expect(body.modelId).toBe(257749);
+    expect(body.modelVersionId).toBe(290640);
+  });
+  it('omits additionalResources when no LoRAs are selected', () => {
+    const body = buildWorkflowBody('a cat', DEFAULT_CHECKPOINT, []);
+    expect(body.additionalResources).toBeUndefined();
+  });
+  it('emits one additionalResources entry per selected LoRA (version + clamped strength)', () => {
+    const loras: LoraOption[] = [
+      { versionId: 135867, modelId: 122359, label: 'Detail Tweaker XL', baseModel: 'SDXL 1.0', weight: 0.8 },
+      // weight out of the [-1, 2] bound is clamped at build time too.
+      { versionId: 152309, modelId: 136749, label: 'Add More Details XL', baseModel: 'SDXL 1.0', weight: 9 },
+    ];
+    const body = buildWorkflowBody('a cat', DEFAULT_CHECKPOINT, loras);
+    expect(body.additionalResources).toEqual([
+      { modelVersionId: 135867, strength: 0.8 },
+      { modelVersionId: 152309, strength: 2 },
+    ]);
+  });
+
+  it('Auto (omitted / "auto") threads NO accountType — today’s behavior byte-for-byte', () => {
+    const base = buildWorkflowBody('a cat', DEFAULT_CHECKPOINT, []);
+    expect('accountType' in base).toBe(false);
+    // Passing 'auto' explicitly is identical to omitting it.
+    expect(buildWorkflowBody('a cat', DEFAULT_CHECKPOINT, [], 'auto')).toEqual(base);
+  });
+  it('a picked pool is threaded as accountType (blue/green/yellow)', () => {
+    expect(buildWorkflowBody('a cat', DEFAULT_CHECKPOINT, [], 'yellow').accountType).toBe('yellow');
+    expect(buildWorkflowBody('a cat', DEFAULT_CHECKPOINT, [], 'green').accountType).toBe('green');
+    expect(buildWorkflowBody('a cat', DEFAULT_CHECKPOINT, [], 'blue').accountType).toBe('blue');
+  });
+});
+
+describe('accountLabel / spentAccountLabel', () => {
+  it('labels each account choice', () => {
+    expect(accountLabel('auto')).toBe('Auto');
+    expect(accountLabel('blue')).toBe('Blue');
+    expect(accountLabel('green')).toBe('Green');
+    expect(accountLabel('yellow')).toBe('Yellow');
+  });
+  it('spentAccountLabel is the pool label, or null when absent', () => {
+    expect(spentAccountLabel('yellow')).toBe('Yellow');
+    expect(spentAccountLabel('blue')).toBe('Blue');
+    expect(spentAccountLabel('green')).toBe('Green');
+    expect(spentAccountLabel(undefined)).toBeNull();
+  });
+});
+
+describe('isDisallowedAccountError', () => {
+  it('catches the server domain-clamp rejection (before the buzz-in-message trap)', () => {
+    const msg = "buzz account 'yellow' is not spendable for this app's content rating";
+    expect(isDisallowedAccountError(msg)).toBe(true);
+    // The disallowed message contains "buzz" — insufficient WOULD match it, so
+    // callers must check disallowed FIRST (phaseForError does).
+    expect(isInsufficientBuzz(msg)).toBe(true);
+  });
+  it('false for unrelated / insufficient errors', () => {
+    expect(isDisallowedAccountError('Insufficient Buzz')).toBe(false);
+    expect(isDisallowedAccountError('prompt rejected by audit')).toBe(false);
+    expect(isDisallowedAccountError(null)).toBe(false);
+  });
+});
+
+describe('isFeatureGated', () => {
+  // The sniff is deliberately NARROW — it matches ONLY the three real
+  // Comfy-on-Civitai gate signals (verified against civitai/civitai
+  // blocks.router.ts + workflow.schema.ts), never broad tokens. Its `'gated'`
+  // phase is separately COMFY-MODE-SCOPED at the App.tsx call site, so the
+  // strings shared with txt2img (a) never surface the Comfy copy there.
+  it('matches ONLY the three specific gate strings', () => {
+    // (a) app-blocks flag gate — assertAppBlocksEnabledForTokenUser.
+    expect(isFeatureGated('Apps are not enabled')).toBe(true);
+    expect(isFeatureGated('UNAUTHORIZED: Apps are not enabled')).toBe(true);
+    // (b) author gate — assertViewerIsAppDeveloper. 🔴 NOT reachable on a
+    //     customComfy submit or estimate: neither arm runs that gate, which lives
+    //     on the app-AUTHORING procs. This fixture pins the string match only, and
+    //     is NOT evidence that the platform gates Comfy by developer status.
+    expect(isFeatureGated('Apps authoring is not enabled for this account')).toBe(true);
+    // (c) unknown-recipe Zod enum rejection — the server's registry holds no such
+    //     id. `starter-comfy-txt2img` IS registered, so this is the "you pointed
+    //     STARTER_COMFY_RECIPE somewhere else" case, not a pre-deploy state.
+    //
+    //     🔴 The `Expected …` side is a PLACEHOLDER on purpose. An earlier fixture
+    //     wrote the real registry's contents in here; the registry is server-owned,
+    //     it changed, and the fixture became a false claim that a reader took for
+    //     documentation. What the predicate actually keys on is the enum signature
+    //     plus THIS app's recipe id — that is what these fixtures pin, and it does
+    //     not depend on what else is registered.
+    expect(
+      isFeatureGated(
+        "Invalid enum value. Expected 'some-registered-id', received 'starter-comfy-txt2img'",
+      ),
+    ).toBe(true);
+  });
+
+  it('does NOT over-match dev-misconfig, moderation, budget, or account errors', () => {
+    // Dropped broad tokens must no longer catch these:
+    expect(isFeatureGated('Insufficient Buzz')).toBe(false);
+    expect(
+      isFeatureGated("buzz account 'yellow' is not spendable for this app's content rating"),
+    ).toBe(false);
+    // A generic scope FORBIDDEN (dev misconfig) — previously masked as "gated".
+    expect(isFeatureGated('block lacks ai:write:budgeted scope')).toBe(false);
+    expect(isFeatureGated('block token missing budget')).toBe(false);
+    // The page-only recipe guard — must surface as a real error, not "gated".
+    expect(isFeatureGated('customComfy recipes are page-only')).toBe(false);
+    // A moderation-style rejection — proves the dropped `not allowed` token no
+    // longer over-matches.
+    expect(isFeatureGated('prompt is not allowed')).toBe(false);
+    expect(isFeatureGated('prompt rejected by audit')).toBe(false);
+    // A DIFFERENT enum rejection (not the recipe id) must not match (c).
+    expect(
+      isFeatureGated("Invalid enum value. Expected 'blue' | 'green' | 'yellow', received 'red'"),
+    ).toBe(false);
+    expect(isFeatureGated(null)).toBe(false);
+  });
+});
+
+describe('phaseForError', () => {
+  it('classifies disallowed-account before insufficient, otherwise failed', () => {
+    expect(
+      phaseForError("buzz account 'yellow' is not spendable for this app's content rating"),
+    ).toBe('account-rejected');
+    expect(phaseForError('Insufficient Buzz')).toBe('insufficient');
+    expect(phaseForError('prompt rejected by audit')).toBe('failed');
+  });
+  it('does NOT itself return gated — a gate string falls through to failed here', () => {
+    // Gating is decided at the App.tsx call site, comfy-mode-scoped. phaseForError
+    // (the shared/txt2img classifier) never produces the Comfy-specific phase.
+    expect(phaseForError('Apps are not enabled')).toBe('failed');
+    expect(
+      phaseForError(
+        "Invalid enum value. Expected 'some-registered-id', received 'starter-comfy-txt2img'",
+      ),
+    ).toBe('failed');
+  });
+});
+
+describe('phaseForSubmitError (comfy-mode-scoped gating)', () => {
+  // The three real gate strings (verified against civitai/civitai).
+  const FLAG_GATE = 'Apps are not enabled';
+  const AUTHOR_GATE = 'Apps authoring is not enabled for this account';
+  // Placeholder `Expected` side — see the note in the isFeatureGated block above:
+  // this fixture must not encode an inventory of the server-owned recipe registry.
+  const ENUM_REJECT =
+    "Invalid enum value. Expected 'some-registered-id', received 'starter-comfy-txt2img'";
+
+  it('COMFY mode: each gate string -> gated', () => {
+    expect(phaseForSubmitError(FLAG_GATE, true)).toBe('gated');
+    expect(phaseForSubmitError(AUTHOR_GATE, true)).toBe('gated');
+    expect(phaseForSubmitError(ENUM_REJECT, true)).toBe('gated');
+  });
+
+  it('TXT2IMG mode: the SAME gate strings are NOT gated (no cross-mode copy)', () => {
+    // Finding 1b: the flag gate ("Apps are not enabled") is shared with txt2img,
+    // so it must NOT render the Comfy-specific panel there — it's a plain failure.
+    expect(phaseForSubmitError(FLAG_GATE, false)).toBe('failed');
+    expect(phaseForSubmitError(AUTHOR_GATE, false)).toBe('failed');
+    expect(phaseForSubmitError(ENUM_REJECT, false)).toBe('failed');
+  });
+
+  it('is identical to phaseForError for non-gate errors, in BOTH modes', () => {
+    for (const isComfy of [true, false]) {
+      expect(phaseForSubmitError('Insufficient Buzz', isComfy)).toBe('insufficient');
+      expect(
+        phaseForSubmitError(
+          "buzz account 'yellow' is not spendable for this app's content rating",
+          isComfy,
+        ),
+      ).toBe('account-rejected');
+      expect(phaseForSubmitError('prompt rejected by audit', isComfy)).toBe('failed');
+    }
+  });
+
+  it('dev-misconfig + moderation are NEVER gated, even in comfy mode', () => {
+    // The point of the audit fix: these must not be MASKED as "invite-only beta".
+    // (Their exact non-gate phase is set by the pre-existing insufficient/failed
+    // sniffs — e.g. a scope error that mentions "budget" reads as insufficient —
+    // but the invariant that matters here is simply "not gated".)
+    for (const msg of [
+      'block lacks ai:write:budgeted scope',
+      'block token missing budget',
+      'customComfy recipes are page-only',
+      'prompt is not allowed',
+      'FORBIDDEN',
+    ]) {
+      expect(phaseForSubmitError(msg, true)).not.toBe('gated');
+      expect(phaseForSubmitError(msg, false)).not.toBe('gated');
+    }
+  });
+});
+
+describe('isTerminalStatus', () => {
+  it('terminal for end states, not for in-flight', () => {
+    expect(isTerminalStatus('succeeded')).toBe(true);
+    expect(isTerminalStatus('processing')).toBe(false);
+  });
+});
+
+describe('phaseForSnapshot', () => {
+  const snap = (over: Partial<BlockWorkflowSnapshot>): BlockWorkflowSnapshot => ({
+    workflowId: 'wf',
+    status: 'pending',
+    ...over,
+  });
+  it('maps in-flight to polling and success to succeeded', () => {
+    expect(phaseForSnapshot(snap({ status: 'processing' }))).toBe('polling');
+    expect(phaseForSnapshot(snap({ status: 'succeeded' }))).toBe('succeeded');
+  });
+  it('maps an insufficient-Buzz failure to insufficient', () => {
+    expect(phaseForSnapshot(snap({ status: 'failed', error: 'Insufficient Buzz' }))).toBe(
+      'insufficient',
+    );
+  });
+  it('maps a disallowed-account failure to account-rejected', () => {
+    expect(
+      phaseForSnapshot(
+        snap({
+          status: 'failed',
+          error: "buzz account 'yellow' is not spendable for this app's content rating",
+        }),
+      ),
+    ).toBe('account-rejected');
+  });
+  it('never returns gated — a gate is a submit-time rejection, not a snapshot', () => {
+    // A feature-gate fails the submit (thrown tRPC rejection) BEFORE a workflow
+    // exists, so it can never arrive as a terminal snapshot. A snapshot error
+    // therefore reduces via phaseForError -> failed (gating is comfy-scoped at
+    // the App.tsx submit-catch site, not in the snapshot path).
+    expect(
+      phaseForSnapshot(snap({ status: 'failed', error: 'Apps are not enabled' })),
+    ).toBe('failed');
+  });
+  it('routes expired / canceled terminal statuses through the error classifier', () => {
+    // Both non-success terminal states reduce via phaseForError: a plain reason
+    // -> failed, an insufficient-Buzz reason -> insufficient.
+    expect(phaseForSnapshot(snap({ status: 'expired' }))).toBe('failed');
+    expect(phaseForSnapshot(snap({ status: 'canceled' }))).toBe('failed');
+    expect(phaseForSnapshot(snap({ status: 'expired', error: 'Insufficient Buzz' }))).toBe(
+      'insufficient',
+    );
+  });
+});
+
+describe('submitErrorReason', () => {
+  // Faithful to the real shape: blocks-react ^0.44 throws an Error SUBCLASS whose
+  // `.message` is a generic template and whose `.snapshot.error` holds the server
+  // reason. The three strings below are pairwise distinct and none equals the
+  // 'submit failed' fallback, so every assertion can see WHICH source was read.
+  class FakeWorkflowSubmitError extends Error {
+    snapshot: { error?: string };
+    constructor(message: string, snapshotError?: string) {
+      super(message);
+      this.name = 'WorkflowSubmitError';
+      this.snapshot = { error: snapshotError };
+    }
+  }
+
+  const GENERIC = 'submit did not return a usable workflow (exception) — reason on .snapshot.error';
+  const SERVER_REASON = "buzz account 'green' is not spendable for this app's content rating";
+
+  it('prefers .snapshot.error over the generic .message (blocks-react ^0.44)', () => {
+    // THE REGRESSION: reading `.message` here classifies as `failed` and renders a
+    // hard "Generation failed" instead of the friendly switched-back-to-Auto note.
+    expect(submitErrorReason(new FakeWorkflowSubmitError(GENERIC, SERVER_REASON))).toBe(
+      SERVER_REASON,
+    );
+  });
+
+  it('falls back to .message when there is no snapshot (blocks-react ^0.43)', () => {
+    expect(submitErrorReason(new Error(SERVER_REASON))).toBe(SERVER_REASON);
+  });
+
+  it('falls back to .message when .snapshot.error is absent, empty or whitespace', () => {
+    expect(submitErrorReason(new FakeWorkflowSubmitError(GENERIC))).toBe(GENERIC);
+    expect(submitErrorReason(new FakeWorkflowSubmitError(GENERIC, ''))).toBe(GENERIC);
+    expect(submitErrorReason(new FakeWorkflowSubmitError(GENERIC, '   '))).toBe(GENERIC);
+  });
+
+  it('falls back to the caller default for a non-Error throw or an empty message', () => {
+    expect(submitErrorReason('a bare string')).toBe('submit failed');
+    expect(submitErrorReason(null)).toBe('submit failed');
+    expect(submitErrorReason(undefined)).toBe('submit failed');
+    expect(submitErrorReason(new Error(''))).toBe('submit failed');
+    expect(submitErrorReason(new Error(''), 'estimate failed')).toBe('estimate failed');
+  });
+
+  it('end-to-end: a ^0.44 disallowed-pool rejection still classifies as account-rejected', () => {
+    // The behavioural claim the structural one exists to serve. Reading `.message`
+    // would yield 'failed' here — that is the mutation this case kills.
+    const err = new FakeWorkflowSubmitError(GENERIC, SERVER_REASON);
+    expect(phaseForError(submitErrorReason(err))).toBe('account-rejected');
+    expect(phaseForError(GENERIC)).toBe('failed');
+  });
+});
+
+describe('isBusyPhase', () => {
+  it('true only for the in-flight phases', () => {
+    for (const p of ['estimating', 'submitting', 'polling'] as const) {
+      expect(isBusyPhase(p)).toBe(true);
+    }
+    for (const p of [
+      'idle',
+      'needs-consent',
+      'succeeded',
+      'failed',
+      'insufficient',
+      'account-rejected',
+      'gated',
+    ] as const) {
+      expect(isBusyPhase(p)).toBe(false);
+    }
+  });
+});
+
+describe('firstImageUrl', () => {
+  const snap = (over: Partial<BlockWorkflowSnapshot>): BlockWorkflowSnapshot => ({
+    workflowId: 'wf',
+    status: 'succeeded',
+    ...over,
+  });
+  it('returns the first image url when present', () => {
+    expect(firstImageUrl(snap({ imageUrls: ['a.png', 'b.png'] }))).toBe('a.png');
+  });
+  it('returns null for a null snapshot / empty or missing imageUrls', () => {
+    expect(firstImageUrl(null)).toBeNull();
+    expect(firstImageUrl(snap({ imageUrls: [] }))).toBeNull();
+    expect(firstImageUrl(snap({}))).toBeNull();
+  });
+});

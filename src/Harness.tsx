@@ -1,0 +1,317 @@
+import { useRef, useState, type CSSProperties, type ReactNode } from 'react';
+
+import {
+  Harness as SdkHarness,
+  readMockHostUrlOptions,
+  type MockHostOptions,
+} from '@civitai/blocks-react/testing';
+
+import { demoSharedSeed } from './community.js';
+import { ALL_APP_SCOPES } from './community-storage.js';
+import { mockBuzzBalance } from './mock-buzz.js';
+
+/**
+ * Local dev mock host for the Dataset Commons PAGE app.
+ *
+ * The real W10 page surface mounts the block in a full-bleed iframe at
+ * /apps/run/dataset-commons and routes the money messages (ESTIMATE/SUBMIT/POLL) to
+ * the generation orchestrator. Locally there's no host, so this plays one — but
+ * we no longer hand-roll it: the published SDK ships the mock host
+ * (`@civitai/blocks-react/testing`). This wrapper mounts it AND renders a loud
+ * "MOCK HOST" banner + a tiny scenario panel so it's always obvious that
+ * **no real Buzz is being spent**.
+ *
+ * URL query knobs (read once on mount) drive the initial scenario — both the
+ * original toggles and the new Layer-1 scenario knobs:
+ *   ?viewer=anon        -> anonymous viewer (sign-in CTA)
+ *   ?consent=granted    -> start WITH the budgeted scope already granted
+ *   ?fail=insufficient  -> SUBMIT returns an insufficient-Buzz failed snapshot
+ *   ?theme=light        -> light theme (default dark)
+ *   ?balance=0          -> simulate a Buzz balance (a gen over it -> insufficient)
+ *   ?latency=2000       -> 2s synthetic gen latency (or ?latency=500-2000 range)
+ *   ?costPerGen=12      -> cost reported per generation
+ *   ?failNext=1         -> fail the next N submits (generic gen error)
+ *   ?failRate=0.5       -> probabilistic submit failures
+ *   ?training=published -> training finishes with a published LoRA linked
+ *   ?community=demo     -> seed the demo dataset/items/votes
+ *
+ * The on-screen scenario panel maps the same controls onto buttons so a dev can
+ * flip them live (it re-mounts the mock host with the new options).
+ *
+ * IMPORTANT: the SDK transport DROPS inbound messages whose origin isn't in its
+ * allowlist, and the mock host fires from `window.location.origin`. The harness
+ * entry (main.tsx) pre-initializes the transport with that origin allowlisted —
+ * see `installHarnessTransport`. No real Buzz is spent (there is no orchestrator).
+ */
+export function Harness({ children }: { children: ReactNode }) {
+  // Read the URL toggles ONCE; the scenario panel then owns the live options
+  // (so a panel choice isn't wiped by a re-mount re-reading the URL).
+  const initial = useRef<MockHostOptions | null>(null);
+  if (initial.current === null) initial.current = readMockHostUrlOptions();
+
+  const [scenario, setScenario] = useState<MockHostOptions>(() => {
+    const base = initial.current as MockHostOptions;
+    const params = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
+    const wantsDemo = params.get('community') === 'demo';
+    // Deterministic training outcome for headless walks: the run
+    // finishes with epochs ready and a published LoRA linked (the
+    // same state the scenario panel's button applies, without a
+    // remount mid-walk).
+    const trainingPublished = params.get('training') === 'published';
+    return {
+      ...base,
+      declaredScopes: [...new Set([...(base.declaredScopes ?? []), ...ALL_APP_SCOPES])],
+      ...(wantsDemo && !base.shared ? { shared: { seed: demoSharedSeed() } } : {}),
+      ...(trainingPublished
+        ? {
+            generation: {
+              trainedEpochs: 10,
+              trainingPublishedModel: { modelId: 42, modelVersionId: 84, published: true },
+            },
+          }
+        : {}),
+    };
+  });
+  const [scenarioKey, setScenarioKey] = useState(0);
+  const apply = (patch: MockHostOptions) => {
+    setScenario((prev) => ({ ...prev, ...patch }));
+    setScenarioKey((k) => k + 1);
+  };
+
+  // 0.18's mock host answers GET_BUZZ_BALANCE natively from the `buzzBalance`
+  // option (which `<SdkHarness>` forwards to `createMockHost`). Project the
+  // current scenario's simulated wallet (`buzz.balance`, the same knob the
+  // panel/URL drives) into a { blue, green, yellow } split. `key={scenarioKey}`
+  // remounts <SdkHarness> on each panel `apply`, so the new wallet is re-applied.
+  const buzzBalance = mockBuzzBalance(scenario.buzz?.balance);
+
+  return (
+    <div style={rootStyle}>
+      <MockBanner />
+      <ScenarioPanel onApply={apply} />
+      {/* applyUrlToggles=false: the panel is authoritative once mounted. */}
+      <SdkHarness key={scenarioKey} applyUrlToggles={false} {...scenario} buzzBalance={buzzBalance}>
+        {children}
+      </SdkHarness>
+    </div>
+  );
+}
+
+/** Loud, always-visible banner so a dev never mistakes mock for live. */
+function MockBanner() {
+  return (
+    <div data-harness-banner="mock" style={bannerStyle}>
+      MOCK HOST · no real Buzz spent
+    </div>
+  );
+}
+
+/**
+ * Dev-only scenario control panel. Maps buttons onto the new `createMockHost`
+ * options so a dev can flip insufficient-buzz / failures / latency WITHOUT
+ * editing code or reloading with URL params. Collapsed by default.
+ */
+function ScenarioPanel({ onApply }: { onApply: (patch: MockHostOptions) => void }) {
+  const [balance, setBalance] = useState('');
+  const [latency, setLatency] = useState('');
+
+  return (
+    <details data-harness-scenario-panel="true" style={panelStyle}>
+      <summary style={summaryStyle}>mock scenarios</summary>
+      <div style={panelBodyStyle}>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() => onApply({ failMode: 'none', buzz: undefined })}
+        >
+          reset (all succeed)
+        </button>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() => onApply({ failMode: 'insufficient' })}
+        >
+          force insufficient Buzz
+        </button>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() => onApply({ generation: { failNext: 1 } })}
+        >
+          fail next generation
+        </button>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() => onApply({ generation: { failRate: 0.5 } })}
+        >
+          50% failure rate
+        </button>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() => onApply({ generation: { trainedEpochs: 10 } })}
+        >
+          training: epochs ready (10)
+        </button>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() =>
+            onApply({
+              generation: {
+                trainedEpochs: 10,
+                trainingPublishedModel: { modelId: 42, modelVersionId: 84, published: true },
+              },
+            })
+          }
+        >
+          training: published LoRA linked
+        </button>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() => onApply({ generation: { trainedEpochs: 0 } })}
+        >
+          training: in moderation (no epochs)
+        </button>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() =>
+            onApply({ declaredScopes: [...ALL_APP_SCOPES], shared: { seed: demoSharedSeed() } })
+          }
+        >
+          community: demo dataset
+        </button>
+        <button
+          type="button"
+          style={btnStyle}
+          onClick={() => onApply({ declaredScopes: [...ALL_APP_SCOPES], shared: { seed: [] } })}
+        >
+          community: empty
+        </button>
+        <label style={rowStyle}>
+          balance
+          <input
+            value={balance}
+            placeholder="e.g. 5"
+            onChange={(e) => setBalance(e.target.value)}
+            style={inputStyle}
+          />
+          <button
+            type="button"
+            style={btnStyle}
+            onClick={() => {
+              const n = Number(balance);
+              if (Number.isFinite(n)) onApply({ buzz: { balance: n } });
+            }}
+          >
+            set
+          </button>
+        </label>
+        <label style={rowStyle}>
+          latency ms
+          <input
+            value={latency}
+            placeholder="e.g. 2000"
+            onChange={(e) => setLatency(e.target.value)}
+            style={inputStyle}
+          />
+          <button
+            type="button"
+            style={btnStyle}
+            onClick={() => {
+              const n = Number(latency);
+              if (Number.isFinite(n)) onApply({ generation: { latencyMs: n } });
+            }}
+          >
+            set
+          </button>
+        </label>
+      </div>
+    </details>
+  );
+}
+
+// Cohesive console/terminal aesthetic for the mock chrome: a tidy dark terminal
+// strip (the banner) over a compact, monospace console panel — minimal, dark,
+// subtle borders, console-green accent — so the whole mock chrome reads as one
+// unobtrusive developer console and is never mistaken for the real (live) host.
+const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const TERMINAL_BG = '#0d1117'; // near-black terminal background
+const TERMINAL_BORDER = '#30363d'; // subtle console border
+const TERMINAL_TEXT = '#c9d1d9'; // muted console foreground
+const TERMINAL_ACCENT = '#3fb950'; // console-green accent
+
+const rootStyle: CSSProperties = { position: 'relative', minHeight: '100dvh' };
+
+const bannerStyle: CSSProperties = {
+  position: 'fixed',
+  top: 0,
+  left: 0,
+  right: 0,
+  zIndex: 10000,
+  background: TERMINAL_BG,
+  color: TERMINAL_ACCENT,
+  fontFamily: MONO,
+  fontSize: 12,
+  fontWeight: 600,
+  textAlign: 'center',
+  padding: '4px 8px',
+  letterSpacing: 0.3,
+  borderBottom: `1px solid ${TERMINAL_BORDER}`,
+};
+
+const panelStyle: CSSProperties = {
+  position: 'fixed',
+  top: 28,
+  left: 8,
+  zIndex: 10000,
+  background: TERMINAL_BG,
+  color: TERMINAL_TEXT,
+  fontFamily: MONO,
+  fontSize: 11,
+  padding: '6px 10px',
+  borderRadius: 6,
+  border: `1px solid ${TERMINAL_BORDER}`,
+  maxWidth: 300,
+};
+
+const summaryStyle: CSSProperties = {
+  cursor: 'pointer',
+  color: TERMINAL_ACCENT,
+  letterSpacing: 0.3,
+};
+
+const panelBodyStyle: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+  marginTop: 6,
+};
+
+const rowStyle: CSSProperties = { display: 'flex', gap: 4, alignItems: 'center' };
+
+const inputStyle: CSSProperties = {
+  width: 60,
+  background: '#161b22',
+  color: TERMINAL_TEXT,
+  border: `1px solid ${TERMINAL_BORDER}`,
+  borderRadius: 4,
+  fontFamily: MONO,
+  fontSize: 11,
+  padding: '2px 4px',
+};
+
+const btnStyle: CSSProperties = {
+  background: '#161b22',
+  color: TERMINAL_TEXT,
+  border: `1px solid ${TERMINAL_BORDER}`,
+  borderRadius: 4,
+  fontFamily: MONO,
+  fontSize: 11,
+  padding: '3px 6px',
+  cursor: 'pointer',
+  textAlign: 'left',
+};

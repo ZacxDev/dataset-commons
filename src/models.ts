@@ -1,0 +1,218 @@
+// Model types + pick→option helpers for Dataset Commons.
+//
+// WHY A CURATED DEFAULT CHECKPOINT (the page platform reality):
+//   A W10 page slot is entity=none — it carries NO model context (unlike a model
+//   slot, which delivers modelId/modelVersionId via BLOCK_INIT). So a page app
+//   must ship a known-good DEFAULT checkpoint that works at first paint, BEFORE
+//   the user opens the host's resource picker. The user then picks any other
+//   checkpoint (or layers on LoRAs) via the SDK's `useResourcePicker` /
+//   `useCheckpointPicker` hooks, which open the HOST's native picker — the block
+//   never browses the catalog itself (the host serves it, in dev:live and prod).
+//
+// MONEY-SAFETY: a pick is DISCOVERY ONLY. Nothing about a client-chosen
+// checkpoint OR LoRA is trusted — the SERVER re-validates (public? covered? SFW
+// for the domain? LoRA-only? compatible? entitled?) and RE-PRICES every estimate
+// and submit. We never imply otherwise.
+
+export interface CheckpointOption {
+  /** ModelVersion id submitted to the workflow as `modelVersionId`. */
+  versionId: number;
+  /** Parent Model id submitted as `modelId`. */
+  modelId: number;
+  /** Short display label for the current-model label. */
+  label: string;
+  /** Base-model family — display + the picker's family hint; compatibility is a SERVER authority. */
+  baseModel: string;
+}
+
+// ---------------------------------------------------------------------------
+// LoRAs — the main feature. A LoRA is an ADDITIONAL resource layered on top of
+// the checkpoint, each with an adjustable weight (its `strength`). It maps to a
+// `body.additionalResources[]` entry, NOT to `modelVersionId` (that's the
+// checkpoint). The SDK's WorkflowBody documents the server bounds we mirror:
+//   - max 5 entries (MAX_LORAS)
+//   - each strength in [-1, 2] (LORA_STRENGTH_MIN/MAX), default 1
+//   - LoRA-only; the server rejects non-LoRA versions AND re-checks base-model
+//     compatibility + entitlement BEFORE any Buzz spend.
+//
+// MONEY-SAFETY: a LoRA pick + its weight are DISCOVERY ONLY. The server
+// re-validates (LoRA? compatible? entitled?) AND re-prices the whole body at
+// every estimate AND submit, so a client choice is never trusted.
+// ---------------------------------------------------------------------------
+
+/** Server `additionalResources[].strength` bounds (mirrors WorkflowBody). */
+export const LORA_STRENGTH_MIN = -1;
+export const LORA_STRENGTH_MAX = 2;
+/** Server default strength when none is given. */
+export const DEFAULT_LORA_WEIGHT = 1;
+/** Server cap on additional resources (max 5 LoRAs per body). */
+export const MAX_LORAS = 5;
+
+/** A LoRA the user has added on top of the checkpoint, with its weight. */
+export interface LoraOption {
+  /** ModelVersion id → an `additionalResources[].modelVersionId` entry. */
+  versionId: number;
+  /** Parent Model id — display/label only (the wire only needs versionId). */
+  modelId: number;
+  /** Short display label for the list. */
+  label: string;
+  /** Base-model family — display/label only; compatibility is a SERVER authority. */
+  baseModel: string;
+  /** The LoRA's weight → its `additionalResources[].strength`. Clamped to [-1, 2]. */
+  weight: number;
+}
+
+/** Clamp a LoRA weight into the server-accepted [-1, 2] range; non-finite → default. */
+export function clampLoraWeight(weight: number | null | undefined): number {
+  const w = weight == null || !Number.isFinite(weight) ? DEFAULT_LORA_WEIGHT : weight;
+  return Math.max(LORA_STRENGTH_MIN, Math.min(LORA_STRENGTH_MAX, w));
+}
+
+/** Round a weight to 2 decimals so display + dedup agree (0.30000001 → 0.3). */
+export function roundLoraWeight(weight: number): number {
+  return Math.round(weight * 100) / 100;
+}
+
+/**
+ * The default checkpoint a fresh session starts on — a foundational,
+ * multi-million-generation public base verified Public + generation-covered +
+ * SFW: SD XL 1.0 (VAE fix) (versionId 128078 / modelId 101055). It's the initial
+ * state so Generate works at first paint, before the user opens the picker. The
+ * user replaces it via the host's checkpoint picker (`useCheckpointPicker`).
+ * DISCOVERY ONLY — the server re-validates + re-prices it like any pick.
+ */
+export const DEFAULT_CHECKPOINT: CheckpointOption = {
+  versionId: 128078,
+  modelId: 101055,
+  label: 'SD XL 1.0',
+  baseModel: 'SDXL 1.0',
+};
+
+// ---------------------------------------------------------------------------
+// Pick → option helpers.
+//
+// `useCheckpointPicker().open(...)` resolves with a `BlockCheckpointInfo` and
+// `useResourcePicker().open(...)` with a `BlockResourceInfo` — both carry the
+// public display names (`modelName`/`versionName`) the HOST resolved for the
+// resource the user picked. These mappers turn that pick into a CheckpointOption
+// / LoraOption with the same money-safety invariants as the default checkpoint.
+// Everything here is DISCOVERY ONLY — the wire is re-validated + re-priced
+// server-side at estimate/submit.
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal shape of a picked resource — the common subset of the SDK's
+ * `BlockCheckpointInfo` and `BlockResourceInfo`. We accept the names as optional
+ * so the mappers tolerate a host that omitted them (older host / partial reply).
+ */
+export interface PickedResource {
+  versionId: number;
+  modelId: number;
+  /** Public display name of the picked model (e.g. "DreamShaper"). */
+  modelName?: string;
+  /** Public display name of the picked model version (e.g. "v8"). */
+  versionName?: string;
+  baseModel: string;
+}
+
+/**
+ * Build a human display name from a pick's `modelName`/`versionName`, or
+ * `undefined` when neither is present. Prefers "<model> — <version>" when both
+ * exist (e.g. "DreamShaper — v8"); falls back to whichever single name is set.
+ * Whitespace-only names are treated as absent.
+ */
+function resourceDisplayName(names?: { modelName?: string; versionName?: string }): string | undefined {
+  const model = names?.modelName?.trim();
+  const version = names?.versionName?.trim();
+  if (model && version) return `${model} — ${version}`;
+  return model || version || undefined;
+}
+
+/**
+ * Label a picked checkpoint. PREFER the public display name; fall back to the
+ * version id + base model ("Model #128078 (SDXL 1.0)") when no name is present.
+ * The fallback is deterministic, dedupes, and still tells the user the family.
+ */
+export function pickedCheckpointLabel(
+  versionId: number,
+  baseModel: string,
+  names?: { modelName?: string; versionName?: string },
+): string {
+  return resourceDisplayName(names) ?? `Model #${versionId} (${baseModel})`;
+}
+
+/** Turn a picked resource (`BlockCheckpointInfo`) into a `CheckpointOption`. */
+export function checkpointFromPick(picked: PickedResource): CheckpointOption {
+  return {
+    versionId: picked.versionId,
+    modelId: picked.modelId,
+    label: pickedCheckpointLabel(picked.versionId, picked.baseModel, picked),
+    baseModel: picked.baseModel,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// LoRA pick → option + the selected-LoRA list mutators (pure + total). The App
+// holds the selected list in state and drives every change through these so the
+// money-relevant invariants (the MAX_LORAS cap, the weight clamp, no duplicate
+// versionId) live in one tested place.
+// ---------------------------------------------------------------------------
+
+/**
+ * Turn a discovered LoRA into a selectable LoraOption at a given weight
+ * (defaults to DEFAULT_LORA_WEIGHT). The weight is clamped + rounded so the
+ * value the user sees is exactly what's submitted.
+ */
+export function loraOption(
+  src: Omit<LoraOption, 'weight'>,
+  weight: number = DEFAULT_LORA_WEIGHT,
+): LoraOption {
+  return { ...src, weight: roundLoraWeight(clampLoraWeight(weight)) };
+}
+
+/** Turn a picked resource (`BlockResourceInfo`) into a LoraOption (label-resolved like a checkpoint). */
+export function loraFromPick(picked: PickedResource, weight?: number): LoraOption {
+  return loraOption(
+    {
+      versionId: picked.versionId,
+      modelId: picked.modelId,
+      label: resourceDisplayName(picked) ?? `LoRA #${picked.versionId} (${picked.baseModel})`,
+      baseModel: picked.baseModel,
+    },
+    weight,
+  );
+}
+
+/**
+ * Add a LoRA to the selected list. No-ops if it's already present (dedup by
+ * versionId) OR the MAX_LORAS cap is already reached (the server caps at 5; we
+ * never let the UI build a body that would be rejected). Returns a new array.
+ */
+export function addLora(
+  selected: readonly LoraOption[],
+  lora: LoraOption,
+): LoraOption[] {
+  if (selected.length >= MAX_LORAS) return [...selected];
+  if (selected.some((l) => l.versionId === lora.versionId)) return [...selected];
+  return [...selected, loraOption(lora, lora.weight)];
+}
+
+/** Remove a LoRA from the selected list by versionId. Returns a new array. */
+export function removeLora(selected: readonly LoraOption[], versionId: number): LoraOption[] {
+  return selected.filter((l) => l.versionId !== versionId);
+}
+
+/** Set a selected LoRA's weight (clamped + rounded). Returns a new array. */
+export function setLoraWeight(
+  selected: readonly LoraOption[],
+  versionId: number,
+  weight: number,
+): LoraOption[] {
+  const w = roundLoraWeight(clampLoraWeight(weight));
+  return selected.map((l) => (l.versionId === versionId ? { ...l, weight: w } : l));
+}
+
+/** versionIds already selected — drives dedup at the picker callback. */
+export function selectedLoraIds(selected: readonly LoraOption[]): Set<number> {
+  return new Set(selected.map((l) => l.versionId));
+}

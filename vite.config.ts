@@ -1,0 +1,137 @@
+/// <reference types="vitest/config" />
+import { defineConfig, loadEnv } from 'vite';
+import react from '@vitejs/plugin-react';
+
+import { civitaiSetupPlugin } from './vite-plugin-civitai-setup.js';
+import { DEV_ALLOWED_HOSTS, devServerSecurityHeaders } from './src/dev-embed.js';
+
+// base MUST be '/' — the platform serves the build output at the root of the
+// app's own subdomain and server-owns the manifest iframe.src (the W10 page
+// surface iframes the bundle at /apps/run/dataset-commons). No path prefix.
+export default defineConfig(({ mode }) => {
+  // Read NON-`VITE_`-prefixed env (the empty prefix loads everything) SERVER-SIDE
+  // at config time. CIVITAI_HOST_KEY is the dev's PERSONAL key — it must NEVER be
+  // bundled into client JS (that's why it's not `VITE_`-prefixed: Vite only
+  // exposes `VITE_*` to client code). The dev-live host nav reads the Buzz
+  // balance through the proxy below, which injects this key SERVER-SIDE as the
+  // Authorization header — the client never sees or references the key. Put it in
+  // the git-ignored `.env.development.local`. Unset → the balance route 401s and
+  // the nav gracefully shows the name only.
+  const env = loadEnv(mode, process.cwd(), '');
+  const hostKey = env.CIVITAI_HOST_KEY;
+  const proxyTarget = env.VITE_LIVE_HOST_ORIGIN || 'https://civitai.com';
+
+  // `civitai app dev-tunnel` runs `dev:tunnel`, which sets CIVITAI_DEV_TUNNEL_HMR=1
+  // (see package.json). When tunneling, Vite's injected `@vite/client` must open
+  // its HMR socket over the PUBLIC tunnel host (`wss://dev-<16hex>.civit.ai:443`),
+  // NOT the dev server's own `ws://localhost:5186` — which the browser INSIDE the
+  // `dev-<hex>.civit.ai` iframe cannot reach (that's why HMR silently fails on the
+  // tunnel while a manual hard-reload still works). The websocket knobs live on
+  // `server.ws` (Vite 8.1 renamed the old `server.hmr` websocket options —
+  // `clientPort`/`protocol`/`host`/… — to `server.ws`; the `server.hmr` aliases
+  // are deprecated). Setting `clientPort: 443` + `protocol: 'wss'` while LEAVING
+  // `ws.host` UNSET makes the client derive the host from `location.hostname` —
+  // which, inside the tunneled iframe, IS the `dev-<hex>.civit.ai` host, and is
+  // minted at runtime AFTER Vite starts so it can't be hardcoded here. For plain
+  // `dev` / `dev:harness` / `dev:live` (flag unset) HMR stays at its DEFAULT local
+  // ws — forcing wss:443 there would BREAK local live-reload. Deterministic env
+  // gate, not a host heuristic.
+  const tunnelHmr =
+    env.CIVITAI_DEV_TUNNEL_HMR === '1' || env.CIVITAI_DEV_TUNNEL_HMR === 'true';
+
+  return {
+  base: '/',
+  // civitaiSetupPlugin is `apply: 'serve'` (dev-only) — it powers the dev:live
+  // wizard's "Set up automatically" button (POST /__civitai/setup-dev-live: mint
+  // the dev token from the local manifest + merge-write .env.development.local).
+  // It is NEVER active in `vite build`, so none of it (or the pasted key it
+  // handles) reaches the client bundle.
+  plugins: [react(), civitaiSetupPlugin()],
+  server: {
+    // The dev harness fires a fake BLOCK_INIT from window.location.origin and
+    // the SDK IframeTransport drops any postMessage whose origin isn't its
+    // allowed parent origin. Pin host+port so that origin is stable.
+    host: 'localhost',
+    port: 5186,
+    strictPort: true,
+    // `civitai app dev-tunnel` serves THIS dev server, through a reverse tunnel,
+    // as a dev-*.civit.ai host that the real https://civitai.com/apps/dev/<id>
+    // parent iframes. Two things make that embed work (both DEV-ONLY — `server.*`
+    // never applies to `vite build`, so the production framing is untouched):
+    //   1. allowedHosts admits the tunneled `.civit.ai` host (Vite's DNS-rebinding
+    //      check would otherwise 403 it), and
+    //   2. a `frame-ancestors https://civitai.com` CSP + NO X-Frame-Options lets
+    //      civitai.com frame it. (The block's parent-origin ALLOWLIST also needs
+    //      civitai.com — see .env.development's VITE_BLOCK_ALLOWED_PARENT_ORIGINS.)
+    // See src/dev-embed.ts (single source of truth + tests).
+    allowedHosts: DEV_ALLOWED_HOSTS,
+    headers: devServerSecurityHeaders(),
+    // Route HMR over the tunnel ONLY when `dev:tunnel` set the gate flag (see
+    // `tunnelHmr` above). Spread-in so plain dev leaves `server.ws` at default.
+    ...(tunnelHmr ? { ws: { clientPort: 443, protocol: 'wss' } } : {}),
+    // dev:live backend proxy. In live mode the SDK's createLiveHost fetches
+    // /api/... with `backendBaseUrl: ''` (see src/dev-transport.ts) so the
+    // browser hits THIS dev server SAME-ORIGIN — no cross-origin preflight (N1).
+    // Vite then proxies server-side to civitai and REWRITES the Origin header to
+    // an allowlisted host, which is LOAD-BEARING: civitai's tRPC isAcceptableOrigin
+    // gate rejects a localhost Origin with "Please use the public API instead" (N2).
+    // Both N1 and N2 are fixed by this one same-origin + Origin-rewrite proxy.
+    // `VITE_LIVE_HOST_ORIGIN` overrides the proxy TARGET (read from env at config
+    // time — NOT import.meta.env); default https://civitai.com.
+    proxy: {
+      // The Buzz-balance route for the dev:live host nav. The page block token
+      // can't read Buzz, so we inject the dev's PERSONAL key (CIVITAI_HOST_KEY)
+      // as the Authorization header SERVER-SIDE here — it never reaches client
+      // JS. This route MUST be declared BEFORE the catch-all `/api` so it wins.
+      // No key set → no header injected → the route 401s → nav shows name only.
+      '/api/trpc/buzz.getBuzzAccount': {
+        target: proxyTarget,
+        changeOrigin: true,
+        headers: {
+          origin: 'https://civitai.com',
+          // Injected only when CIVITAI_HOST_KEY is present (empty object otherwise).
+          ...(hostKey ? { authorization: `Bearer ${hostKey}` } : {}),
+        },
+      },
+      // Catch-all backend proxy for the live host's protocol calls (estimate /
+      // submit / poll / cancel / blocks.me / blocks.models). These carry the
+      // BLOCK token from the client (the live host sets the Bearer); we only
+      // rewrite the Origin. The personal key is NEVER injected here.
+      '/api': {
+        target: proxyTarget,
+        changeOrigin: true, // rewrites Host to the target
+        headers: { origin: 'https://civitai.com' }, // satisfies the origin gate (N2) + no CORS (N1)
+      },
+    },
+  },
+  build: {
+    target: 'es2022',
+    rollupOptions: { output: { manualChunks: undefined } },
+  },
+  test: {
+    // Two suites in one `vitest run`:
+    //  - `node`: pure-logic unit tests (*.test.ts) — no DOM, fast.
+    //  - `dom` : component + e2e tests (*.test.tsx) — jsdom + testing-library,
+    //            driving <App/> against the SDK's createMockHost.
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'node',
+          environment: 'node',
+          include: ['src/**/*.test.ts'],
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'dom',
+          environment: 'jsdom',
+          include: ['src/**/*.test.tsx'],
+          setupFiles: ['./src/test-setup.ts'],
+        },
+      },
+    ],
+  },
+  };
+});

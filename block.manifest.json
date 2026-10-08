@@ -1,0 +1,41 @@
+{
+  "$schema": "https://civitai.com/schemas/app-block/v1.json",
+  "blockId": "dataset-commons",
+  "bootSkeleton": true,
+  "buildCommand": "npm run build",
+  "contentRating": "g",
+  "iframe": {
+    "maxHeight": 4000,
+    "minHeight": 600,
+    "resizable": true,
+    "sandbox": "allow-scripts allow-forms"
+  },
+  "minApiVersion": "1.0",
+  "name": "Open Datasets",
+  "tagline": "Assemble datasets together, vote the training set in, train LoRAs, and track contributor shares.",
+  "description": "Open Datasets is a community dataset builder for LoRA training. Contributors add images with captions, the community votes items in or out, and a trainer can freeze a vote-weighted snapshot and train a LoRA on Civitai's trainer with the price confirmed up front. Tracked Buzz events for a trained LoRA are split across contributors by their frozen snapshot weight in an in-app ledger (tracked shares only — the app does not pay out Buzz). Dataset owners can edit or delete their datasets.",
+  "category": "generation",
+  "outputDir": "dist",
+  "page": {
+    "buzzBudgetPerGen": 1000,
+    "icon": "bolt",
+    "path": "/",
+    "title": "Open Datasets"
+  },
+  "scopeJustifications": {
+    "ai:write:budgeted": "Runs image generations on the user's behalf, spending from the per-generation Buzz budget the page grants.",
+    "apps:storage:read": "Reads the viewer's own settings and contribution index for this app so their ledger view and theme preference reload with them.",
+    "apps:storage:shared:read": "Reads the community datasets, items, votes, snapshots, LoRA records, and tracked-credit ledger every viewer of this app shares.",
+    "apps:storage:shared:write": "Lets a viewer contribute datasets and items, cast changeable up/down votes, and record training snapshots, LoRA links, and tracked-credit events that other viewers of this app can see.",
+    "apps:storage:write": "Saves the viewer's own settings and contribution index for this app; no other viewer's data is touched."
+  },
+  "scopes": [
+    "ai:write:budgeted",
+    "apps:storage:read",
+    "apps:storage:write",
+    "apps:storage:shared:read",
+    "apps:storage:shared:write"
+  ],
+  "type": "block",
+  "version": "0.1.5"
+}

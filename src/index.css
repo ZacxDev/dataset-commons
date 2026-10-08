@@ -1,0 +1,106 @@
+:root {
+  /* DARK ONLY by default (Archive Lab — Sharpened): the app never follows the
+     browser/OS scheme. Light exists solely under the explicit in-app override
+     selector `[data-theme='light']` below. */
+  color-scheme: dark;
+}
+
+/* Archive Lab — Sharpened token overrides (spec §8; theme pick A, 2026-10-06),
+   scoped to every app surface root via [data-dc-archive] so the shell and the
+   community/train surfaces share ONE palette family: a deeper charcoal base,
+   cyan reserved strictly for the primary action, and amber
+   (--civitai-color-warning) reserved for ledger/earnings surfaces only.
+   Dark is the unqualified base; the light block applies ONLY when the user
+   explicitly toggles the override in-app. */
+[data-dc-archive] {
+  --civitai-color-primary: #25c2d8;
+  --civitai-color-primary-hover: #58d6e8;
+  --civitai-color-warning: #e8a33d;
+  --civitai-color-surface: #121c24;
+  --civitai-color-surface-2: #1a2833;
+  --civitai-color-text: #eef3f5;
+  --civitai-color-text-dimmed: #9aa7b1;
+  --civitai-color-border: #243746;
+  --dc-archive-bg: #0b1116;
+  --dc-archive-surface: #121c24;
+  --dc-archive-surface-2: #1a2833;
+  --dc-archive-ledger: #e8a33d;
+  color-scheme: dark;
+}
+
+[data-dc-archive][data-theme='light'] {
+  --civitai-color-primary: #0b7285;
+  --civitai-color-primary-hover: #1098ad;
+  --civitai-color-surface: #ffffff;
+  --civitai-color-surface-2: #e8eef2;
+  --civitai-color-text: #16202a;
+  --civitai-color-text-dimmed: #5a6b76;
+  --civitai-color-border: #c9d4db;
+  --dc-archive-bg: #f1f5f8;
+  --dc-archive-surface: #ffffff;
+  --dc-archive-surface-2: #e8eef2;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+}
+
+body {
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* Focus affordance for any raw textarea/button (the W6 /ui pack styles its own
+   controls). Use the pack's brand accent so the outline matches, not a clashing
+   gold; --civitai-color-primary is defined by the stylesheet
+   @civitai/blocks-react/ui injects. Every --civitai-color-* token referenced
+   anywhere under templates/ is checked against that pack's published token set
+   by internal/scaffold/design_tokens_guard_test.go — see its testdata ledger. */
+textarea:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--civitai-color-primary);
+  outline-offset: 2px;
+}
+
+/* Responsive layout (full-width desktop, stacked mobile). Breakpoints are
+   written as raw px on purpose: a var() inside a media-query prelude is dead.
+   Tiers mirror Civitai's block scale (sm 768 · md 1024 · lg 1184 · xl 1440). */
+.od-grid-cards {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
+}
+@media (min-width: 768px) {
+  .od-grid-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1184px) {
+  .od-grid-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.od-grid-items {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
+}
+@media (min-width: 768px) {
+  .od-grid-items { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1440px) {
+  .od-grid-items { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.od-detail-layout {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+}
+@media (min-width: 1024px) {
+  .od-detail-layout { grid-template-columns: minmax(0, 1fr) 400px; align-items: start; }
+}

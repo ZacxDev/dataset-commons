@@ -1,0 +1,633 @@
+import { StrictMode, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { createRoot } from 'react-dom/client';
+
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Group,
+  Stack,
+  TextInput,
+  injectBlocksStyles,
+} from '@civitai/blocks-react/ui';
+
+import { App } from './App.js';
+import { Harness } from './Harness.js';
+import {
+  getHarnessMode,
+  installHarnessTransport,
+  installLiveHost,
+  resolveLiveConfig,
+} from './dev-transport.js';
+import {
+  isTokenExpired,
+  navDisplay,
+  parseBuzzBalance,
+  parseViewerName,
+  shouldPromptReMint,
+} from './nav.js';
+import './index.css';
+
+// Dev harness entry. The mode decides the surface:
+//
+//   VITE_DEV_HARNESS=true   -> mount a harness at all (never in prod).
+//   VITE_HARNESS_MODE=mock  -> (default) the SDK MOCK host. Synthetic, no real
+//                              Buzz, no compute, no network. `npm run dev:harness`.
+//   VITE_HARNESS_MODE=live  -> the SDK LIVE host (`createLiveHost`): forwards the
+//                              protocol to the REAL Civitai backend with a REAL
+//                              block token — spends REAL Buzz / real compute.
+//                              `npm run dev:live`. With no VITE_LIVE_BLOCK_TOKEN
+//                              it FAILS SAFE (renders a notice, never spends).
+//
+// Prod builds set neither and render <App/> bare (the platform is the host).
+const useHarness = import.meta.env.VITE_DEV_HARNESS === 'true';
+const mode = getHarnessMode();
+
+// The mock host replies from window.location.origin; the SDK transport drops
+// mismatched-origin messages. Allowlist this origin BEFORE any hook runs so
+// BLOCK_INIT lands. (Prod uses VITE_BLOCK_ALLOWED_PARENT_ORIGINS instead.)
+// Live mode does the same inside installLiveHost (deferred to mount).
+if (useHarness && mode === 'mock') {
+  // 0.18's mock host natively answers the balance read (from the `buzzBalance`
+  // option <Harness> passes) and stamps `spentAccountType` on succeeded
+  // snapshots, so no local shim is registered here.
+  installHarnessTransport();
+}
+
+const container = document.getElementById('root');
+if (!container) throw new Error('#root missing from index.html');
+
+/** Render decision for the harness. */
+function Root() {
+  if (!useHarness) return <App />;
+
+  if (mode === 'live') {
+    const live = resolveLiveConfig();
+    if (!live.ready) return <LiveUnavailable />;
+    return <LiveApp token={live.token} backendBaseUrl={live.backendBaseUrl} />;
+  }
+
+  // mode === 'mock'
+  return (
+    <Harness>
+      <App />
+    </Harness>
+  );
+}
+
+/**
+ * LIVE harness mount. Installs the SDK's real `createLiveHost` (which forwards
+ * the protocol to the real backend, Bearer = the dev token) on mount and tears
+ * it down on unmount, then renders <App/> against it. A successful submit here
+ * SPENDS REAL BUZZ.
+ *
+ * The harness IS the host here, so it renders a minimal HOST NAV above the app
+ * (on the real platform this nav is civitai's own chrome, OUTSIDE the iframe) —
+ * the dev's profile name + Buzz balance + a persistent "LIVE · spends real Buzz"
+ * safety pill. See {@link HostNav} for the credential split.
+ */
+function LiveApp({ token, backendBaseUrl }: { token: string; backendBaseUrl: string }) {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    const uninstall = installLiveHost({ token, backendBaseUrl });
+    setReady(true);
+    return uninstall;
+  }, [token, backendBaseUrl]);
+
+  return (
+    <>
+      <HostNav blockToken={token} backendBaseUrl={backendBaseUrl} />
+      {ready ? <App /> : null}
+    </>
+  );
+}
+
+/**
+ * The minimal dev:live HOST NAV — profile name + Buzz balance + the LIVE safety
+ * pill. Console/minimal chrome to match the harness. Both reads go SAME-ORIGIN
+ * through the vite dev proxy (no CORS, Origin rewritten server-side).
+ *
+ * CREDENTIAL SPLIT (security-critical):
+ *  - PROFILE NAME — `/api/v1/blocks/me` authed with the page-scoped BLOCK TOKEN
+ *    (the same VITE_LIVE_BLOCK_TOKEN the app uses). Faithful to prod: a page
+ *    block CAN read its own viewer.
+ *  - BUZZ BALANCE — `/api/trpc/buzz.getBuzzAccount`. The page token canNOT read
+ *    Buzz (no `buzz:read:self`), so the dev proxy injects the dev's PERSONAL key
+ *    as the Authorization header SERVER-SIDE, only on that route (see
+ *    vite.config.ts). The key is NEVER `VITE_`-bundled — this client code never
+ *    references it; it just fetches the same-origin route. With no key set the
+ *    balance route 401s and the nav GRACEFULLY shows the name only (no error).
+ *
+ * EXPIRED-TOKEN SURFACING: dev block tokens live ~4h. An expired token
+ * SILENTLY degrades (the block still renders — `createLiveHost` reads claims
+ * unverified — and the balance still resolves via the personal key), so a dead
+ * token looks like feature bugs. We detect it two ways — a client-side `exp`
+ * read AND a 401 from `/blocks/me` (server reject) — and render a prominent
+ * re-mint banner ABOVE the nav strip instead of the misleading neutral 'viewer'.
+ */
+function HostNav({ blockToken, backendBaseUrl }: { blockToken: string; backendBaseUrl: string }) {
+  const [name, setName] = useState<string | null>(null);
+  const [balance, setBalance] = useState<number | null>(null);
+  // The HTTP status of the LAST `/blocks/me` failure (a 401 = server rejected
+  // the token), or `null` on success / network error. Distinct from `name` so a
+  // 401 surfaces the re-mint banner even when the name can't resolve.
+  const [meStatus, setMeStatus] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const base = backendBaseUrl.replace(/\/+$/, '');
+
+    // Profile name: block token, same-origin via the proxy. CAPTURE the HTTP
+    // status on failure (don't discard it) — a 401 means the server rejected the
+    // token (expired / bad kid) and we must prompt a re-mint.
+    void fetch(`${base}/api/v1/blocks/me`, {
+      headers: { Authorization: `Bearer ${blockToken}` },
+    })
+      .then(async (r) => {
+        if (cancelled) return;
+        if (!r.ok) {
+          setMeStatus(r.status); // name stays null; status drives the banner
+          return;
+        }
+        setMeStatus(null);
+        setName(parseViewerName(await r.json()));
+      })
+      .catch(() => {
+        /* network error → name stays null, no server status (no banner from here) */
+      });
+
+    // Buzz balance: NO Authorization header here — the dev proxy injects the
+    // personal key server-side on this route (see vite.config.ts). With no key
+    // the route 401s and the balance stays hidden (name-only nav).
+    void fetch(`${base}/api/trpc/buzz.getBuzzAccount`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body) => {
+        if (!cancelled) setBalance(parseBuzzBalance(body));
+      })
+      .catch(() => {
+        /* balance stays null → hidden */
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [blockToken, backendBaseUrl]);
+
+  // The token is static, so a component-body Date.now() is fine. clientExpired =
+  // our unverified exp-read; promptReMint folds in the server's 401.
+  const clientExpired = isTokenExpired(blockToken, Date.now());
+  const promptReMint = shouldPromptReMint(clientExpired, meStatus);
+
+  const display = navDisplay(name, balance);
+
+  return (
+    <>
+      {promptReMint && (
+        <div data-testid="pm-nav-remint" data-theme="dark" style={remintBannerStyle}>
+          <Alert
+            color="warning"
+            title="Dev token expired — re-mint to restore your session"
+            data-harness-banner="token-expired"
+          >
+            <Stack gap={8}>
+              <span style={stepLabelStyle}>
+                Your dev block token is no longer valid (they last ~4&nbsp;h). The block still
+                renders and your Buzz balance still shows (those use your personal key), but the
+                live session is running on a dead token — re-mint it:
+              </span>
+              <CmdRow cmd="civitai app dev-token dataset-commons --env >> .env.development.local" />
+              <span style={stepLabelStyle}>
+                then restart <code>dev:live</code> (or it auto-restarts when <code>.env</code>{' '}
+                changes).
+              </span>
+            </Stack>
+          </Alert>
+        </div>
+      )}
+      <nav data-harness-banner="live" data-theme="dark" style={navStyle}>
+        <span style={navProfileStyle} data-testid="pm-nav-name">
+          {promptReMint ? (
+            <span style={navExpiredStyle}>token expired</span>
+          ) : (
+            <>
+              <span style={navAvatarStyle} aria-hidden>
+                {display.name.charAt(0).toUpperCase()}
+              </span>
+              {display.name}
+            </>
+          )}
+        </span>
+        <span style={navRightStyle}>
+          {display.balance != null && (
+            <span style={navBalanceStyle} data-testid="pm-nav-balance">
+              ⚡ {display.balance} Buzz
+            </span>
+          )}
+          {promptReMint ? (
+            <span style={navExpiredPillStyle} data-testid="pm-nav-pill">
+              token expired
+            </span>
+          ) : (
+            <span style={navPillStyle} data-testid="pm-nav-pill">
+              LIVE · spends real Buzz
+            </span>
+          )}
+        </span>
+      </nav>
+    </>
+  );
+}
+
+/** Clipboard / check glyphs for the copy icon button (zero-dep inline SVG). */
+const ClipboardGlyph = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="9" y="9" width="13" height="13" rx="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>
+);
+const CheckGlyph = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M20 6 9 17l-5-5" />
+  </svg>
+);
+
+/**
+ * An icon-only "copy to clipboard" button (W6 pack Button) with a transient
+ * checkmark state, so each command row stays compact. `onCopied` (optional) fires
+ * once the copy succeeds — the wizard passes it to AUTO-ADVANCE to the next step
+ * on the current step's copy, so copying a command moves you forward.
+ */
+function CopyButton({ text, onCopied }: { text: string; onCopied?: () => void }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <Button
+      variant="subtle"
+      size="sm"
+      color={copied ? 'success' : 'primary'}
+      aria-label={copied ? 'Copied' : 'Copy command'}
+      title={copied ? 'Copied!' : 'Copy'}
+      onClick={() => {
+        void navigator.clipboard?.writeText(text).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+          onCopied?.();
+        });
+      }}
+    >
+      {copied ? <CheckGlyph /> : <ClipboardGlyph />}
+    </Button>
+  );
+}
+
+/** A copyable command row: the command in a code block + a copy icon button. */
+function CmdRow({ cmd, onCopied }: { cmd: string; onCopied?: () => void }) {
+  return (
+    <Group gap={8} align="stretch" wrap={false}>
+      <pre style={cmdStyle}>{cmd}</pre>
+      <CopyButton text={cmd} onCopied={onCopied} />
+    </Group>
+  );
+}
+
+/**
+ * One step of the progressive setup wizard. Hidden until reached (`n <= current`);
+ * once the user advances past it (`n < current`) the number badge becomes a green
+ * check, but the step's content (commands) stays visible so the full recipe is
+ * always there to re-copy.
+ */
+function WizardStep({
+  n,
+  current,
+  title,
+  children,
+}: {
+  n: number;
+  current: number;
+  title: ReactNode;
+  children: ReactNode;
+}) {
+  if (n > current) return null;
+  const done = n < current;
+  return (
+    <Stack gap={8}>
+      <Group gap={10} align="center">
+        <Badge color={done ? 'success' : 'primary'} variant={done ? 'filled' : 'light'}>
+          {done ? '✓' : n}
+        </Badge>
+        <strong style={stepLabelStyle}>{title}</strong>
+      </Group>
+      {children}
+    </Stack>
+  );
+}
+
+/** The endpoint the dev-only vite plugin registers (vite-plugin-civitai-setup.ts). */
+const SETUP_ENDPOINT = '/__civitai/setup-dev-live';
+
+/** Auto-setup request state for the "Set up automatically" button. */
+type SetupState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'done' }
+  | { kind: 'error'; message: string };
+
+/**
+ * Fail-safe LIVE screen — shown when `dev:live` is requested but no spendable
+ * dev token is set. The PRIMARY path is ONE CLICK: paste your personal API key,
+ * click "Set up automatically", and the dev server (which runs in Node, unlike
+ * the page) mints the dev block token from your local `block.manifest.json` +
+ * writes `.env.development.local` + auto-restarts into live mode — paste → click
+ * → done. The manual command recipe (login → dev-token → restart) is kept as a
+ * FALLBACK behind a disclosure. Live mode ALWAYS spends real Buzz, hence the
+ * credential-first flow (an OAuth login can't spend).
+ *
+ * SECURITY: the pasted key is POSTed to the localhost dev-only endpoint, which
+ * writes it to the git-ignored `.env.development.local` as the non-`VITE_` host
+ * key (never bundled). The browser never persists it; this client code never
+ * bundles the plugin (it's `apply: 'serve'`).
+ */
+function LiveUnavailable() {
+  injectBlocksStyles();
+  const [apiKey, setApiKey] = useState('');
+  const [setup, setSetup] = useState<SetupState>({ kind: 'idle' });
+  const trimmedKey = apiKey.trim();
+
+  // The minted key's name is app-specific so it's recognizable in the user's key
+  // list; the scope is the minimal "AI Services" preset (all a personal key needs
+  // to mint a spendable dev token). Params are inert on older civitai builds —
+  // the link still lands on /user/account, so it degrades gracefully.
+  const tokenName = 'App Dataset Commons dev token';
+  const apiKeyUrl =
+    'https://civitai.com/user/account?addApiKey=1&name=' +
+    encodeURIComponent(tokenName) +
+    '&scope=AIServices';
+
+  // The one-click path: POST the pasted key to the dev-only localhost endpoint.
+  // On success the dev server writes .env.development.local → vite auto-restarts
+  // (it watches .env*) → the page reloads itself into live mode, so we just show
+  // "Done — restarting…". On failure we surface the actionable error + retry.
+  async function setUpAutomatically() {
+    if (trimmedKey.length === 0) {
+      setSetup({ kind: 'error', message: 'Paste your personal API key first.' });
+      return;
+    }
+    setSetup({ kind: 'loading' });
+    try {
+      const res = await fetch(SETUP_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: trimmedKey }),
+      });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
+      if (res.ok && body.ok) {
+        // Success — vite is about to restart; the page will reload itself.
+        setSetup({ kind: 'done' });
+      } else {
+        setSetup({ kind: 'error', message: body.error || `Setup failed (${res.status}).` });
+      }
+    } catch (e) {
+      setSetup({
+        kind: 'error',
+        message:
+          'Could not reach the dev server. Is `npm run dev:live` running? ' +
+          (e instanceof Error ? e.message : String(e)),
+      });
+    }
+  }
+
+  return (
+    <div data-harness-banner="live-unavailable" data-theme="dark" style={liveScreenStyle}>
+      <Card padding="lg" style={liveCardStyle}>
+        <Stack gap={16}>
+          <Group justify="space-between">
+            <strong style={liveCardTitleStyle}>Live mode setup</strong>
+            <Badge color="warning" variant="light">
+              spends REAL Buzz
+            </Badge>
+          </Group>
+
+          <Alert color="warning" title="Set your API key to authorize buzz spend">
+            Paste your personal API key and we'll set up your dev environment automatically.
+            <br />
+            Don't have one? Create a key at{' '}
+            <a href={apiKeyUrl} target="_blank" rel="noopener noreferrer" style={linkStyle}>
+              civitai.com/user/account
+            </a>
+          </Alert>
+
+          {/* PRIMARY path — one click. Paste the key, click, the dev server mints
+              the token + writes the env + auto-restarts into live mode. */}
+          <Stack gap={10}>
+            <TextInput
+              label="Your personal API key"
+              placeholder="paste the key you just created"
+              value={apiKey}
+              onChange={(e) => {
+                setApiKey(e.target.value);
+                if (setup.kind === 'error') setSetup({ kind: 'idle' });
+              }}
+            />
+            <Group gap={10} align="center">
+              <Button
+                color="primary"
+                onClick={() => void setUpAutomatically()}
+                disabled={setup.kind === 'loading' || setup.kind === 'done'}
+                data-testid="pm-setup-auto"
+              >
+                {setup.kind === 'loading'
+                  ? 'Setting up…'
+                  : setup.kind === 'done'
+                    ? 'Done — restarting…'
+                    : 'Set up automatically'}
+              </Button>
+              {setup.kind === 'done' && (
+                <span style={setupDoneStyle} data-testid="pm-setup-done">
+                  ✓ Reloading into live mode…
+                </span>
+              )}
+            </Group>
+            {setup.kind === 'error' && (
+              <Alert color="error" title="Setup failed">
+                {setup.message}
+              </Alert>
+            )}
+          </Stack>
+
+          {/* FALLBACK — the manual command recipe, demoted behind a disclosure.
+              Same knowledge as before (login → dev-token → restart), kept for
+              devs who prefer running the commands themselves. */}
+          <details style={manualDetailsStyle}>
+            <summary style={manualSummaryStyle}>Prefer to run the commands yourself?</summary>
+            <ManualSetupSteps apiKeyUrl={apiKeyUrl} trimmedKey={trimmedKey} />
+          </details>
+        </Stack>
+      </Card>
+    </div>
+  );
+}
+
+/**
+ * The manual fallback: the original 4-step progressive wizard (create key →
+ * authenticate the CLI → mint the dev token → restart), kept so the recipe isn't
+ * lost. Steps auto-advance (key non-empty → step 2; copying a step's command →
+ * the next step). Lives behind the "Prefer to run the commands yourself?"
+ * disclosure in {@link LiveUnavailable}.
+ */
+function ManualSetupSteps({ apiKeyUrl, trimmedKey }: { apiKeyUrl: string; trimmedKey: string }) {
+  const [step, setStep] = useState(1);
+  // Step 2's command carries the pasted key (placeholder until they paste).
+  const loginCmd = 'civitai login --token ' + (trimmedKey || '<your-personal-api-key>');
+  const mintCmd = 'civitai app dev-token dataset-commons --env >> .env.development.local';
+
+  // Step 1 AUTO-advances to step 2 the moment the API-key input becomes
+  // non-empty (no Next button) — there's nothing else to do on step 1. Guarded
+  // so it only advances FORWARD from step 1 (a later edit doesn't yank you back).
+  useEffect(() => {
+    if (step === 1 && trimmedKey.length > 0) setStep(2);
+  }, [step, trimmedKey]);
+
+  return (
+    <Stack gap={14} style={manualStepsStyle}>
+      <WizardStep n={1} current={step} title="Create your API key">
+        <span style={stepLabelStyle}>
+          Create your personal API key so your app can spend Buzz from your local dev
+          environment.{' '}
+          <a href={apiKeyUrl} target="_blank" rel="noopener noreferrer" style={linkStyle}>
+            civitai.com/user/account
+          </a>
+          {trimmedKey.length === 0 && ' — then paste it into the field above.'}
+        </span>
+      </WizardStep>
+
+      {/* Steps 2 + 3 AUTO-advance when you copy that step's command (the copy
+          icon's onCopied) — but only while it's the CURRENT step, so re-copying
+          an earlier command later doesn't jump you forward. */}
+      <WizardStep n={2} current={step} title="Authenticate the CLI with your key">
+        <CmdRow cmd={loginCmd} onCopied={step === 2 ? () => setStep(3) : undefined} />
+      </WizardStep>
+
+      <WizardStep n={3} current={step} title="Mint the dev token (no submit needed)">
+        <CmdRow cmd={mintCmd} onCopied={step === 3 ? () => setStep(4) : undefined} />
+      </WizardStep>
+
+      <WizardStep n={4} current={step} title="Restart dev:live">
+        <CmdRow cmd="npm run dev:live" />
+      </WizardStep>
+    </Stack>
+  );
+}
+
+// The dev:live host NAV — a console/minimal strip matching the harness chrome.
+// On the real platform this is civitai's own nav outside the iframe; here the
+// harness IS the host, so it renders a minimal equivalent (name + balance + the
+// LIVE safety pill). Monospace + dark, sticky at the top.
+const navStyle: CSSProperties = {
+  position: 'sticky',
+  top: 0,
+  zIndex: 9999,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: 12,
+  padding: '8px 14px',
+  background: '#0e0f12',
+  borderBottom: '1px solid #2a2c31',
+  color: '#e6e6e6',
+  fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+  fontSize: 13,
+};
+const navProfileStyle: CSSProperties = { display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600 };
+const navAvatarStyle: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  width: 22,
+  height: 22,
+  borderRadius: '50%',
+  background: '#3b3d44',
+  color: '#fff',
+  fontSize: 12,
+  fontWeight: 700,
+};
+const navRightStyle: CSSProperties = { display: 'flex', alignItems: 'center', gap: 12 };
+const navBalanceStyle: CSSProperties = { color: '#ffd43b', fontWeight: 600, fontVariantNumeric: 'tabular-nums' };
+const navPillStyle: CSSProperties = {
+  background: '#7a1f1f',
+  color: '#ffd8a8',
+  fontWeight: 700,
+  padding: '3px 10px',
+  borderRadius: 999,
+  whiteSpace: 'nowrap',
+};
+// When the dev token is expired, the name area + pill go honest ("token expired")
+// instead of the misleading neutral 'viewer' + the LIVE-spend pill.
+const navExpiredStyle: CSSProperties = { color: '#ffa94d', fontWeight: 700 };
+const navExpiredPillStyle: CSSProperties = {
+  background: '#7a5a1f',
+  color: '#ffe8cc',
+  fontWeight: 700,
+  padding: '3px 10px',
+  borderRadius: 999,
+  whiteSpace: 'nowrap',
+};
+// The re-mint banner sits sticky ABOVE the nav strip, themed so the W6 Alert's
+// CSS vars resolve against the dark host chrome.
+const remintBannerStyle: CSSProperties = {
+  position: 'sticky',
+  top: 0,
+  zIndex: 10000,
+  padding: '10px 14px',
+  background: '#0e0f12',
+  borderBottom: '1px solid #2a2c31',
+};
+
+// The fail-safe screen themes its OWN root (data-theme) so the W6 pack's CSS
+// vars resolve, then uses the pack's surface/text tokens — matching the real
+// app instead of the old bespoke amber theme.
+const liveScreenStyle: CSSProperties = {
+  minHeight: '100dvh',
+  display: 'flex',
+  justifyContent: 'center',
+  alignItems: 'flex-start',
+  padding: 24,
+  boxSizing: 'border-box',
+  background: 'var(--civitai-color-surface-2)',
+  color: 'var(--civitai-color-text)',
+};
+const liveCardStyle: CSSProperties = { width: '100%', maxWidth: 640 };
+const liveCardTitleStyle: CSSProperties = { fontSize: 20 };
+const stepLabelStyle: CSSProperties = { lineHeight: 1.5 };
+const linkStyle: CSSProperties = { color: 'var(--civitai-color-primary)', fontWeight: 600 };
+const setupDoneStyle: CSSProperties = { color: 'var(--civitai-color-success, #2f9e44)', fontWeight: 600 };
+// The manual fallback is a quiet disclosure beneath the one-click path.
+const manualDetailsStyle: CSSProperties = {
+  borderTop: '1px solid var(--civitai-color-border)',
+  paddingTop: 12,
+};
+const manualSummaryStyle: CSSProperties = {
+  cursor: 'pointer',
+  color: 'var(--civitai-color-text-dimmed, #868e96)',
+  fontSize: 13,
+  userSelect: 'none',
+};
+const manualStepsStyle: CSSProperties = { marginTop: 14 };
+const cmdStyle: CSSProperties = {
+  flex: 1,
+  margin: 0,
+  padding: '10px 12px',
+  background: 'var(--civitai-color-surface)',
+  border: '1px solid var(--civitai-color-border)',
+  borderRadius: 6,
+  color: 'var(--civitai-color-text)',
+  fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+  fontSize: 13,
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-all',
+};
+
+createRoot(container).render(
+  <StrictMode>
+    <Root />
+  </StrictMode>,
+);
