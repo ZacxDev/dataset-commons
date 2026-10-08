@@ -32,6 +32,8 @@ import { mockBuzzBalance } from './mock-buzz.js';
  *   ?costPerGen=12      -> cost reported per generation
  *   ?failNext=1         -> fail the next N submits (generic gen error)
  *   ?failRate=0.5       -> probabilistic submit failures
+ *   ?training=published -> training finishes with a published LoRA linked
+ *   ?community=demo     -> seed the demo dataset/items/votes
  *
  * The on-screen scenario panel maps the same controls onto buttons so a dev can
  * flip them live (it re-mounts the mock host with the new options).
@@ -49,12 +51,25 @@ export function Harness({ children }: { children: ReactNode }) {
 
   const [scenario, setScenario] = useState<MockHostOptions>(() => {
     const base = initial.current as MockHostOptions;
-    const wantsDemo =
-      typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('community') === 'demo';
+    const params = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
+    const wantsDemo = params.get('community') === 'demo';
+    // Deterministic training outcome for headless walks: the run
+    // finishes with epochs ready and a published LoRA linked (the
+    // same state the scenario panel's button applies, without a
+    // remount mid-walk).
+    const trainingPublished = params.get('training') === 'published';
     return {
       ...base,
       declaredScopes: [...new Set([...(base.declaredScopes ?? []), ...ALL_APP_SCOPES])],
       ...(wantsDemo && !base.shared ? { shared: { seed: demoSharedSeed() } } : {}),
+      ...(trainingPublished
+        ? {
+            generation: {
+              trainedEpochs: 10,
+              trainingPublishedModel: { modelId: 42, modelVersionId: 84, published: true },
+            },
+          }
+        : {}),
     };
   });
   const [scenarioKey, setScenarioKey] = useState(0);

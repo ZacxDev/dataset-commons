@@ -292,6 +292,74 @@ export function Community() {
     [entries, folded.datasets, runWrite, viewerId],
   );
 
+  const deleteDataset = useCallback(
+    async (datasetId: string): Promise<boolean> => {
+      const existing = folded.datasets.find((d) => d.datasetId === datasetId);
+      if (!existing || viewerId == null) return false;
+      if (existing.ownerId !== viewerId) {
+        setNotice('Only the dataset owner can delete it.');
+        return false;
+      }
+      return runWrite(`delete-dataset-${datasetId}`, async () => {
+        const datasetItems = folded.items.filter((item) => item.datasetId === datasetId);
+        const itemIds = new Set(datasetItems.map((item) => item.itemId));
+        // Remove the dataset's visible contents first. The owner's own
+        // entries are withdrawn; another contributor's item gets the same
+        // removal record the detail screen writes, so the fold hides it.
+        for (const item of datasetItems) {
+          if (folded.removals.some((r) => r.itemId === item.itemId)) continue;
+          if (item.contributorId === viewerId && item.storageKey) {
+            const withdrawn = await sharedRef.current.withdraw(item.storageKey);
+            if (!withdrawn.deleted) throw new Error('an item record was not withdrawn');
+          } else {
+            await sharedRef.current.append(
+              removalSharedValue({
+                itemId: item.itemId,
+                datasetId,
+                actorId: viewerId,
+                reason: 'owner-remove',
+                createdAt: new Date().toISOString(),
+              }),
+            );
+          }
+        }
+        // The viewer can withdraw their own votes on the dataset/items;
+        // votes left by other viewers point at records that no longer fold.
+        for (const vote of folded.votes) {
+          if (
+            vote.voterId === viewerId &&
+            vote.storageKey &&
+            ((vote.targetKind === 'dataset' && vote.targetId === datasetId) ||
+              (vote.targetKind === 'item' && itemIds.has(vote.targetId)))
+          ) {
+            await sharedRef.current.withdraw(vote.storageKey);
+          }
+        }
+        // Frozen snapshots and LoRA links belong to the dataset's training
+        // history; withdrawing them keeps a deleted scratch dataset from
+        // resurfacing through LoRA detail or the contributor ledger.
+        for (const snapshot of folded.snapshots.filter((s) => s.datasetId === datasetId)) {
+          const key = folded.snapshotStorageKeys.get(snapshot.snapshotId);
+          if (key) {
+            const withdrawn = await sharedRef.current.withdraw(key);
+            if (!withdrawn.deleted) throw new Error('a snapshot record was not withdrawn');
+          }
+        }
+        for (const lora of folded.loras.filter((l) => l.datasetId === datasetId)) {
+          if (lora.storageKey) {
+            const withdrawn = await sharedRef.current.withdraw(lora.storageKey);
+            if (!withdrawn.deleted) throw new Error('a LoRA record was not withdrawn');
+          }
+        }
+        if (!existing.storageKey) throw new Error('dataset record has no storage key to withdraw');
+        const withdrawn = await sharedRef.current.withdraw(existing.storageKey);
+        if (!withdrawn.deleted) throw new Error('dataset record was not withdrawn');
+        setRoute({ name: 'explore' });
+      }, 'Dataset deleted.');
+    },
+    [folded, runWrite, viewerId],
+  );
+
   const castVote = useCallback(
     async (targetKind: 'dataset' | 'item', targetId: string, clicked: 1 | -1) => {
       if (!requireViewer() || viewerId == null) return;
@@ -643,6 +711,7 @@ export function Community() {
             busyKey={busyKey}
             onBack={() => setRoute({ name: 'explore' })}
             onEdit={() => setRoute({ name: 'edit', datasetId: selectedDataset.datasetId })}
+            onDelete={() => void deleteDataset(selectedDataset.datasetId)}
             onTrain={() => setRoute({ name: 'train', datasetId: selectedDataset.datasetId })}
             onOpenLora={(loraId) => setRoute({ name: 'lora', loraId })}
             onVote={(kind, id, value) => void castVote(kind, id, value)}
@@ -947,6 +1016,7 @@ function DatasetDetail(props: {
   busyKey: string | null;
   onBack: () => void;
   onEdit: () => void;
+  onDelete: () => void;
   onTrain: () => void;
   onOpenLora: (loraId: string) => void;
   onVote: (kind: 'dataset' | 'item', id: string, value: 1 | -1) => void;
@@ -1024,6 +1094,11 @@ function DatasetDetail(props: {
         {isOwner && (
           <Button variant="light" onClick={props.onEdit} data-testid="dc-edit-dataset">
             Edit dataset
+          </Button>
+        )}
+        {isOwner && (
+          <Button variant="subtle" color="red" onClick={props.onDelete} data-testid="dc-delete-dataset">
+            Delete dataset
           </Button>
         )}
       </div>

@@ -129,6 +129,27 @@ describe('Community screens (voting option b)', () => {
     expect(screen.getByTestId(`dc-votes-${itemId}`)).toBeDisabled();
   });
 
+  it('owner can delete a dataset so a scratch dataset leaves no Explore record', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      declaredScopes: [...ALL_APP_SCOPES],
+      shared: { seed: [] },
+    });
+    await openCommunity(user);
+    await user.click(await screen.findByTestId('dc-community-enable'));
+    await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
+
+    await user.click(screen.getByTestId('dc-create-first-dataset'));
+    await user.type(screen.getByTestId('dc-dataset-name'), 'Scratch Delete');
+    await user.click(screen.getByTestId('dc-dataset-save'));
+    expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toHaveTextContent('Scratch Delete');
+
+    await user.click(screen.getByTestId('dc-delete-dataset'));
+    expect(await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.queryByText('Scratch Delete')).not.toBeInTheDocument();
+  });
+
   it('gated images render visible, hidden, and rating-pending states without leaking a hidden url', async () => {
     const user = userEvent.setup();
     const dataset: DatasetRecord = {
