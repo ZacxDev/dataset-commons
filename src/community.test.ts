@@ -182,6 +182,8 @@ describe('foldSharedEntries + buildCommunityView', () => {
       ['a', 'user:11', 5],
       ['b', 'user:12', 1],
     ]);
+    expect(trainingItems[0]).toMatchObject({ imageId: 101 });
+    expect(trainingItems[1]).not.toHaveProperty('imageId');
   });
 
   it('snapshot share rows use frozen weights, not live votes', () => {

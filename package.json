@@ -1,12 +1,12 @@
 {
   "name": "dataset-commons",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
-  "description": "Civitai App (page money path) \u2014 estimate -> consent -> submit -> poll -> real Buzz spend, wired to the published App SDK.",
+  "description": "Civitai App (page money path) — estimate -> consent -> submit -> poll -> real Buzz spend, wired to the published App SDK.",
   "license": "MIT",
   "scripts": {
-    "postinstall": "node -e \"console.log('\\n\u2713 Installed. Next: npm run dev:harness   (preview \u2014 mock host, no Buzz)\\n  real generation: civitai app dev-token <slug> -> npm run dev:live (no submit needed; see README)   \u00b7   publish: civitai app submit')\"",
+    "postinstall": "node -e \"console.log('\\n✓ Installed. Next: npm run dev:harness   (preview — mock host, no Buzz)\\n  real generation: civitai app dev-token <slug> -> npm run dev:live (no submit needed; see README)   ·   publish: civitai app submit')\"",
     "dev": "vite",
     "dev:harness": "VITE_DEV_HARNESS=true VITE_HARNESS_MODE=mock vite --host localhost --port 5186",
     "dev:live": "VITE_DEV_HARNESS=true VITE_HARNESS_MODE=live vite --host localhost --port 5186",
@@ -17,8 +17,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@civitai/app-sdk": "^0.57.0",
-    "@civitai/blocks-react": "^0.64.0",
+    "@civitai/app-sdk": "^0.58.0",
+    "@civitai/blocks-react": "^0.65.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

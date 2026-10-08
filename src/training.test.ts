@@ -8,10 +8,13 @@ import {
   blobKeyFromUrl,
   buildPublishWizardPath,
   buildTrainingBody,
+  buildTrainingKindBody,
   canAffordQuote,
   classifyTrainingEstimate,
+  classifyTrainingKindQuote,
   contributorShares,
   creditLedgerEvent,
+  describeEstimateFailure,
   deriveContributorCredits,
   freezeSnapshot,
   includedItems,
@@ -20,6 +23,8 @@ import {
   trackedTotals,
   trainingFailureCopy,
   trainingFeeEvent,
+  trainingKindEligibility,
+  trainingKindRunFailure,
   trainingStateForSnapshot,
   type DatasetItem,
 } from './training.js';
@@ -295,6 +300,130 @@ describe('buildTrainingBody (the #541 pass-through shape)', () => {
   });
 });
 
+describe("dedicated kind: 'training' (the viewer's own images)", () => {
+  it('freezeSnapshot carries Civitai image ids into the frozen record', () => {
+    const snap = freezeSnapshot('ds1', 'trainer', [item({ itemId: 'a', imageId: 101 })], {
+      snapshotId: 's-image-id',
+    });
+    expect(snap.items[0]).toMatchObject({ imageId: 101 });
+  });
+
+  it('eligibility is ready only when every included item is the trainer\'s own image with an id', () => {
+    const snap = freezeSnapshot('ds1', 'trainer', [
+      item({ itemId: 'a', contributorId: 'trainer', imageId: 101, caption: 'one' }),
+      item({ itemId: 'b', contributorId: 'trainer', imageId: 102, caption: 'two' }),
+      item({ itemId: 'out', contributorId: 'someone-else', imageId: 103, netVotes: 0 }),
+    ]);
+    const eligibility = trainingKindEligibility(snap);
+    expect(eligibility.ready).toBe(true);
+    expect(eligibility.candidates).toEqual([
+      { itemId: 'a', imageId: 101, caption: 'one' },
+      { itemId: 'b', imageId: 102, caption: 'two' },
+    ]);
+    expect(eligibility.blockers).toEqual([]);
+  });
+
+  it('eligibility names blockers instead of silently training a subset', () => {
+    const snap = freezeSnapshot('ds1', 'trainer', [
+      item({ itemId: 'other', contributorId: 'bob', imageId: 201 }),
+      item({ itemId: 'no-id', contributorId: 'trainer' }),
+      item({ itemId: 'dup-a', contributorId: 'trainer', imageId: 202 }),
+      item({ itemId: 'dup-b', contributorId: 'trainer', imageId: 202 }),
+      item({ itemId: 'long', contributorId: 'trainer', imageId: 203, caption: 'x'.repeat(1001) }),
+    ]);
+    const eligibility = trainingKindEligibility(snap);
+    expect(eligibility.ready).toBe(false);
+    expect(eligibility.candidates.map((candidate) => candidate.itemId)).toEqual(['dup-a']);
+    expect(eligibility.blockers.map((blocker) => blocker.itemId)).toEqual(['other', 'no-id', 'dup-b', 'long']);
+    expect(eligibility.blockers[0]!.reason).toMatch(/contributed by someone else/);
+    expect(eligibility.blockers[1]!.reason).toMatch(/no Civitai image ID/);
+    expect(eligibility.blockers[2]!.reason).toMatch(/duplicates Civitai image #202/);
+    expect(eligibility.blockers[3]!.reason).toMatch(/longer than 1000/);
+  });
+
+  it('eligibility blocks items beyond the 50-image prepared-dataset limit', () => {
+    const many = Array.from({ length: 51 }, (_, index) =>
+      item({ itemId: `i${index}`, contributorId: 'trainer', imageId: index + 1 }),
+    );
+    const eligibility = trainingKindEligibility(freezeSnapshot('ds1', 'trainer', many));
+    expect(eligibility.ready).toBe(false);
+    expect(eligibility.candidates).toHaveLength(50);
+    expect(eligibility.blockers).toEqual([
+      expect.objectContaining({ itemId: 'i50', reason: expect.stringMatching(/50-image limit/) }),
+    ]);
+  });
+
+  it('builds the exact training-kind body the quote and run must share', () => {
+    const body = buildTrainingKindBody({
+      preparedDatasetId: 'tds_0123456789abcdef0123456789abcdef',
+      config: {
+        preset: DEFAULT_TRAINING_PRESET,
+        triggerWord: ' mytok ',
+        steps: 2000,
+        epochs: 10,
+        samplePrompt: '',
+      },
+    });
+    expect(body).toMatchObject({
+      kind: 'training',
+      datasetId: 'tds_0123456789abcdef0123456789abcdef',
+      engine: 'ai-toolkit',
+      model: 'sdxl',
+      triggerWord: 'mytok',
+      samplePrompts: ['mytok, portrait'],
+    });
+    expect(body.params).toMatchObject({
+      engine: 'ai-toolkit',
+      ecosystem: 'sdxl',
+      steps: 2000,
+      epochs: 10,
+      resolution: 1024,
+      lr: 0.0001,
+      trainTextEncoder: false,
+      lrScheduler: 'cosine',
+      optimizerType: 'adamw8bit',
+      networkDim: 32,
+      networkAlpha: 16,
+    });
+    expect(body).not.toHaveProperty('quoteId');
+  });
+
+  it('classifies a training quote only when the server quote is usable and matches cost', () => {
+    const quote = {
+      quoteId: `tq_${'a'.repeat(32)}`,
+      total: 725,
+      imageCount: 2,
+      expiresAt: '2026-10-08T20:00:00.000Z',
+    };
+    expect(classifyTrainingKindQuote({ cost: { total: 725 }, trainingQuote: quote })).toEqual({
+      kind: 'quoted',
+      quote,
+    });
+    expect(classifyTrainingKindQuote({ cost: { total: 725 } }).kind).toBe('missing');
+    expect(classifyTrainingKindQuote({ cost: { total: 700 }, trainingQuote: quote }).kind).toBe('missing');
+    expect(
+      classifyTrainingKindQuote({ trainingQuote: { ...quote, total: 5001 } }).kind,
+    ).toBe('missing');
+  });
+
+  it('run failures keep the money meaning exact: declined, unconfirmed, refused', () => {
+    expect(trainingKindRunFailure({ declined: true }).kind).toBe('declined');
+    expect(trainingKindRunFailure({ declined: true }).message).toMatch(/no Buzz was charged/);
+
+    const unconfirmed = trainingKindRunFailure({ unconfirmed: true, message: 'submission-unconfirmed' });
+    expect(unconfirmed.kind).toBe('unconfirmed');
+    expect(unconfirmed.message).toMatch(/may have been charged/);
+    expect(unconfirmed.message).toMatch(/will not retry automatically/);
+
+    const refused = trainingKindRunFailure({ refused: true, message: 'daily Buzz cap reached' });
+    expect(refused.kind).toBe('refused');
+    expect(refused.message).toMatch(/daily Buzz cap reached/);
+    expect(refused.message).toMatch(/nothing was charged/);
+
+    expect(trainingKindRunFailure({ signInRequired: true }).kind).toBe('sign-in');
+  });
+});
+
 describe('classifyTrainingEstimate (the quote gate)', () => {
   it('cost above maxBuzz is the real quote', () => {
     expect(classifyTrainingEstimate(512, 1)).toEqual({ kind: 'quoted', cost: 512 });
@@ -309,6 +438,24 @@ describe('classifyTrainingEstimate (the quote gate)', () => {
     expect(classifyTrainingEstimate(undefined, 1)).toEqual({ kind: 'missing' });
     expect(classifyTrainingEstimate(Number.NaN, 1)).toEqual({ kind: 'missing' });
     expect(classifyTrainingEstimate(0, 1)).toEqual({ kind: 'missing' });
+  });
+
+  it('describeEstimateFailure surfaces the message, and the code when present', () => {
+    expect(describeEstimateFailure(new Error('orchestrator refused'))).toBe('orchestrator refused');
+    const coded = Object.assign(new Error('host refused'), { code: 'TRAINING_UNSUPPORTED' });
+    expect(describeEstimateFailure(coded)).toBe('host refused (code: TRAINING_UNSUPPORTED)');
+    expect(describeEstimateFailure({ message: 'nope', code: 'X1' })).toBe('nope (code: X1)');
+    expect(
+      describeEstimateFailure({
+        message: 'estimate did not return a usable price (failed) — reason on .snapshot.error',
+        code: 'failed',
+        snapshot: { error: 'this training run costs 5001 Buzz, above the per-run limit' },
+      }),
+    ).toBe('this training run costs 5001 Buzz, above the per-run limit (code: failed)');
+    expect(describeEstimateFailure({ code: 'ONLY_CODE' })).toBe('estimate failed (code: ONLY_CODE)');
+    expect(describeEstimateFailure('plain string failure')).toBe('plain string failure');
+    expect(describeEstimateFailure(null)).toBe('the estimate returned no usable cost');
+    expect(describeEstimateFailure(undefined)).toBe('the estimate returned no usable cost');
   });
 });
 

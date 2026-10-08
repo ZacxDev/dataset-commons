@@ -64,8 +64,8 @@ describe('block.manifest.json — training contract', () => {
     expect(PAGE_BUZZ_BUDGET).toBe(manifest.page.buzzBudgetPerGen);
   });
 
-  it('pins the SDK pair that types trainedEpochs / publishedModel', () => {
-    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.57.0');
-    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.64.0');
+  it('pins the SDK pair that types the training hooks + trainedEpochs / publishedModel', () => {
+    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.58.0');
+    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.65.0');
   });
 });

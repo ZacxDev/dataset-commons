@@ -13,7 +13,7 @@
   "minApiVersion": "1.0",
   "name": "Open Datasets",
   "tagline": "Assemble datasets together, vote the training set in, train LoRAs, and track contributor shares.",
-  "description": "Open Datasets is a community dataset builder for LoRA training. Contributors add images with captions, the community votes items in or out, and a trainer can freeze a vote-weighted snapshot and train a LoRA on Civitai's trainer with the price confirmed up front. Tracked Buzz events for a trained LoRA are split across contributors by their frozen snapshot weight in an in-app ledger (tracked shares only — the app does not pay out Buzz). Dataset owners can edit or delete their datasets.",
+  "description": "Open Datasets is a community dataset builder for LoRA training. Contributors add images with captions, the community votes items in or out, and a trainer can freeze a vote-weighted snapshot and train a LoRA on Civitai's trainer with the price confirmed up front. Tracked Buzz events for a trained LoRA are split across contributors by their frozen snapshot weight in an in-app ledger (tracked shares only \u2014 the app does not pay out Buzz). Dataset owners can edit or delete their datasets.",
   "category": "generation",
   "outputDir": "dist",
   "page": {
@@ -37,5 +37,5 @@
     "apps:storage:shared:write"
   ],
   "type": "block",
-  "version": "0.1.5"
+  "version": "0.1.6"
 }
