@@ -24,7 +24,11 @@
 //    rounding so per-contributor credits always sum back to the gross amount.
 //  - Amounts are tracked credit, never paid/spendable Buzz (locked decision).
 
-import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
+import type {
+  BlockTrainingQuote,
+  BlockWorkflowSnapshot,
+  WorkflowBodyTraining,
+} from '@civitai/app-sdk/blocks';
 
 // ---------------------------------------------------------------------------
 // Dataset items + uploads
@@ -38,6 +42,8 @@ export interface DatasetItem {
   contributorName?: string;
   /** Civitai-hosted image url (from `useImageUpload`), or a reference url. */
   imageUrl: string;
+  /** Civitai image id when the contribution carries one (own-images training). */
+  imageId?: number;
   caption: string;
   /** Live net votes (up − down) at the moment the snapshot is frozen. */
   netVotes: number;
@@ -121,6 +127,8 @@ export interface SnapshotItem {
   contributorId: string;
   contributorName?: string;
   imageUrl: string;
+  /** Civitai image id when the live item carried one. */
+  imageId?: number;
   caption: string;
   /** Net votes frozen at snapshot time. */
   frozenNetVotes: number;
@@ -180,6 +188,7 @@ export function freezeSnapshot(
         contributorId: item.contributorId,
         ...(item.contributorName ? { contributorName: item.contributorName } : {}),
         imageUrl: item.imageUrl,
+        ...(item.imageId != null ? { imageId: item.imageId } : {}),
         caption: item.caption,
         frozenNetVotes: net,
         weight: 0,
@@ -193,6 +202,7 @@ export function freezeSnapshot(
         contributorId: item.contributorId,
         ...(item.contributorName ? { contributorName: item.contributorName } : {}),
         imageUrl: item.imageUrl,
+        ...(item.imageId != null ? { imageId: item.imageId } : {}),
         caption: item.caption,
         frozenNetVotes: net,
         weight: Math.max(net, 1),
@@ -205,6 +215,7 @@ export function freezeSnapshot(
       contributorId: item.contributorId,
       ...(item.contributorName ? { contributorName: item.contributorName } : {}),
       imageUrl: item.imageUrl,
+      ...(item.imageId != null ? { imageId: item.imageId } : {}),
       caption: item.caption,
       frozenNetVotes: net,
       weight: 0,
@@ -368,6 +379,10 @@ export interface TrainingPreset {
   approxBuzz: number;
   /** Platform status: true while the per-call budget clamps at 1000 Buzz. */
   withinCurrentCap: boolean;
+  /** Dedicated `kind: 'training'` catalog key/ecosystem, when wired. */
+  trainingKindModel?: string;
+  trainingKindEcosystem?: 'sdxl';
+  trainingKindResolution?: number;
 }
 
 /**
@@ -380,7 +395,7 @@ export interface TrainingPreset {
  * training kind (civitai/civitai#5434, flag-off at time of writing).
  */
 export const TRAINING_PRESETS: readonly TrainingPreset[] = [
-  { id: 'sdxl', label: 'SDXL', ecosystem: 'sdxl', modelAir: 'urn:air:sdxl:checkpoint:civitai:101055@128078', approxBuzz: 500, withinCurrentCap: true },
+  { id: 'sdxl', label: 'SDXL', ecosystem: 'sdxl', modelAir: 'urn:air:sdxl:checkpoint:civitai:101055@128078', approxBuzz: 500, withinCurrentCap: true, trainingKindModel: 'sdxl', trainingKindEcosystem: 'sdxl', trainingKindResolution: 1024 },
   { id: 'pony', label: 'Pony (~500 Buzz — base AIR not wired in v1)', ecosystem: 'sdxl', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
   { id: 'illustrious', label: 'Illustrious (~500 Buzz — base AIR not wired in v1)', ecosystem: 'sdxl', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
   { id: 'sd15', label: 'SD 1.5 (~500 Buzz — base AIR not wired in v1)', ecosystem: 'sd1', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
@@ -445,6 +460,223 @@ export function buildTrainingBody(
 export type TrainingBody = ReturnType<typeof buildTrainingBody>;
 
 // ---------------------------------------------------------------------------
+// Dedicated `kind: 'training'` path — the viewer's own Civitai images
+// ---------------------------------------------------------------------------
+
+export const TRAINING_KIND_MAX_ITEMS = 50;
+export const TRAINING_KIND_CAPTION_MAX_CHARS = 1000;
+export const TRAINING_KIND_MAX_BUZZ = 5000;
+
+export interface TrainingKindCandidate {
+  itemId: string;
+  imageId: number;
+  caption: string;
+}
+
+export interface TrainingKindBlocker {
+  itemId: string;
+  contributorId: string;
+  reason: string;
+}
+
+export interface TrainingKindEligibility {
+  candidates: TrainingKindCandidate[];
+  blockers: TrainingKindBlocker[];
+  /** True only when EVERY included snapshot item can go through this path. */
+  ready: boolean;
+}
+
+/**
+ * Decide whether a frozen snapshot can use Civitai's dedicated training kind.
+ * That host path admits only the signed-in trainer's own images, so this app
+ * deliberately does not silently train a subset of a collaborative snapshot:
+ * every included item must be the trainer's, carry a Civitai image id, have a
+ * caption inside the host bound, and fit the 50-image dataset bound. Anything
+ * else is returned as a blocker for the UI to name.
+ */
+export function trainingKindEligibility(
+  snapshot: DatasetSnapshot,
+  trainerId: string = snapshot.trainerId,
+): TrainingKindEligibility {
+  const candidates: TrainingKindCandidate[] = [];
+  const blockers: TrainingKindBlocker[] = [];
+  const seenImageIds = new Set<number>();
+  for (const item of includedItems(snapshot)) {
+    if (item.contributorId !== trainerId) {
+      blockers.push({
+        itemId: item.itemId,
+        contributorId: item.contributorId,
+        reason: 'it was contributed by someone else; the trainer\'s own-images path cannot submit it',
+      });
+      continue;
+    }
+    if (item.imageId == null || !Number.isInteger(item.imageId) || item.imageId <= 0) {
+      blockers.push({
+        itemId: item.itemId,
+        contributorId: item.contributorId,
+        reason: 'it has no Civitai image ID, so Civitai cannot verify that it is the trainer\'s own image',
+      });
+      continue;
+    }
+    if (item.caption.length > TRAINING_KIND_CAPTION_MAX_CHARS) {
+      blockers.push({
+        itemId: item.itemId,
+        contributorId: item.contributorId,
+        reason: `its caption is longer than ${TRAINING_KIND_CAPTION_MAX_CHARS} characters`,
+      });
+      continue;
+    }
+    if (seenImageIds.has(item.imageId)) {
+      blockers.push({
+        itemId: item.itemId,
+        contributorId: item.contributorId,
+        reason: `it duplicates Civitai image #${item.imageId} already in the training set`,
+      });
+      continue;
+    }
+    if (candidates.length >= TRAINING_KIND_MAX_ITEMS) {
+      blockers.push({
+        itemId: item.itemId,
+        contributorId: item.contributorId,
+        reason: `it is beyond the ${TRAINING_KIND_MAX_ITEMS}-image limit for one prepared training dataset`,
+      });
+      continue;
+    }
+    seenImageIds.add(item.imageId);
+    candidates.push({ itemId: item.itemId, imageId: item.imageId, caption: item.caption });
+  }
+  return { candidates, blockers, ready: includedItems(snapshot).length > 0 && blockers.length === 0 };
+}
+
+/**
+ * Build the dedicated training body for a dataset Civitai prepared from the
+ * trainer's own images. The estimate call sends this exact object WITHOUT a
+ * quoteId; the run call sends `{ ...body, quoteId }` and changes nothing else.
+ */
+export function buildTrainingKindBody(args: {
+  preparedDatasetId: string;
+  config: TrainingConfig;
+}): WorkflowBodyTraining {
+  const { preset } = args.config;
+  if (!preset.trainingKindModel || !preset.trainingKindEcosystem) {
+    throw new Error(`Training preset "${preset.id}" is not wired for Civitai's own-images training kind in this build.`);
+  }
+  if (!args.preparedDatasetId) {
+    throw new Error('Cannot build an own-images training body before Civitai prepares the dataset.');
+  }
+  const trigger = args.config.triggerWord.trim() || 'dataset';
+  const sample = args.config.samplePrompt.trim() || `${trigger}, portrait`;
+  return {
+    kind: 'training',
+    datasetId: args.preparedDatasetId,
+    engine: 'ai-toolkit',
+    model: preset.trainingKindModel,
+    params: {
+      engine: 'ai-toolkit',
+      ecosystem: preset.trainingKindEcosystem,
+      steps: Math.max(1, Math.trunc(args.config.steps) || 1),
+      epochs: Math.max(1, Math.trunc(args.config.epochs) || 1),
+      resolution: preset.trainingKindResolution ?? 1024,
+      lr: 0.0001,
+      textEncoderLr: null,
+      trainTextEncoder: false,
+      lrScheduler: 'cosine',
+      optimizerType: 'adamw8bit',
+      networkDim: 32,
+      networkAlpha: 16,
+      noiseOffset: null,
+      minSnrGamma: null,
+      flipAugmentation: false,
+      shuffleTokens: false,
+      keepTokens: 0,
+    },
+    triggerWord: trigger,
+    samplePrompts: [sample],
+  };
+}
+
+export type TrainingKindQuoteClass =
+  | { kind: 'quoted'; quote: BlockTrainingQuote }
+  | { kind: 'missing'; detail: string };
+
+/**
+ * Classify a `kind: 'training'` estimate. The usable price is the server-stored
+ * `trainingQuote`, not merely a cost number: without its quoteId the app cannot
+ * honestly hand the run to Civitai's consent dialog.
+ */
+export function classifyTrainingKindQuote(
+  snapshot: Pick<BlockWorkflowSnapshot, 'trainingQuote' | 'cost'>,
+): TrainingKindQuoteClass {
+  const quote = snapshot.trainingQuote;
+  if (!quote) {
+    return {
+      kind: 'missing',
+      detail: `The estimate returned no training quote (cost total was ${snapshot.cost?.total ?? 'absent'}).`,
+    };
+  }
+  if (
+    !quote.quoteId ||
+    !Number.isFinite(quote.total) ||
+    quote.total <= 0 ||
+    quote.total > TRAINING_KIND_MAX_BUZZ ||
+    !Number.isInteger(quote.imageCount) ||
+    quote.imageCount < 1
+  ) {
+    return { kind: 'missing', detail: 'The estimate returned a training quote that is not usable.' };
+  }
+  if (snapshot.cost?.total != null && Math.round(snapshot.cost.total) !== Math.round(quote.total)) {
+    return {
+      kind: 'missing',
+      detail: `The estimate cost (${snapshot.cost.total}) does not match the training quote (${quote.total}).`,
+    };
+  }
+  return { kind: 'quoted', quote: { ...quote, total: Math.round(quote.total) } };
+}
+
+export type TrainingKindRunFailureKind = 'declined' | 'unconfirmed' | 'refused' | 'sign-in' | 'error';
+
+export interface TrainingKindRunFailure {
+  kind: TrainingKindRunFailureKind;
+  message: string;
+}
+
+/**
+ * Translate a `useRunTraining()` failure into copy that is exact about whether
+ * a run or charge may exist. The dangerous class is `unconfirmed`: never call
+ * it a failure and never invite an automatic retry.
+ */
+export function trainingKindRunFailure(error: unknown): TrainingKindRunFailure {
+  const record = typeof error === 'object' && error !== null ? (error as Record<string, unknown>) : {};
+  const detail = describeEstimateFailure(error);
+  if (record.declined === true || record.code === 'declined') {
+    return {
+      kind: 'declined',
+      message: "Civitai's training dialog was dismissed, so no run was submitted and no Buzz was charged.",
+    };
+  }
+  if (record.unconfirmed === true || record.timedOut === true || record.code === 'submission-unconfirmed') {
+    return {
+      kind: 'unconfirmed',
+      message:
+        'The training submission is unconfirmed — a run may exist and may have been charged. Check your Civitai trainings before trying again; this app will not retry automatically.',
+    };
+  }
+  if (record.signInRequired === true || record.code === 'sign in to train') {
+    return { kind: 'sign-in', message: 'Sign in to train, then price the own-images run again.' };
+  }
+  if (record.refused === true || record.code === 'refused') {
+    return {
+      kind: 'refused',
+      message: `${detail} No run was started and nothing was charged. Price the run again before retrying.`,
+    };
+  }
+  return {
+    kind: 'error',
+    message: `${detail} No run was confirmed. Price the run again before retrying.`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Quote gate — the estimate decides whether a submit may happen at all
 // ---------------------------------------------------------------------------
 
@@ -471,6 +703,41 @@ export function classifyTrainingEstimate(
   if (costTotal > maxBuzz) return { kind: 'quoted', cost: Math.round(costTotal) };
   if (costTotal === maxBuzz) return { kind: 'unquoted' };
   return { kind: 'missing' };
+}
+
+/**
+ * One-line detail for a failed/unusable estimate, safe to show the viewer and
+ * precise enough to report upstream (#541 asks for the actual error): the
+ * error's message, plus its `code` when the host attached one.
+ */
+export function describeEstimateFailure(error: unknown): string {
+  if (typeof error === 'string' && error.trim()) return error.trim();
+  if (typeof error === 'object' && error !== null) {
+    const snapshot = (error as { snapshot?: unknown }).snapshot;
+    const snapshotError =
+      typeof snapshot === 'object' && snapshot !== null
+        ? (snapshot as { error?: unknown }).error
+        : undefined;
+    const code = (error as { code?: unknown }).code;
+    if (typeof snapshotError === 'string' && snapshotError.trim()) {
+      return typeof code === 'string' && code
+        ? `${snapshotError.trim()} (code: ${code})`
+        : snapshotError.trim();
+    }
+  }
+  if (error instanceof Error && error.message.trim()) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === 'string' && code ? `${error.message} (code: ${code})` : error.message;
+  }
+  if (typeof error === 'object' && error !== null) {
+    const message = (error as { message?: unknown }).message;
+    const code = (error as { code?: unknown }).code;
+    if (typeof message === 'string' && message.trim()) {
+      return typeof code === 'string' && code ? `${message} (code: ${code})` : message;
+    }
+    if (typeof code === 'string' && code) return `estimate failed (code: ${code})`;
+  }
+  return 'the estimate returned no usable cost';
 }
 
 /** Can the trainer afford the quoted run on their known balance? null = unknown. */

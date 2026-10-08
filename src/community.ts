@@ -500,6 +500,7 @@ export function trainingItemsForDataset(dataset: DatasetView): DatasetItem[] {
       contributorId: contributorKey(item.contributorId),
       contributorName: item.contributorName,
       imageUrl: item.imageRef,
+      ...(item.imageId != null ? { imageId: item.imageId } : {}),
       caption: item.caption,
       netVotes: item.netVotes,
     }));
