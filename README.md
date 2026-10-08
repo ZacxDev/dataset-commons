@@ -1,0 +1,761 @@
+# Open Datasets
+
+A Civitai **page money-path** App (Vite + React + TypeScript), wired to
+the published App SDK (`@civitai/blocks-react` + `@civitai/app-sdk`). It mounts
+as a full-page (W10) app at `/apps/run/dataset-commons` and spends Buzz to generate
+an image: pick a checkpoint, optionally layer on a few LoRAs (each with a
+weight) → estimate → (lazy consent) → submit → poll → result.
+
+## Every hook the SDK exports
+
+The COMPLETE, always-current list is
+<https://developer.civitai.com/apps/reference/hooks.md>. **Fetch it first.** Every
+capability this platform has is a hook, so if it is not there it is not a hook —
+check that page before concluding the platform cannot do something. It is
+generated from the published `@civitai/blocks-react`, so unlike a copy pasted into
+this file it cannot fall behind the package you actually installed.
+
+**A declared scope is not a granted scope.** `ai:write:budgeted` and
+`posts:write:self` are consent-gated: they are dropped from the token until the
+viewer consents, so you get a 403 while the manifest and the runtime both look
+correct — call `useRequestConsent()` and retry. A hook the reference lists with no
+scope is host-mediated (the host resolves the viewer from your block token).
+
+## What this is
+
+A sandboxed static web app served in an iframe by the Civitai host. Its UI is
+built from the **`@civitai/blocks-react/ui`** W6 component pack (Button, Textarea,
+Card, Stack, Group, Alert, Badge) — the one exception is each LoRA's weight
+control (a themed native range `<input>`, since the pack ships no Slider yet).
+The model + LoRA pickers are the HOST's own — the app never browses a catalog;
+it calls the SDK's `useCheckpointPicker` / `useResourcePicker` hooks and the host
+opens its native resource modal. The pack ships its own theme-aware styles;
+`injectBlocksStyles()` is called at module init in `src/App.tsx` so the first
+paint is already styled.
+
+The platform
+owns the build: it runs `npm ci` then the `buildCommand` from
+`block.manifest.json` (`npm run build`), serving the static output from
+`outputDir` (`dist/`). You do NOT commit `dist/` — the platform builds it.
+
+**Commit your lockfile.** The platform installs *strictly* from it — `npm ci`,
+with no registry re-resolve fallback — so builds are byte-reproducible. Without
+a committed `package-lock.json` the build hard-fails. If you prefer pnpm or
+yarn, set `"buildCommand"` to that package manager (plus the `"outputDir"` the
+manifest schema requires alongside it) and commit *that* lockfile instead:
+`"pnpm run build"` needs `pnpm-lock.yaml`, `"yarn run build"` needs `yarn.lock`.
+A lockfile that disagrees with `buildCommand` is the most common build failure
+there is — `civitai app validate` catches it before you submit.
+
+The money path uses the SDK hooks — never raw `window.parent.postMessage`. These
+are the ones THIS sample calls; the full export list is the hosted reference
+linked at the top of this file:
+
+- `useBuzzWorkflow()` — `estimate` / `submit` / `poll` (the spend).
+- `useBuzzBalance()` — the viewer's per-pool balance (`{ blue, green, yellow }`),
+  read host-side via the `GET_BUZZ_BALANCE` bridge — **no `buzz:read:self` scope
+  needed** (the host resolves the viewer from the block token). Use it to *reason*
+  about spend (which account can fund this?), **not** to re-display the balance —
+  the Civitai chrome around your app already shows it.
+- `useCheckpointPicker()` / `useResourcePicker()` — open the HOST's native
+  resource picker for the checkpoint + LoRAs (the app never browses a catalog).
+- `useRequestConsent()` — lazy, on first Generate: `ai:write:budgeted` is
+  consent-gated, so the token mints WITHOUT it; the grant arrives as a
+  `TOKEN_REFRESH` and the app auto-resumes the click.
+- `useBlockResize()` — the SDK reports height to the host safely.
+- `useBlockBreakpoint()` — the width tier of your block's own box, for layout
+  decisions. See below.
+
+Page constraints: a page is `entity=none` — it carries no HOST model context (a
+model slot would deliver `modelId`/`modelVersionId` via `BLOCK_INIT`; a page does
+not). So this app ships its OWN initial model choice — a curated default
+checkpoint (`DEFAULT_CHECKPOINT` in `src/models.ts`, so Generate works at first
+paint) — and lets the user CHANGE it via the host picker. The viewer's Buzz
+balance is read in-block via `useBuzzBalance()` (host-mediated, no scope) — an
+insufficient-Buzz `failed` snapshot is still handled as a backstop. The budget
+comes from `page.buzzBudgetPerGen` in the manifest.
+
+### Width-adaptive layout (`useBlockBreakpoint`)
+
+Your app renders inside whatever slot the host gave it, and **slot width is not
+monotonic in viewport width** — the `model.sidebar_top` slot is about 360px next
+to a 360px phone and only about 430px next to a 1440px desktop. So the useful
+question is "how wide am **I**?", not "how wide is the browser window?".
+
+`useBlockBreakpoint()` answers that. It observes your element with a
+`ResizeObserver` (a container query, effectively) and returns the width **tier**:
+
+```ts
+const bp = useBlockBreakpoint(rootRef); // or no ref → the sandbox document
+bp.tier;            // 'base' | 'xs' | 'sm' | 'md' | 'lg' | 'xl'
+bp.below('sm');     // true when narrower than 768px
+bp.atLeast('md');   // true at 1024px and up
+bp.measured;        // false until the first measurement lands
+```
+
+The scale is **CSS pixels**: `xs 480 · sm 768 · md 1024 · lg 1184 · xl 1440`.
+That is Civitai's own scale, and it is deliberately **not** Mantine's stock `em`
+scale (576 / 768 / 992 / 1200 / 1408) — the two agree on `sm` and nowhere else,
+so a check that only ever exercises 768 tells you nothing about the rest.
+
+It re-renders you on a **tier change only**, never per pixel, so branching on it
+is cheap. `src/App.tsx` uses it for exactly one decision — the Model row is a
+`Group` when there is room and a `Stack` when there is not — and
+`src/responsive.test.tsx` drives that at two widths. Keep the rest of your layout
+in fluid CSS; reach for the hook when you need a genuinely **different element
+tree**, not a different size.
+
+> 🔴 **`--civitai-bp-*` cannot be used in a query condition.** The tokens exist,
+> and putting one in the condition of a media or container query is the first
+> thing most people try — but a query's condition is evaluated before custom
+> properties are substituted, so the rule never matches. Nothing errors, nothing
+> warns, the build stays green, and your layout is silently stuck on one branch.
+> In CSS, write the pixel number out. In JS, use this hook.
+
+Full guide: <https://developer.civitai.com/apps/guide/responsive>
+
+### Model picker (host-served, server-revalidated)
+
+The **Change model** button calls `useCheckpointPicker().open({ baseModelGroup,
+currentVersionId })`. The HOST opens its own native checkpoint picker (in
+`dev:live` the SDK live host serves a protocol-identical in-harness catalog
+overlay; on the real platform it's civitai's own modal); the app never sees a
+catalog, a list, or any resource the user didn't pick. The picker resolves with a
+`BlockCheckpointInfo`, which `checkpointFromPick` (`src/models.ts`) maps into the
+selected checkpoint.
+
+A pick is **discovery only**. Nothing about a client-chosen checkpoint is trusted:
+the server **re-validates** (public? generation-covered? SFW for the domain?) and
+**re-prices** the body at every `estimate` AND `submit`. A client can POST any id
+regardless of what the picker showed — `buildWorkflowBody` is not the enforcement
+boundary; the spend path is.
+
+### LoRA selector (host-served, server-revalidated)
+
+On top of the checkpoint the user can layer up to **5 LoRAs**, each with an
+adjustable **weight** (the LoRA's `strength`, clamped to the server's `[-1, 2]`
+bound). The **Add LoRA** button calls `useResourcePicker().open({ resourceType:
+'LORA', baseModelGroup })`, the host opens its LoRA picker, and the pick
+(`BlockResourceInfo`) is appended via `loraFromPick` + `addLora`. LoRAs ride along
+as `additionalResources` in the workflow body — one `{ modelVersionId, strength }`
+entry per selected LoRA, emitted only when at least one is selected (a
+checkpoint-only body stays backward compatible).
+
+- **`src/models.ts`** — the LoRA types + the pure selection helpers (`addLora` /
+  `removeLora` / `setLoraWeight`) that enforce the dedup, the 5-LoRA cap
+  (`MAX_LORAS`), and the weight clamp, plus the pick→option mappers.
+
+LoRA picks + weights are **discovery only**, exactly like the checkpoint: the
+server is LoRA-only for additional resources and **re-validates** base-model
+compatibility + per-resource entitlement (early-access / Private) AND
+**re-prices** the whole body **before any Buzz spend**.
+
+### Comfy on Civitai samples (customComfy)
+
+A **mode toggle** at the top switches between two samples that share the one
+estimate → consent → submit → poll driver — only the body differs:
+
+- **Text to image** (primary, runnable today) — the checkpoint + LoRA path above.
+- **Comfy on Civitai recipe** (invite-only beta) — runs a **server-registered**
+  recipe via `buildComfyBody` in `src/comfy.ts`.
+
+`src/comfy.ts` also ships **`buildInlineComfyBody`** — a complete, unit-tested
+builder for the OTHER `customComfy` arm, where your app ships **its own ComfyUI
+graph**. It is not on the toggle yet; see [Why inline is not on the
+toggle](#why-inline-is-not-on-the-toggle-yet) below. Read that function and its
+tests — it is the shape you need, and it is why you are not guessing at key
+names.
+
+**`customComfy` has TWO arms, selected by `mode`.** Earlier versions of this
+README stated flatly that an app could not ship a ComfyUI graph. That was true
+once and is not any more — the inline arm below is live. It is called out here
+because a developer reading that stale sentence believed it over a working
+feature and stopped probing.
+
+| | `mode` | The app sends | Who can run it |
+|---|---|---|---|
+| **recipe** | omitted, or `'recipe'` | a registered recipe id + bounded `params` | invite-only beta |
+| **inline** | `'inline'` (required) | the graph itself + a declared resource manifest + `maxBuzz` | app developers |
+
+The scope is the same for both — `customComfy` needs exactly
+`ai:write:budgeted`, already declared.
+
+#### The recipe arm
+
+`{ kind: 'customComfy', recipe, params }`, where `recipe` is a
+**server-registered, code-reviewed recipe id**. The civitai server owns the
+graph, the resource allowlist, the checkpoint policy, and a hard per-job
+`maxBuzz` ceiling; the block picks only the recipe + a small, per-recipe-
+validated `params` object (here just a prompt, plus the shared account picker —
+no checkpoint/LoRA axis). This sample invokes **`starter-comfy-txt2img`** — a
+cheap, minimal Z-Image txt2img starter recipe, and it is **registered
+server-side**, so the id in this scaffold resolves to a real recipe.
+
+Its per-job Buzz ceiling is owned by the **registry**, not by your app, and can be
+changed server-side without a scaffold release (it was raised once already, to
+cover cold-start). Treat any ceiling number printed in this README as indicative
+and the server's own response as authoritative.
+
+Note that `mode` is **omitted**, not set to `'recipe'`. The server declares it an
+optional literal precisely so a body without the key parses as a recipe, which is
+what keeps every already-published app working.
+
+#### The inline arm — ship your own graph
+
+```ts
+{
+  kind: 'customComfy',
+  mode: 'inline',                 // REQUIRED — a `workflow` key alone is not enough
+  workflow: { '1': { class_type: 'CheckpointLoaderSimple', inputs: { … } }, … },
+  resources: ['urn:air:sdxl:checkpoint:civitai:101055@128078'],
+  prompt: 'a mountain at dawn',   // optional; surfaced + audited
+  negativePrompt: '',             // optional
+  maxBuzz: 90,                    // REQUIRED — see below, it is also the timeout
+}
+```
+
+**`mode: 'inline'` is required.** Including a `workflow` key does not select this
+arm. A body without `mode` routes to the *recipe* arm and is then rejected for a
+missing `recipe` — which reads like an unrelated error.
+
+**`resources` is a declared manifest, and declaring is not optional.** Every AIR
+URN that appears anywhere in your graph — including as an object key — must also
+appear in this array, or the submit is rejected. It is not inferred from the
+graph: this flat array is the entire surface the entitlement check runs over, and
+containment is what makes checking it sufficient. Anything the graph references
+that is missing here would also fail at load time inside ComfyUI. A
+`civitai`-sourced AIR must carry a model **version** id
+(`urn:air:<ecosystem>:<type>:civitai:<modelId>@<versionId>`); without one there
+is no version to check entitlement against. At most 24 entries. The permitted AIR
+types are model **weights** (checkpoint, diffusion_model, unet, lora, lycoris,
+dora, embedding, hypernet, controlnet, vae, upscaler, clip, clipvision,
+text_encoders, motion, …); an OCI container-image AIR is not permitted.
+
+**Graph limits, all of which REJECT rather than truncate:** 1–300 nodes, at most
+256 KB serialized, at most 128 levels of nesting. Each node is exactly
+`{ class_type, inputs }` — the node schema is `.strict()`, so the `_meta` key a
+raw ComfyUI "Save (API Format)" export adds per node must be stripped or the
+whole body bounces.
+
+**What replaced code review.** A recipe is reviewed in-repo; an inline graph is
+not, so three server-side gates stand in, all of which run *before* any spend:
+AIR containment (above), an entitlement belt over `resources` that is stricter
+than the on-site generator (early-access and Private/epoch subscription are both
+folded in, and a resource the site would silently swap for a sibling version is
+**rejected** instead — your graph names one exact string and nothing rewrites
+it), and a moderation sweep that reads every string leaf in the graph, not just
+your declared `prompt`.
+
+**Who can run it.** 🔴 **Not app developers only.** This paragraph used to say it
+was — that the host runs a developer check on every `customComfy` estimate *and*
+submit, so a non-developer viewing your published block could not submit one.
+That is false: neither `customComfy` arm runs any app-developer check, on either
+path. Do not ship an inline graph you would not ship to every viewer of your
+published block.
+
+What the host does refuse, before either arm's body is inspected — handle every
+one of these:
+
+- **Page tokens only** — a model-bound token is rejected.
+- The token must carry the **`ai:write:budgeted`** consent scope.
+- The viewer must be **signed in** (a token whose subject does not resolve is
+  refused).
+- The viewer must be **enabled for Apps** — this is a closed beta, and the
+  kill-switch is evaluated on the token's subject.
+- On **submit** only: the token must carry a **positive per-call Buzz budget**.
+  That budget comes from *your own* manifest (`page.buzzBudgetPerGen`), not from
+  the viewer.
+
+A registered recipe gets you a reviewed graph you do not have to ship in the
+body. It is not a way onto a surface the inline arm cannot reach.
+
+**An inline body has no account picker.** Its schema is `.strict()` with no
+`accountType` field, so the host funds it as Auto. The picker is hidden in that
+mode rather than shown and ignored.
+
+#### 🔴 `maxBuzz` is the step TIMEOUT in seconds, not just a price
+
+The server stamps `stepTimeoutSeconds = maxBuzz`. One number, both roles — which
+is exactly what makes the ceiling physically enforceable rather than merely
+promised.
+
+So **setting it low to be thrifty does not buy a cheaper generation.** It buys a
+job that is killed after that many seconds and comes back `expired`, with nothing
+to show for it. You are billed the *real* cost either way: billing is post-paid
+against measured GPU seconds and settles to actual, refunding the unused
+remainder of the ceiling. Headroom is free; a stingy ceiling is not thrift, it is
+a timeout. Size it to the wall-clock time your graph needs (this sample's 20-step
+SDXL graph gets 90s; the server's hard maximum is 250).
+
+For the same reason, `estimate` on an inline body just echoes your `maxBuzz` back
+as `cost.total`. That is an **upper bound, not a price** — the orchestrator
+forwards the graph opaquely and cannot price it. Surface it as "up to N Buzz".
+
+#### Why inline is not on the toggle yet
+
+Not because the feature is missing — it is live server-side — but because the
+**mock host** in the pinned `@civitai/blocks-react` crashes on an inline body.
+Its `preferredAccountType` helper reads `body.params.accountType`
+unconditionally, and an inline body has no `params`, so `npm run dev:harness`
+fails with `Cannot read properties of undefined (reading 'accountType')` rather
+than generating. That is a bug in the mock, not in your body.
+
+The fix is landing in `@civitai/blocks-react`. Once this scaffold's pin moves
+past it, wiring inline into the toggle is a three-line change: add `'inline'` to
+`GenMode`, add a `SegmentedControl` entry, and select `buildInlineComfyBody(prompt)`
+in `runGeneration`. Two things to remember when you do: hide the account picker
+in that mode (an inline body has no `accountType` field, so a picker there cannot
+affect the request), and drop the `as WorkflowBody` cast the older pinned SDK
+needs.
+
+**None of this affects live civitai.com** — the inline arm works there today for
+an app-developer account. It only affects the offline mock harness.
+
+**Two different numbers, and they are not the same quantity.** It is easy to
+read one off the other; don't.
+
+- A recipe's **`maxBuzz` ceiling** is what the *server* enforces on a
+  single job. The step runs under a timeout that physically bounds GPU-seconds,
+  so the job cannot accrue more than that no matter what the graph does — and
+  you settle down to the *real* runtime cost anyway. You don't choose this
+  number; the recipe registry does.
+- **`page.buzzBudgetPerGen`** is what *you* choose: the largest single generation
+  your app is permitted to request **at all**. It is a blast-radius limit — the
+  bound on what one generation could cost if your app were exploited or its
+  bundle compromised.
+
+The ceiling constrains the budget in exactly one direction: a submit is rejected
+when the recipe's ceiling exceeds the token budget, so the recipe's ceiling is a
+hard **floor** on your budget. A floor is not a sizing method. "Ceiling plus a
+margin" pegs your blast radius to whatever the cheapest recipe you currently call
+happens to cost, which is an estimate wearing a safety hat — and it re-breaks the
+app the moment you call something pricier, *or* the moment the registry raises
+that recipe's ceiling underneath you (which has happened). Size the budget from
+how much damage you are willing to absorb, then check it clears the floor. The
+scaffold ships **300**, several times the starter recipe's ceiling.
+
+If you do hit the floor, the server says so precisely — `insufficient buzz
+budget: recipe ceiling <N> exceeds budget <M>` names the live ceiling. That
+message, not this README, is the current value.
+
+> **One budget serves both modes, and it is a CEILING — not an estimate.**
+> `page.buzzBudgetPerGen` is the safety ceiling on what a SINGLE generation your
+> app requests may cost. It exists so a bug, or a compromised bundle, can't drain
+> the viewer's Buzz — not to predict your bill. A manifest declares one value, so
+> **300** is the per-gen ceiling for the txt2img sample too.
+>
+> **Raise it; don't lower it.** Headroom is free: the server re-prices every
+> submit and charges the REAL price, so a generous ceiling never costs anyone
+> more. Sizing it to what you expect a run to cost is the classic mistake — a
+> submit priced ABOVE the budget is rejected outright with `insufficient buzz
+> budget`. Nothing is charged, but the user gets nothing, and it stays broken for
+> every user until you ship a new manifest version and it is re-approved. Any
+> upward drift does that: more steps, a bigger resolution, a pricier model or
+> recipe. Pick several times your worst case (the server clamps at 1000 anyway),
+> and note that cumulative spend is separately capped per viewer per day — a high
+> per-gen ceiling does not widen total exposure.
+
+**Requesting a new recipe.** Recipes are server-registered + code-reviewed, so
+you can't add one from the app. Request one via the CLI's issue form at
+<https://github.com/civitai/cli/issues/new?template=request-recipe.yml> (describe
+the graph + the intended `params` + the use case). It ships as a registered id
+once reviewed. **If you just want to run a graph today, use the inline arm** —
+that is what it is for; a recipe is for making a graph available to every viewer.
+
+**Dev loop — honest state.** In `npm run dev:harness` (the **mock** host) the
+**recipe** sample works end-to-end (estimate → submit → poll → succeeded with a
+mock image + cost), so you can build against it today. The **inline** sample's
+builder and its unit tests run under `npm test`, but the mock host cannot drive
+it yet — see [above](#why-inline-is-not-on-the-toggle-yet).
+
+On **live** civitai.com:
+
+- **Inline** requires an **app-developer** account (and a page token). With one,
+  the path is live; without one the submit is rejected by the same app-blocks
+  gate below.
+- **The recipe sample** names a **registered** recipe — `starter-comfy-txt2img`
+  resolves server-side and prices an estimate. What gates it is the **cohort, not
+  the recipe**: `customComfy` is **invite-only beta**, so a submit by a
+  non-tester is rejected by the app-blocks gate (`"Apps are not enabled"` /
+  `"Apps authoring is not enabled for this account"`).
+
+🔴 **An earlier revision of this README claimed the opposite** — that this recipe
+had not shipped, and it printed a hardcoded inventory of the registry alongside
+that claim. Both were wrong by the time anyone read them, and a developer who
+trusted this file over the published docs burned a real generation attempt
+finding out which one to believe. The lesson is structural, not a typo: **the
+recipe registry is server-owned and changes without a scaffold release**, so this
+README no longer tries to enumerate it.
+
+**To discover what is registered right now, ask the server.** Send an id and read
+the rejection: an unregistered id is refused at the workflow-schema **enum**
+boundary, and the message enumerates the ids that ARE registered —
+`Invalid enum value. Expected …, received '<the id you sent>'`. That list is
+generated from the live registry, so it cannot go stale the way a README can.
+
+The app degrades the gate signals to a friendly **invite-only beta** panel:
+`isFeatureGated` matches three specific strings — the two app-blocks gate strings
+above, plus that enum rejection. Note what the enum case means **now**: "this
+server's registry has no such id", i.e. you pointed `STARTER_COMFY_RECIPE` at
+something else, or you are running against a deployment that predates the recipe.
+It is no longer the expected state of the shipped sample. **In Comfy mode only**,
+the App renders the beta panel instead of a raw error. **Caveat (honest):** this
+only works if the host relays the raw server message into the block's submit
+rejection — the host→block error relay is host-dependent and can't be verified
+locally, so **a live Comfy submit may still surface a raw error** rather than the
+panel. The persistent "invite-only beta" note above the prompt frames the sample
+honestly regardless. The txt2img path is unaffected — the gate strings are
+Comfy-scoped and never change its behaviour.
+
+So: **mock works now**; a real Comfy run on live civitai.com needs the
+invite-only beta cohort (+ `civitai app dev-tunnel` in that cohort).
+
+### Buzz balance + account picker (per-account spend)
+
+🔴 **Don't render a Buzz balance readout in your app.** Your app runs inside the
+Civitai chrome, which **already shows the viewer's balance** — a second copy
+inside the iframe is redundant, and it competes with the real one whenever the
+two are momentarily out of sync. This scaffold deliberately ships **no** balance
+panel; if you're tempted to add one, that's the signal you want a *host* surface,
+not an app surface.
+
+The app still *reads* the balance via `useBuzzBalance()` — for exactly one
+purpose: annotating **which account can actually fund this generation** in the
+picker below. That's app-specific context the chrome can't provide, so it earns
+its place. It's additive: if the balance is loading, errored, or unavailable the
+annotation just doesn't render and generation is **never blocked**.
+
+Below the LoRA selector, a **"Spend from"** picker lets the viewer choose which
+pool funds the generation:
+
+- **Auto** (the default) — omits `accountType` from the workflow body entirely.
+  This is the pre-existing behavior byte-for-byte: the host drains its default
+  domain-allowed order.
+- **Blue / Green / Yellow** — threads that pool as `body.accountType`, a
+  *preference*. The server clamps it to what you actually hold + the app's
+  content-rating domain (preferred-first, then falls back). A pool with a 0
+  balance is annotated but stays selectable (the server falls back).
+
+A pick the app's content-rating domain forbids is rejected server-side
+(`BAD_REQUEST`, `"buzz account '<type>' is not spendable for this app's content
+rating"`); the app catches that, shows a friendly "switched back to Auto" note,
+and resets the picker to Auto so the retry just works.
+
+After a successful generation, the success note reports **which pool primarily
+funded it** — read from `snapshot.spentAccountType` (the account with the LARGEST
+debit). Note this can be **blue** even when you paid: a gen covered mostly by
+free/earned Buzz reports `blue`. It's informational only.
+
+`accountType` / `spentAccountType` / `useBuzzBalance` require
+`@civitai/app-sdk@^0.51.0` + `@civitai/blocks-react@^0.58.0` (already pinned in
+`package.json`).
+
+## Develop
+
+```bash
+npm install
+npm run dev:harness   # http://localhost:5186 — mounts a MOCK host so you see something
+```
+
+`npm run dev` alone shows a blank screen — there's no host to send `BLOCK_INIT`.
+Use `dev:harness`.
+
+`npm run dev:harness` mounts the published SDK mock host
+(`@civitai/blocks-react/testing`) — no hand-rolled simulator to maintain. A loud
+**🧪 MOCK HOST · no real Buzz spent** banner is always on screen so you never
+mistake it for the real thing.
+
+### Mock vs live
+
+There are two harness modes, selected by `VITE_HARNESS_MODE` (the npm scripts
+set it for you):
+
+| Script | Mode | What it does |
+|---|---|---|
+| `npm run dev:harness` | **mock** (default) | The SDK mock host. Synthetic — **no real Buzz, no compute, no network.** Safe to spam. |
+| `npm run dev:live` | **live** | The SDK **live host** (`createLiveHost`) — forwards the protocol to the **real Civitai backend** with a real dev token. **Spends REAL Buzz / real compute.** |
+
+**How `dev:live` reaches the backend.** `dev:live` mounts `createLiveHost` from
+`@civitai/blocks-react/live` — its own subexport, separate from the mock host on
+`/testing`, precisely because it spends real money — which forwards the App
+postMessage protocol to the real backend using a pasted dev token (Bearer). The live host's
+backend calls go through the **vite dev proxy** (`server.proxy['/api']` in
+`vite.config.ts`), NOT straight to `civitai.com`: `createLiveHost` is configured
+with an empty `backendBaseUrl`, so it fetches `/api/...` SAME-ORIGIN against the
+dev server (`localhost:5186`), and vite proxies that server-side to civitai with
+the `Origin` header rewritten to an allowlisted host. That's load-bearing — a
+direct cross-origin fetch from `localhost` would (1) be blocked by CORS preflight
+and (2) be rejected by civitai's tRPC origin gate ("Please use the public API
+instead"). The same-origin proxy + Origin rewrite fixes both. Override the proxy
+target with `VITE_LIVE_HOST_ORIGIN` (default `https://civitai.com`).
+
+**Live mode setup.**
+
+> ⚠️ **`dev:live` works WITHOUT submitting first.** The dev-token mint
+> (`POST /api/v1/blocks/dev-token`) accepts a brand-new slug with **no app row
+> yet** — it mints from the `scopes` in your local `block.manifest.json` (clamped
+> server-side), so `create → dev-token → dev:live` works directly. (A pending
+> slug after `civitai app submit` is accepted too.) You do **not** need to submit
+> or wait for approval to dev:live-test — submit when you're ready to publish.
+> For **real generation** you must mint with a credential carrying the **AI
+> Services** scopes: a **full-scope personal API key**, or an OAuth login that
+> opted in via **`civitai login --scopes generate`**. A **default** `civitai
+> login` token mints read-only (`user:read:self`) and **cannot spend**. Use
+> `civitai buzz` / `civitai whoami` to confirm your credential can spend. With no `VITE_LIVE_BLOCK_TOKEN` `dev:live` fails safe (renders a notice,
+> never spends), and `dev:harness` (the mock host) needs no token at all.
+
+To use it:
+
+1. Mint a short-lived dev block token (a ~4-hour RS256 JWT; re-mint + restart
+   when it expires). The friendly path is the CLI — it calls the invite-gated
+   mint route with your stored credential and writes a paste-ready line:
+   ```bash
+   civitai app dev-token dataset-commons --env >> .env.development.local
+   ```
+   (drop `--env >> …` to just print the token). **Auth — the credential you mint
+   with decides what the dev token can do:**
+   - The mint needs a credential carrying the **Apps submit** scope.
+   - **Real generation (spends real Buzz) needs the AI Services scopes.** Two
+     routes: run **`civitai login --scopes generate`** (a browser login that
+     additively opts into generation), or create a **full-scope personal API
+     key** at `https://civitai.com/user/account` (a personal key carries every
+     scope, including AI Services) and store it with `civitai login --token
+     <key>`. Either way `civitai app dev-token` then mints a spendable token —
+     a **default** `civitai login` (no `--scopes`) cannot spend. Or pass a
+     personal key as the Bearer to the raw route directly:
+     ```bash
+     curl -s -X POST https://civitai.com/api/v1/blocks/dev-token \
+       -H "Authorization: Bearer $CIVITAI_TOKEN" \
+       -H 'Content-Type: application/json' \
+       -d '{"slug":"dataset-commons","scopes":["ai:write:budgeted"]}'   # → { token, expiresAt, scopes, buzzBudget }
+     ```
+   - **A DEFAULT `civitai login` mints a read/identity-only dev token for this
+     app.** The default device-login scope set carries Apps submit but NOT AI
+     Services (by design — a plain login shouldn't grant general Buzz spend). A
+     page-money app's manifest declares only `ai:write:budgeted`, and the server
+     strips that budgeted-spend scope from a token minted by a bearer without AI
+     Services, so what's left is **read/identity only**: `dev:live` shows your
+     **viewer** plus catalog/storage, but **estimate → submit → real generation
+     does NOT work**. Fix it by re-running **`civitai login --scopes generate`**
+     (the login is re-runnable and additive — you keep submit + dev-tunnel), or
+     by using the full-scope **personal API key** above.
+2. If you printed the token instead of using `--env >> …`, paste it into
+   `.env.development.local` as `VITE_LIVE_BLOCK_TOKEN=<token>`. Keep the secret in
+   `.env.development.local` (git-ignored), NOT the committed `.env.development`.
+   (Never commit it. `submit` excludes every `.env`-prefixed file but
+   `.env.example`, `.env.sample` and `.env.production` — and those three it
+   UPLOADS, so keep the token out of them too. See "Validate & submit".)
+3. `npm run dev:live` — a minimal **host nav** sits at the top (your profile name,
+   Buzz balance, and a persistent **LIVE · spends real Buzz** pill); a successful
+   Generate spends your own real Buzz.
+
+### The dev:live host nav + your Buzz balance (the credential split)
+
+On the real platform the nav above the app is civitai's OWN chrome (outside the
+iframe). In `dev:live` the harness IS the host, so it renders a minimal
+equivalent: your **profile name**, your **Buzz balance**, and the LIVE safety
+pill. Both reads go same-origin through the vite dev proxy.
+
+The two reads use **different credentials** — by design, and security-critical:
+
+- **Profile name** — `/api/v1/blocks/me`, authed with the page-scoped
+  **block token** (`VITE_LIVE_BLOCK_TOKEN`). Faithful to prod: a page app can
+  read its own viewer.
+- **Buzz balance** — `/api/trpc/buzz.getBuzzAccount`. The page block token can't
+  read Buzz (no `buzz:read:self`), so the balance needs a buzz-read credential:
+  your **personal key**. There is **no public REST Buzz endpoint**; the balance
+  lives behind this tRPC procedure.
+
+  > 💡 From a terminal, don't hand-roll that tRPC call — run **`civitai buzz`**
+  > (it reads the same route with your stored personal key). Use
+  > **`civitai buzz --json`** before and after a `dev:live` generation to diff
+  > the spend, e.g.:
+  > ```bash
+  > civitai buzz --json > before.json   # { "blue":…, "green":…, "yellow":…, "total":… }
+  > # …run a dev:live generation…
+  > civitai buzz --json > after.json     # compare total to confirm the debit
+  > ```
+  > (An OAuth `civitai login` token can't read balance — `civitai buzz` will tell
+  > you to switch to a personal key; confirm your credential with `civitai whoami`.)
+
+  > 🔐 The personal key is set as **`CIVITAI_HOST_KEY`** (note: **NO `VITE_`
+  > prefix**) in the git-ignored **`.env.development.local`**. Vite reads it
+  > **server-side** and the dev proxy injects it as the `Authorization` header on
+  > the balance route **only** — it is **NEVER bundled into client JS** (Vite only
+  > exposes `VITE_*` to the client). Client code never references the key; it just
+  > fetches the same-origin route. If `CIVITAI_HOST_KEY` is unset the nav
+  > gracefully shows your name only (no balance, no error). Dev-only — never
+  > commit it.
+
+  ```bash
+  # In .env.development.local (git-ignored), NOT committed:
+  echo 'CIVITAI_HOST_KEY=<your-personal-api-key>' >> .env.development.local
+  ```
+
+> ⚠️ With no `VITE_LIVE_BLOCK_TOKEN`, `dev:live` **fails safe**: it renders a
+> notice telling you to mint a token, and never silently spends.
+>
+> **Live v1 scope:** `createLiveHost` supports the money path
+> (`estimate`/`submit`/`poll`/`cancel`) AND the resource pickers — it serves a
+> protocol-identical in-harness picker overlay, so `useCheckpointPicker` /
+> `useResourcePicker` work in `dev:live`. It does **not** support
+> `SET_USER_CHECKPOINT` persistence, the App-Storage KV protocol, in-band Buzz
+> purchase, or the `GET_BUZZ_BALANCE` read (`useBuzzBalance`) — those reply "not
+> supported in live v1" (use mock mode for them). So in `dev:live` the balance
+> reads as unavailable and the "Spend from" picker simply drops its 0-Buzz
+> annotations — nothing else changes, and the host nav's own balance total (read
+> via your personal key through the proxy) still works. The balance resolves in
+> **`dev:harness`** (synthetic, wired to the `balance` scenario) and on the **real
+> platform** (the civitai host answers `GET_BUZZ_BALANCE` natively).
+
+> **`dev:harness` is the wide one — do not infer its limits from `dev:live`'s.**
+> The mock host answers the whole block→host protocol, so hooks that `dev:live`
+> refuses work there, INCLUDING posting: `CREATE_POST_FROM_APP`
+> (`useCreatePostFromApp()`), `PUBLISH_GENERATION_OUTPUTS`, `SAVE_IMAGE`,
+> `GET_IMAGES_BY_IDS`, `SET_COLLECTION_FOLLOW`, `OPEN_IMAGE_UPLOAD`,
+> `GET_WILDCARD_PACK` and the App-Storage + shared-storage message families are
+> all mocked. You do not need to read `mockHost.js` to find that out, and you do
+> not need beta access or Buzz to exercise any of them. The authority is the set
+> of message types `createMockHost` handles in
+> `@civitai/blocks-react/testing` — this list is checked against it.
+
+### Scenarios (exercise the money / error / storage UX for free)
+
+The mock host is configurable, so you can test the full spend / failure /
+insufficient-Buzz UX without spending anything. Drive it two ways:
+
+- **On-screen scenario panel** (top-left, collapsed): buttons + inputs to flip
+  *force insufficient Buzz*, *fail next generation*, *50% failure rate*, a
+  simulated *balance*, and *latency* live — no reload.
+- **URL query params** (read once on load):
+
+  | Param | Effect |
+  |---|---|
+  | `?viewer=anon` | anonymous viewer (sign-in CTA) |
+  | `?consent=granted` | start with the budgeted scope granted |
+  | `?theme=light` | light theme (default dark) |
+  | `?balance=0` | simulate a Buzz balance — a gen over it returns insufficient-Buzz, AND the 3-pool balance panel shows the split (mostly yellow + a little blue) |
+  | `?fail=insufficient` | force every submit down the insufficient path |
+  | `?latency=2000` | 2s synthetic gen latency (`?latency=500-2000` for a range) |
+  | `?costPerGen=12` | cost reported per generation |
+  | `?failNext=1` | fail the next N submits (generic gen error) |
+  | `?failRate=0.5` | probabilistic submit failures |
+
+  e.g. `http://localhost:5186/?balance=0&fail=insufficient` to land straight in
+  the insufficient-Buzz / top-up flow.
+
+These map to the `createMockHost` scenario options
+(`generation` / `buzz` / `storage`) from `@civitai/blocks-react`.
+
+```bash
+npm test              # all tests (vitest run), two suites:
+                      #   node : pure-logic units    (src/*.test.ts)
+                      #   dom  : component + e2e      (src/*.test.tsx, jsdom)
+npm run build         # what the platform produces (tsc typecheck + vite build)
+```
+
+### Tests
+
+`npm test` runs both vitest projects in one go (split in `vite.config.ts`):
+
+- **`src/generation.test.ts`** — pure-logic units (node env).
+- **`src/models.test.ts`** — the default checkpoint + the pick→option helpers
+  (`checkpointFromPick` / `loraFromPick` from the SDK's `BlockCheckpointInfo` /
+  `BlockResourceInfo`, with missing-field tolerance), AND the LoRA selection
+  helpers (`addLora`/`removeLora`/`setLoraWeight`, the dedup + 5-LoRA cap + the
+  weight clamp).
+- **`src/nav.test.ts`** — the dev:live host nav's pure logic: the balance-response
+  parser (`parseBuzzBalance`: tRPC envelope / bare / malformed / empty → safe),
+  the viewer-name parser, and `navDisplay` (name present, balance present/absent).
+- **`src/App.test.tsx`** — component tests: render `<App/>` against the mock host
+  and assert the UI (anon → sign-in, signed-in → prompt + the Change model / Add
+  LoRA picker buttons, the 3-pool balance panel, the Auto-default account picker,
+  and the graceful balance-error state).
+- **`src/e2e.test.tsx`** — the money-path proof: drives the FULL
+  estimate → consent → submit → poll → succeeded flow through the REAL SDK
+  transport against the mock host (no hook mocking) — plus the per-account paths:
+  Auto omits `accountType`, a pick threads it, `spentAccountType` renders after
+  success, and a disallowed pool resets to Auto with a friendly note. This is what
+  tells you the spend wiring still works after you edit the app.
+- **`src/mock-buzz.ts`** — dev/test-only glue (NOT shipped in prod). The published
+  SDK mock host doesn't answer the newer per-account-buzz messages
+  (`GET_BUZZ_BALANCE`, `spentAccountType`), so this layers them on synthetically:
+  `installMockMoneyHost` (the `createMockHost` wrapper the tests + the App-level
+  suites use) answers the balance read and stamps `spentAccountType`. The dev
+  harness uses the same helpers so `dev:harness` exercises the full UI.
+- **`src/App.pollretry.test.tsx`** — poll-loop robustness: a transient poll
+  error (a transport blip, e.g. a not-yet-rolled-out pod) is retried, not turned
+  into a terminal failure, while a genuine `failed` status stays terminal. Keep
+  this if you customize `runPollLoop`.
+
+## Allowed parent origins
+
+The SDK drops any inbound message whose origin isn't allowlisted and refuses to
+mount with an empty list. Set `VITE_BLOCK_ALLOWED_PARENT_ORIGINS` per environment
+(`.env.development` for the harness, `.env.production` for the civitai.com host).
+See `.env.example`.
+
+## Validate & submit
+
+```bash
+civitai app validate
+civitai login        # once, to store your API token
+civitai app submit
+```
+
+`submit` packages the SOURCE tree (manifest + src + build config), excluding
+`.git`, `node_modules`, and `dist` — the platform rebuilds from source. It also
+excludes build artifacts (`*.zip`) and, as a **catch-all**, every file whose base
+name starts with `.env` — dotted or not, so `.env.development`,
+`.env.development.local`, `.env.staging` and `.envrc` all stay out. That is what
+keeps a `VITE_LIVE_BLOCK_TOKEN` you pasted into `.env.development.local` from
+being uploaded.
+
+Three names are **allow-listed and ARE uploaded**: `.env.example`, `.env.sample`
+and `.env.production` (the production build reads the last one).
+
+> 🔴 **The allow-list is by FILE NAME — nothing reads what is inside.** Whatever
+> you put in those three is packaged and uploaded verbatim, to the platform and
+> to a human moderator reviewer. That includes a `VITE_`-prefixed value (Vite
+> inlines those into the client bundle, so they are public the moment your app
+> loads) *and* a plain unprefixed one (Vite leaves that out of the bundle, but
+> the CLI still ships the file). Put nothing in them you would not paste into a
+> public page — a real `VITE_LIVE_BLOCK_TOKEN` belongs in the git-ignored
+> `.env.development.local`, which the catch-all above excludes.
+
+## Store-listing media (`assets/`)
+
+Your store listing **cannot publish without an icon and a cover**, and both are
+settable while the app is in review. `assets/` is scaffolded for them and ships
+with no images on purpose — see [`assets/README.md`](assets/README.md) for the
+size, format and aspect requirements, then:
+
+```bash
+civitai app listing set-icon  ./assets/icon.png
+civitai app listing set-cover ./assets/cover.png
+civitai app listing status
+```
+
+## Submission lifecycle
+
+After `civitai app submit`, your publish request is `pending` review — a
+Civitai-side **moderator** approves (or rejects) it. **This is not self-service
+today**; you cannot approve your own app. Track it with `civitai app status`.
+
+- **`dev:live` works before you submit** — the dev-token mint accepts a brand-new
+  slug with no app row yet (minting from your local manifest scopes) as well as a
+  pending slug, so you can real-spend-test before submit/approval. Real generation
+  needs the **AI Services** scopes — `civitai login --scopes generate`, or a
+  **full-scope personal API key** (a **default** `civitai login` token mints
+  read-only and can't spend); confirm with
+  `civitai buzz` / `civitai whoami`. See the live-mode prerequisite above.
+- Need to change the bundle while a request is still `pending`? **Withdraw your
+  own pending submission** and resubmit a different one:
+
+  ```bash
+  civitai app withdraw <pubreq-id>   # the pubreq id from `civitai app status`
+  ```
+
+  Only a `pending` request can be withdrawn (an already-approved/rejected one
+  cannot). Withdrawing is idempotent and frees the slug so a fresh
+  `civitai app submit` can take its place.
