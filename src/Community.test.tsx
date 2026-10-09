@@ -77,9 +77,8 @@ describe('Community screens (voting option b)', () => {
     expect(screen.getByTestId('dc-item-card-item-a')).toHaveTextContent('in training set');
     expect(screen.getByTestId('dc-item-card-item-c')).toHaveTextContent('not in training set');
 
-    // First click asks for storage consent (lazy); the second lands the vote.
-    await user.click(screen.getByTestId('dc-item-item-a-up'));
-    expect(await screen.findByTestId('dc-community-notice')).toHaveTextContent(/storage access/i);
+    // One click: the consent prompt fires, the grant lands, and the same
+    // save retries itself — no second click needed.
     await user.click(screen.getByTestId('dc-item-item-a-up'));
     await waitFor(() => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('6'));
 
@@ -87,6 +86,28 @@ describe('Community screens (voting option b)', () => {
     await user.click(screen.getByTestId('dc-item-item-a-up'));
     await waitFor(() => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5'));
   });
+
+  it('a save prompts for consent once and then lands without a second click', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      declaredScopes: [...ALL_APP_SCOPES],
+      // Token starts consent-gated (no shared scopes): the first vote must
+      // prompt, wait for the grant, and retry the same save on its own.
+      shared: { seed: demoSharedSeed() },
+    });
+    await openCommunity(user);
+    await user.click(screen.getByTestId('dc-open-dataset-dataset-archive-ink'));
+    expect(await screen.findByTestId('dc-dataset-detail')).toBeInTheDocument();
+    expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5');
+
+    // ONE click: consent prompt -> grant -> the vote lands by itself.
+    await user.click(screen.getByTestId('dc-item-item-a-up'));
+    await waitFor(
+      () => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('6'),
+      { timeout: 8000 },
+    );
+  }, 20000);
 
   it('a failed vote save shows the host error and a Retry that lands the vote', async () => {
     const user = userEvent.setup();
@@ -103,12 +124,12 @@ describe('Community screens (voting option b)', () => {
     expect(await screen.findByTestId('dc-dataset-detail')).toBeInTheDocument();
     expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5');
 
-    // First click is the lazy storage-consent round-trip; the second lands
-    // on the forced shared-mutation failure.
+    // Consent is prompted and granted en route; the write itself hits the
+    // forced shared-mutation failure and surfaces it with a Retry.
     await user.click(screen.getByTestId('dc-item-item-a-up'));
-    expect(await screen.findByTestId('dc-community-notice')).toHaveTextContent(/storage access/i);
-    await user.click(screen.getByTestId('dc-item-item-a-up'));
-    expect(await screen.findByTestId('dc-community-notice')).toHaveTextContent(/That did not save/);
+    await waitFor(() =>
+      expect(screen.getByTestId('dc-community-notice')).toHaveTextContent(/That did not save/),
+    );
     expect(screen.getByTestId('dc-community-notice-detail')).toHaveTextContent('SHARED_UNAVAILABLE');
     expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5');
 

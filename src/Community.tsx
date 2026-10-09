@@ -221,16 +221,37 @@ export function Community() {
     [requestConsent],
   );
 
+  /**
+   * Ask for the shared-storage scopes, then wait for the host to actually
+   * grant them (the token context carries them once consent lands).
+   * Resolves true as soon as the scopes are present; false after the
+   * timeout (dialog dismissed or refused — the save stays unwritten).
+   */
+  const ensureSharedConsent = useCallback(async (): Promise<boolean> => {
+    if (hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES)) return true;
+    requestConsent({ scopes: [...SHARED_STORAGE_SCOPES] });
+    const deadline = Date.now() + 45_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      if (hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES)) return true;
+    }
+    return hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES);
+  }, [requestConsent]);
+
   /** Run one shared-storage write with sign-in/consent gates and honest failure copy. */
   const runWrite = useCallback(
     async (busy: string, fn: () => Promise<void>, successNote?: string): Promise<boolean> => {
       if (!requireViewer()) return false;
       if (!hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES)) {
-        requestConsent({ scopes: [...SHARED_STORAGE_SCOPES] });
+        // Prompt for exactly what's missing, then CONTINUE the same save
+        // once consent lands — the user never has to click Save twice.
         setNoticeDetail(null);
         setFailedRetry(null);
-        setNotice('Confirm community storage access in the Civitai dialog, then try again.');
-        return false;
+        setNotice('Confirm community storage access in the Civitai dialog — this save will continue automatically.');
+        if (!(await ensureSharedConsent())) {
+          setNotice('Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.');
+          return false;
+        }
       }
       // Serialized: this write (and its refresh) finishes before the next
       // one starts, so rapid contribute/vote sequences can't overlap host
@@ -247,6 +268,23 @@ export function Community() {
           if (successNote) setNotice(successNote);
           return true;
         } catch (error) {
+          if (classifyStorageError(error) === 'not-permitted') {
+            // The write itself was refused on scope grounds (e.g. a stale
+            // token): prompt, wait for the grant, and retry the same write
+            // once before giving up.
+            setNotice('Confirm community storage access in the Civitai dialog — this save will continue automatically.');
+            if (await ensureSharedConsent()) {
+              try {
+                await fn();
+                await refresh();
+                setBusyKey((cur) => (cur === busy ? null : cur));
+                if (successNote) setNotice(successNote);
+                return true;
+              } catch (retryError) {
+                error = retryError;
+              }
+            }
+          }
           writeFailed(error, busy);
           // The retry re-runs this same write; queued writes recompute
           // from the latest folded state when they execute.
@@ -255,7 +293,7 @@ export function Community() {
         }
       });
     },
-    [refresh, requestConsent, requireViewer, writeFailed],
+    [ensureSharedConsent, refresh, requireViewer, writeFailed],
   );
 
   // ------------------------------------------------------------- writes
