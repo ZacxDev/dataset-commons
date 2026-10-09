@@ -88,6 +88,36 @@ describe('Community screens (voting option b)', () => {
     await waitFor(() => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5'));
   });
 
+  it('a failed vote save shows the host error and a Retry that lands the vote', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      declaredScopes: [...ALL_APP_SCOPES],
+      consentGranted: true,
+      // The next shared mutation fails once (the live walk-2026-10-08-2157
+      // shape: two quick vote saves, banner up, both items stuck at net 0).
+      shared: { seed: demoSharedSeed(), failNext: 1 },
+    });
+    await openCommunity(user);
+    await user.click(screen.getByTestId('dc-open-dataset-dataset-archive-ink'));
+    expect(await screen.findByTestId('dc-dataset-detail')).toBeInTheDocument();
+    expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5');
+
+    // First click is the lazy storage-consent round-trip; the second lands
+    // on the forced shared-mutation failure.
+    await user.click(screen.getByTestId('dc-item-item-a-up'));
+    expect(await screen.findByTestId('dc-community-notice')).toHaveTextContent(/storage access/i);
+    await user.click(screen.getByTestId('dc-item-item-a-up'));
+    expect(await screen.findByTestId('dc-community-notice')).toHaveTextContent(/That did not save/);
+    expect(screen.getByTestId('dc-community-notice-detail')).toHaveTextContent('SHARED_UNAVAILABLE');
+    expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5');
+
+    // Visibly retryable: one tap re-runs the same vote and it lands.
+    await user.click(screen.getByTestId('dc-community-notice-retry'));
+    await waitFor(() => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('6'));
+    expect(screen.queryByTestId('dc-community-notice-retry')).not.toBeInTheDocument();
+  });
+
   it('create -> contribute -> vote -> train review uses the live item, locked metadata, no local upload', async () => {
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({

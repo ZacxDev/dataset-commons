@@ -53,6 +53,8 @@ import {
 import {
   SHARED_STORAGE_SCOPES,
   classifyStorageError,
+  createSerialWriteQueue,
+  describeStorageError,
   hasScopes,
   loadSharedEntries,
   loadThemePreference,
@@ -111,6 +113,8 @@ export function Community() {
   const [entries, setEntries] = useState<SharedEntryLike[]>([]);
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [notice, setNotice] = useState<string | null>(null);
+  const [noticeDetail, setNoticeDetail] = useState<string | null>(null);
+  const [failedRetry, setFailedRetry] = useState<{ run: () => Promise<boolean> } | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState<ExploreSort>('top-voted');
@@ -121,6 +125,15 @@ export function Community() {
   sharedRef.current = shared;
   const scopesRef = useRef(token.scopes);
   scopesRef.current = token.scopes;
+  // Writes read the LATEST folded state at execution time, not the render
+  // that scheduled them: a queued vote must fold what the previous write
+  // actually landed, never a stale snapshot of the entry list.
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
+  const foldedRef = useRef<FoldedCommunity | null>(null);
+  // One shared-storage write at a time (see createSerialWriteQueue): the
+  // walker's contribute -> vote -> vote cadence must not overlap mutations.
+  const writeQueueRef = useRef(createSerialWriteQueue());
 
   const viewerId = viewer?.id ?? null;
   const viewerName = viewer?.username ?? 'you';
@@ -137,6 +150,7 @@ export function Community() {
   }, [refresh, token.scopes]);
 
   const folded: FoldedCommunity = useMemo(() => foldSharedEntries(entries), [entries]);
+  foldedRef.current = folded;
   const view = useMemo(() => buildCommunityView(folded, viewerId), [folded, viewerId]);
   const viewerLedger = useMemo(
     () => buildViewerLedger(folded, viewerId, viewerName),
@@ -193,9 +207,14 @@ export function Community() {
       if (busy) setBusyKey((cur) => (cur === busy ? null : cur));
       const access = classifyStorageError(error);
       if (access === 'not-permitted') {
+        setNoticeDetail(null);
+        setFailedRetry(null);
         setNotice('Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.');
         requestConsent({ scopes: [...SHARED_STORAGE_SCOPES] });
       } else {
+        // Surface the host's actual error (walks report it verbatim) and
+        // keep the failed write one tap away — never a silent dead banner.
+        setNoticeDetail(describeStorageError(error));
         setNotice('That did not save. Nothing was written — try again in a moment.');
       }
     },
@@ -208,21 +227,33 @@ export function Community() {
       if (!requireViewer()) return false;
       if (!hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES)) {
         requestConsent({ scopes: [...SHARED_STORAGE_SCOPES] });
+        setNoticeDetail(null);
+        setFailedRetry(null);
         setNotice('Confirm community storage access in the Civitai dialog, then try again.');
         return false;
       }
-      setBusyKey(busy);
-      setNotice(null);
-      try {
-        await fn();
-        await refresh();
-        setBusyKey((cur) => (cur === busy ? null : cur));
-        if (successNote) setNotice(successNote);
-        return true;
-      } catch (error) {
-        writeFailed(error, busy);
-        return false;
-      }
+      // Serialized: this write (and its refresh) finishes before the next
+      // one starts, so rapid contribute/vote sequences can't overlap host
+      // mutations or fold a read taken before the previous write landed.
+      return writeQueueRef.current.run(async () => {
+        setBusyKey(busy);
+        setNotice(null);
+        setNoticeDetail(null);
+        setFailedRetry(null);
+        try {
+          await fn();
+          await refresh();
+          setBusyKey((cur) => (cur === busy ? null : cur));
+          if (successNote) setNotice(successNote);
+          return true;
+        } catch (error) {
+          writeFailed(error, busy);
+          // The retry re-runs this same write; queued writes recompute
+          // from the latest folded state when they execute.
+          setFailedRetry({ run: () => runWrite(busy, fn, successNote) });
+          return false;
+        }
+      });
     },
     [refresh, requestConsent, requireViewer, writeFailed],
   );
@@ -278,7 +309,7 @@ export function Community() {
       const ok = await runWrite('edit-dataset', async () => {
         await upsertOwnSharedEntry(
           sharedRef.current,
-          entries,
+          entriesRef.current,
           viewerId,
           (d) => d.kind === 'dataset' && d.datasetId === datasetId,
           datasetSharedValue(record),
@@ -363,18 +394,22 @@ export function Community() {
   const castVote = useCallback(
     async (targetKind: 'dataset' | 'item', targetId: string, clicked: 1 | -1) => {
       if (!requireViewer() || viewerId == null) return;
-      const current = viewerVoteRecord(folded.votes, viewerId, targetKind, targetId);
-      const record = {
-        voterId: viewerId,
-        targetKind,
-        targetId,
-        value: nextVoteValue(current?.value ?? 0, clicked),
-        updatedAt: new Date().toISOString(),
-      };
       await runWrite(`vote-${targetKind}-${targetId}`, async () => {
+        // Computed at execution time (writes are serialized): the current
+        // vote and the entry list are whatever the previous write landed,
+        // never the render that scheduled this one.
+        const votesNow = foldedRef.current?.votes ?? [];
+        const current = viewerVoteRecord(votesNow, viewerId, targetKind, targetId);
+        const record = {
+          voterId: viewerId,
+          targetKind,
+          targetId,
+          value: nextVoteValue(current?.value ?? 0, clicked),
+          updatedAt: new Date().toISOString(),
+        };
         await upsertOwnSharedEntry(
           sharedRef.current,
-          entries,
+          entriesRef.current,
           viewerId,
           (d) =>
             d.kind === 'vote' &&
@@ -386,7 +421,7 @@ export function Community() {
         );
       });
     },
-    [entries, folded.votes, requireViewer, runWrite, viewerId],
+    [requireViewer, runWrite, viewerId],
   );
 
   const contributeItem = useCallback(
@@ -557,8 +592,36 @@ export function Community() {
         </div>
 
         {notice && (
-          <Alert color="info" withCloseButton onClose={() => setNotice(null)} data-testid="dc-community-notice">
+          <Alert
+            color="info"
+            withCloseButton
+            onClose={() => {
+              setNotice(null);
+              setNoticeDetail(null);
+              setFailedRetry(null);
+            }}
+            data-testid="dc-community-notice"
+          >
             {notice}
+            {noticeDetail && (
+              <span style={monoStyle} data-testid="dc-community-notice-detail">
+                {' '}
+                Details: {noticeDetail}
+              </span>
+            )}
+            {failedRetry && (
+              <>
+                {' '}
+                <Button
+                  size="sm"
+                  variant="light"
+                  onClick={() => void failedRetry.run()}
+                  data-testid="dc-community-notice-retry"
+                >
+                  Retry save
+                </Button>
+              </>
+            )}
           </Alert>
         )}
 

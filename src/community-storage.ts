@@ -79,6 +79,43 @@ export function classifyStorageError(error: unknown): Exclude<StorageAccess, 're
   return 'failed';
 }
 
+/**
+ * One-line detail for a failed write, safe to show the viewer and precise
+ * enough to report from a walk: the host's own error string, capped so a
+ * pathological message can't flood the banner. Mirrors the training-side
+ * rule (surface the actual error; never swallow it into a silent refusal).
+ */
+export function describeStorageError(error: unknown): string {
+  const message = errorMessage(error).trim();
+  if (!message) return 'shared storage write failed';
+  return message.length > 240 ? `${message.slice(0, 239)}…` : message;
+}
+
+/**
+ * Serialize shared-storage writes. The host bridge answers one request at a
+ * time per block in practice; two overlapping mutations (the walker's
+ * contribute-then-vote-vote cadence) can race the read-after-write refresh
+ * and surface as a generic save failure with nothing folded. Running every
+ * write — and its refresh — to completion before the next starts removes
+ * that whole class: a queued write always folds the state the previous
+ * write actually landed.
+ */
+export function createSerialWriteQueue(): {
+  run<T>(fn: () => Promise<T>): Promise<T>;
+} {
+  let tail: Promise<unknown> = Promise.resolve();
+  return {
+    run<T>(fn: () => Promise<T>): Promise<T> {
+      const result = tail.then(fn, fn);
+      tail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    },
+  };
+}
+
 /** True when the block token already carries every scope in `required`. */
 export function hasScopes(
   scopes: readonly string[] | undefined | null,

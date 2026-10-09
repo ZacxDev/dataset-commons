@@ -5,6 +5,8 @@ import {
   SHARED_STORAGE_SCOPES,
   classifySharedRead,
   classifyStorageError,
+  createSerialWriteQueue,
+  describeStorageError,
   hasScopes,
   loadSharedEntries,
   loadThemePreference,
@@ -54,6 +56,33 @@ describe('classifyStorageError', () => {
     expect(classifyStorageError(new Error('per-user row limit exceeded'))).toBe('failed');
     expect(classifyStorageError(new Error('storage request failed'))).toBe('failed');
     expect(classifyStorageError(new Error('socket closed'))).toBe('failed');
+  });
+});
+
+describe('describeStorageError (walk-grade failure detail)', () => {
+  it('surfaces the host message, capped, with a fallback for empty errors', () => {
+    expect(describeStorageError(new Error('SHARED_UNAVAILABLE'))).toBe('SHARED_UNAVAILABLE');
+    expect(describeStorageError('host busy')).toBe('host busy');
+    expect(describeStorageError(null)).toBe('shared storage write failed');
+    expect(describeStorageError(new Error('x'.repeat(300)))).toHaveLength(240);
+  });
+});
+
+describe('createSerialWriteQueue (no overlapping shared writes)', () => {
+  it('runs queued writes one at a time, in order, even after a failure', async () => {
+    const queue = createSerialWriteQueue();
+    const order: string[] = [];
+    const task = (name: string, fail = false) =>
+      queue.run(async () => {
+        order.push(`start:${name}`);
+        await new Promise((r) => setTimeout(r, 5));
+        order.push(`end:${name}`);
+        if (fail) throw new Error('boom');
+        return name;
+      });
+    const results = await Promise.allSettled([task('a'), task('b', true), task('c')]);
+    expect(order).toEqual(['start:a', 'end:a', 'start:b', 'end:b', 'start:c', 'end:c']);
+    expect(results.map((r) => r.status)).toEqual(['fulfilled', 'rejected', 'fulfilled']);
   });
 });
 

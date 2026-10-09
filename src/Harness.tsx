@@ -34,6 +34,8 @@ import { mockBuzzBalance } from './mock-buzz.js';
  *   ?failRate=0.5       -> probabilistic submit failures
  *   ?training=published -> training finishes with a published LoRA linked
  *   ?community=demo     -> seed the demo dataset/items/votes
+ *   ?sharedFail=1       -> fail the next N shared-storage mutations
+ *                          (SHARED_UNAVAILABLE) against the demo seed
  *
  * The on-screen scenario panel maps the same controls onto buttons so a dev can
  * flip them live (it re-mounts the mock host with the new options).
@@ -58,10 +60,15 @@ export function Harness({ children }: { children: ReactNode }) {
     // same state the scenario panel's button applies, without a
     // remount mid-walk).
     const trainingPublished = params.get('training') === 'published';
+    const sharedFail = Number(params.get('sharedFail') ?? 0);
     return {
       ...base,
       declaredScopes: [...new Set([...(base.declaredScopes ?? []), ...ALL_APP_SCOPES])],
-      ...(wantsDemo && !base.shared ? { shared: { seed: demoSharedSeed() } } : {}),
+      ...(Number.isInteger(sharedFail) && sharedFail > 0
+        ? { shared: { seed: demoSharedSeed(), failNext: sharedFail } }
+        : wantsDemo && !base.shared
+          ? { shared: { seed: demoSharedSeed() } }
+          : {}),
       ...(trainingPublished
         ? {
             generation: {
