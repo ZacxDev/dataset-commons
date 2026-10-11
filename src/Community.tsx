@@ -79,6 +79,13 @@ import { TrainFlow, type TrainRunLink } from './TrainFlow.js';
  * per-viewer app-storage copy is only a rebuildable index of "mine".
  */
 
+/**
+ * A shared-storage write outcome. `reason` carries the honest failure text
+ * (consent never granted, or the host's actual error) so callers with a
+ * form-level error line show the real cause instead of a generic fallback.
+ */
+export type WriteResult = { ok: boolean; reason: string | null };
+
 type Route =
   | { name: 'explore' }
   | { name: 'create' }
@@ -114,7 +121,7 @@ export function Community() {
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeDetail, setNoticeDetail] = useState<string | null>(null);
-  const [failedRetry, setFailedRetry] = useState<{ run: () => Promise<boolean> } | null>(null);
+  const [failedRetry, setFailedRetry] = useState<{ run: () => Promise<WriteResult> } | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState<ExploreSort>('top-voted');
@@ -240,8 +247,8 @@ export function Community() {
 
   /** Run one shared-storage write with sign-in/consent gates and honest failure copy. */
   const runWrite = useCallback(
-    async (busy: string, fn: () => Promise<void>, successNote?: string): Promise<boolean> => {
-      if (!requireViewer()) return false;
+    async (busy: string, fn: () => Promise<void>, successNote?: string): Promise<WriteResult> => {
+      if (!requireViewer()) return { ok: false, reason: 'Sign in to save.' };
       if (!hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES)) {
         // Prompt for exactly what's missing, then CONTINUE the same save
         // once consent lands — the user never has to click Save twice.
@@ -250,13 +257,16 @@ export function Community() {
         setNotice('Confirm community storage access in the Civitai dialog — this save will continue automatically.');
         if (!(await ensureSharedConsent())) {
           setNotice('Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.');
-          return false;
+          return {
+            ok: false,
+            reason: 'Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.',
+          };
         }
       }
       // Serialized: this write (and its refresh) finishes before the next
       // one starts, so rapid contribute/vote sequences can't overlap host
       // mutations or fold a read taken before the previous write landed.
-      return writeQueueRef.current.run(async () => {
+      return writeQueueRef.current.run(async (): Promise<WriteResult> => {
         setBusyKey(busy);
         setNotice(null);
         setNoticeDetail(null);
@@ -266,7 +276,7 @@ export function Community() {
           await refresh();
           setBusyKey((cur) => (cur === busy ? null : cur));
           if (successNote) setNotice(successNote);
-          return true;
+          return { ok: true, reason: null };
         } catch (error) {
           if (classifyStorageError(error) === 'not-permitted') {
             // The write itself was refused on scope grounds (e.g. a stale
@@ -279,7 +289,7 @@ export function Community() {
                 await refresh();
                 setBusyKey((cur) => (cur === busy ? null : cur));
                 if (successNote) setNotice(successNote);
-                return true;
+                return { ok: true, reason: null };
               } catch (retryError) {
                 error = retryError;
               }
@@ -289,7 +299,7 @@ export function Community() {
           // The retry re-runs this same write; queued writes recompute
           // from the latest folded state when they execute.
           setFailedRetry({ run: () => runWrite(busy, fn, successNote) });
-          return false;
+          return { ok: false, reason: describeStorageError(error) };
         }
       });
     },
@@ -317,10 +327,10 @@ export function Community() {
         createdAt: now,
         updatedAt: now,
       };
-      const ok = await runWrite('create-dataset', async () => {
+      const result = await runWrite('create-dataset', async () => {
         await sharedRef.current.append(datasetSharedValue(record));
       });
-      if (!ok) return 'That did not save — community storage may not be granted yet.';
+      if (!result.ok) return result.reason ?? 'That did not save — try again in a moment.';
       setRoute({ name: 'dataset', datasetId: record.datasetId });
       return null;
     },
@@ -344,7 +354,7 @@ export function Community() {
         targetNote: checked.value.targetNote,
         updatedAt: new Date().toISOString(),
       };
-      const ok = await runWrite('edit-dataset', async () => {
+      const result = await runWrite('edit-dataset', async () => {
         await upsertOwnSharedEntry(
           sharedRef.current,
           entriesRef.current,
@@ -354,7 +364,7 @@ export function Community() {
           existing.storageKey,
         );
       });
-      if (!ok) return 'That did not save — community storage may not be granted yet.';
+      if (!result.ok) return result.reason ?? 'That did not save — try again in a moment.';
       setRoute({ name: 'dataset', datasetId });
       return null;
     },
@@ -369,7 +379,7 @@ export function Community() {
         setNotice('Only the dataset owner can delete it.');
         return false;
       }
-      return runWrite(`delete-dataset-${datasetId}`, async () => {
+      const result = await runWrite(`delete-dataset-${datasetId}`, async () => {
         const datasetItems = folded.items.filter((item) => item.datasetId === datasetId);
         const itemIds = new Set(datasetItems.map((item) => item.itemId));
         // Remove the dataset's visible contents first. The owner's own
@@ -425,6 +435,7 @@ export function Community() {
         if (!withdrawn.deleted) throw new Error('dataset record was not withdrawn');
         setRoute({ name: 'explore' });
       }, 'Dataset deleted.');
+      return result.ok;
     },
     [folded, runWrite, viewerId],
   );
@@ -486,10 +497,10 @@ export function Community() {
         createdAt: now,
         updatedAt: now,
       };
-      const ok = await runWrite('contribute', async () => {
+      const result = await runWrite('contribute', async () => {
         await sharedRef.current.append(itemSharedValue(record));
       }, 'Item contributed. It joins the training set once its net votes are positive.');
-      return ok ? null : 'That did not save — community storage may not be granted yet.';
+      return result.ok ? null : (result.reason ?? 'That did not save — try again in a moment.');
     },
     [requestSignIn, runWrite, viewerId, viewerName],
   );

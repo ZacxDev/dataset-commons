@@ -180,6 +180,29 @@ describe('Community screens (voting option b)', () => {
     expect(screen.getByTestId(`dc-votes-${itemId}`)).toBeDisabled();
   });
 
+  it('a failed dataset save shows the actual error, not the generic consent line', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      declaredScopes: [...ALL_APP_SCOPES],
+      consentGranted: true,
+      // The shared write itself fails (not a consent problem): the form
+      // must name the host error instead of blaming consent.
+      shared: { seed: [], failNext: 1 },
+    });
+    await openCommunity(user);
+    await user.click(await screen.findByTestId('dc-community-enable'));
+    await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
+
+    await user.click(screen.getByTestId('dc-create-first-dataset'));
+    await user.type(screen.getByTestId('dc-dataset-name'), 'Doomed Dataset');
+    await user.click(screen.getByTestId('dc-dataset-save'));
+
+    const formError = await screen.findByTestId('dc-dataset-form-error', {}, { timeout: 5000 });
+    expect(formError).toHaveTextContent('SHARED_UNAVAILABLE');
+    expect(formError).not.toHaveTextContent(/may not be granted yet/i);
+  });
+
   it('owner can delete a dataset so a scratch dataset leaves no Explore record', async () => {
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({
