@@ -96,8 +96,6 @@ export interface TrainFlowProps {
   trainerId?: string;
   /** When false, items are the live dataset: captions/votes are read-only. */
   lockItemMetadata?: boolean;
-  /** Hide the built-in light/dark toggle (the host view already renders one). */
-  hideThemeToggle?: boolean;
   /** Owner overrides only make sense for the dataset owner. Default true (mock). */
   canOwnerOverride?: boolean;
   /** Local uploads extend the mock dataset only; live datasets contribute elsewhere. */
@@ -137,7 +135,7 @@ const MOCK_ITEMS: DatasetItem[] = [
 export function TrainFlow(props: TrainFlowProps = {}) {
   const { viewer } = useBlockContext();
   // Archive Lab: dark by default, light ONLY from this explicit in-app toggle.
-  const [dcTheme, setDcTheme] = useState<'dark' | 'light'>('dark');
+  // Dark only (Archive Lab): no light override; dc-theme-root roots at data-theme="dark".
   const token = useBlockToken();
   const { estimate, submit, poll, watch } = useBuzzWorkflow();
   const { prepareDataset } = usePrepareTrainingDataset();
@@ -776,25 +774,12 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   const failureCopy = runState ? trainingFailureCopy(runState, runError) : null;
 
   return (
-    <div data-testid="dc-theme-root" data-theme={dcTheme} data-dc-archive="true" style={archiveRootStyle}>
+    <div data-testid="dc-theme-root" data-theme="dark" data-dc-archive="true" style={archiveRootStyle}>
     <Stack gap={16} data-testid="dc-train">
       <span style={sectionTitleStyle}>Train a LoRA from this dataset</span>
-      <span>
-        {props.hideThemeToggle !== true && (
-          <Button
-            variant="subtle"
-            size="sm"
-            onClick={() => setDcTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-            data-testid="dc-theme-toggle"
-          >
-            {dcTheme === 'dark' ? 'Light override' : 'Back to dark (default)'}
-          </Button>
-        )}
-      </span>
       <span style={hintStyle}>
-        In-app training on Civitai's trainer. The estimate is the real price — if the trainer
-        can't quote the run, this app won't submit it. Publishing happens in Civitai's model
-        wizard; the published LoRA links back to the frozen snapshot below.
+        The estimate is the real price — no quote, no submit. The published LoRA links back to
+        the frozen snapshot below.
       </span>
 
       {/* --- Snapshot review (spec Screen 4, first half) --- */}
@@ -806,8 +791,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           </Badge>
         </span>
         <span style={hintStyle}>
-          Included = net-positive votes. Vote weights freeze when you train — later votes never
-          rewrite this snapshot. Shares below are of any Buzz this LoRA tracks.
+          Vote weights freeze when you train — later votes never rewrite this snapshot.
         </span>
         {props.lockItemMetadata === true && (
           <span style={hintStyle}>Captions and votes are locked from the live dataset record — they freeze exactly as shown.</span>
@@ -983,9 +967,8 @@ export function TrainFlow(props: TrainFlowProps = {}) {
             </Badge>
           </span>
           <span style={hintStyle}>
-            Civitai can train directly from the trainer's own Civitai images. It prepares the
-            dataset first, quotes that exact run, then shows its own confirmation dialog before
-            charging.
+            Civitai trains from the trainer's own Civitai images: it prepares, quotes, then
+            confirms before charging.
           </span>
 
           {!ownEligibility.ready && ownEligibility.blockers.length > 0 && (
@@ -1162,8 +1145,8 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           {runState === 'ready-to-publish' && epoch != null && (
             <Stack gap={8}>
               <span style={hintStyle}>
-                Training finished — epoch {epoch} is ready. Publishing happens in Civitai's model
-                wizard (license, title, moderation); this app never receives the checkpoint file.
+                Training finished — epoch {epoch} is ready. Publish in Civitai's model wizard;
+                this app never receives the checkpoint file.
               </span>
               <Button onClick={onPublishClick} data-testid="dc-publish">
                 Publish epoch {epoch} on Civitai

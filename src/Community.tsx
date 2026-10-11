@@ -57,11 +57,8 @@ import {
   describeStorageError,
   hasScopes,
   loadSharedEntries,
-  loadThemePreference,
-  saveThemePreference,
   saveViewerIndex,
   upsertOwnSharedEntry,
-  type DcTheme,
   type StorageAccess,
 } from './community-storage.js';
 import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
@@ -125,7 +122,6 @@ export function Community() {
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState<ExploreSort>('top-voted');
-  const [theme, setTheme] = useState<DcTheme>('dark');
   const [viewerIndexAccess, setViewerIndexAccess] = useState<StorageAccess>('ready');
 
   const sharedRef = useRef(shared);
@@ -183,25 +179,6 @@ export function Community() {
     indexJsonRef.current = json;
     void saveViewerIndex(appStorage, viewerId, index).then(setViewerIndexAccess);
   }, [appStorage, folded, loadState, viewerId, viewerLedger]);
-
-  useEffect(() => {
-    if (viewerId == null) return;
-    let alive = true;
-    void loadThemePreference(appStorage, viewerId).then((result) => {
-      if (alive && result.access === 'ready') setTheme(result.theme);
-    });
-    return () => {
-      alive = false;
-    };
-  }, [appStorage, viewerId]);
-
-  const toggleTheme = useCallback(() => {
-    setTheme((cur) => {
-      const next: DcTheme = cur === 'dark' ? 'light' : 'dark';
-      if (viewerId != null) void saveThemePreference(appStorage, viewerId, next);
-      return next;
-    });
-  }, [appStorage, viewerId]);
 
   const requireViewer = useCallback((): boolean => {
     if (viewerId != null) return true;
@@ -616,7 +593,7 @@ export function Community() {
   );
 
   return (
-    <div data-testid="dc-community" data-theme={theme} data-dc-archive="true" style={rootStyle}>
+    <div data-testid="dc-community" data-theme="dark" data-dc-archive="true" style={rootStyle}>
       <Stack gap={16}>
         <div style={headerStyle}>
           <div>
@@ -628,14 +605,6 @@ export function Community() {
           <div style={headerActionsStyle}>
             <Button variant="subtle" size="sm" onClick={() => setRoute({ name: 'ledger' })} data-testid="dc-open-ledger">
               My contributions
-            </Button>
-            <Button
-              variant="subtle"
-              size="sm"
-              onClick={toggleTheme}
-              data-testid="dc-community-theme-toggle"
-            >
-              {theme === 'dark' ? 'Light override' : 'Back to dark (default)'}
             </Button>
           </div>
         </div>
@@ -742,16 +711,8 @@ export function Community() {
                 <span style={cardTitleStyle}>No datasets yet</span>
                 <span style={hintStyle}>
                   {view.datasets.length === 0
-                    ? 'Be the first: create a dataset, contribute images, and let the community vote the training set in.'
+                    ? 'Be the first: tap Create dataset above, contribute images, and let the community vote the training set in.'
                     : 'Nothing matches that search. Try a different term, or create the dataset yourself.'}
-                </span>
-                <span>
-                  <Button
-                    onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'create' }))}
-                    data-testid="dc-create-first-dataset"
-                  >
-                    Create the first dataset
-                  </Button>
                 </span>
               </div>
             ) : (
@@ -817,6 +778,7 @@ export function Community() {
 
         {loadState === 'ready' && route.name === 'dataset' && selectedDataset && (
           <DatasetDetail
+            key={selectedDataset.datasetId}
             dataset={selectedDataset}
             loras={view.loras.filter((l) => l.datasetId === selectedDataset.datasetId)}
             viewerId={viewerId}
@@ -851,7 +813,6 @@ export function Community() {
               datasetId={selectedDataset.datasetId}
               trainerId={viewerId != null ? contributorKey(viewerId) : viewerName}
               lockItemMetadata
-              hideThemeToggle
               canOwnerOverride={viewerId != null && selectedDataset.ownerId === viewerId}
               allowLocalUploads={false}
               onSnapshotConfirmed={persistSnapshot}
@@ -922,6 +883,7 @@ function VoteControl(props: {
         onClick={() => props.onVote(1)}
         data-testid={`${props.testIdPrefix}-up`}
         aria-label="Upvote"
+        style={{ minWidth: 44, minHeight: 44, fontSize: 18 }}
       >
         ↑
       </Button>
@@ -935,6 +897,7 @@ function VoteControl(props: {
         onClick={() => props.onVote(-1)}
         data-testid={`${props.testIdPrefix}-down`}
         aria-label="Downvote"
+        style={{ minWidth: 44, minHeight: 44, fontSize: 18 }}
       >
         ↓
       </Button>
@@ -1164,6 +1127,24 @@ function DatasetDetail(props: {
   }, [getImages, imageIds]);
   const isOwner = viewerId != null && dataset.ownerId === viewerId;
   const liveItems = dataset.items.filter((i) => !i.removed);
+  // Two-tap delete confirm: first tap arms, second tap fires. The key on the
+  // parent resets this when the dataset changes; the timer disarms a stray tap.
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const disarmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (disarmTimer.current) clearTimeout(disarmTimer.current);
+    };
+  }, []);
+  const armOrDelete = useCallback(() => {
+    if (deleteArmed) {
+      if (disarmTimer.current) clearTimeout(disarmTimer.current);
+      props.onDelete();
+      return;
+    }
+    setDeleteArmed(true);
+    disarmTimer.current = setTimeout(() => setDeleteArmed(false), 6000);
+  }, [deleteArmed, props]);
 
   return (
     <Stack gap={12} data-testid="dc-dataset-detail">
@@ -1209,8 +1190,8 @@ function DatasetDetail(props: {
           </Button>
         )}
         {isOwner && (
-          <Button variant="subtle" color="red" onClick={props.onDelete} data-testid="dc-delete-dataset">
-            Delete dataset
+          <Button variant="subtle" color="red" onClick={armOrDelete} data-testid="dc-delete-dataset">
+            {deleteArmed ? 'Tap again to confirm delete' : 'Delete dataset'}
           </Button>
         )}
       </div>

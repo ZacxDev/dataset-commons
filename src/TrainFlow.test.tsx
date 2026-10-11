@@ -49,7 +49,6 @@ function renderTrainFlow(props: TrainFlowProps = {}) {
       datasetId="ds-own"
       trainerId="dev"
       allowLocalUploads={false}
-      hideThemeToggle
       {...props}
     />,
   );
@@ -89,19 +88,15 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.getAllByTestId('dc-dataset-item')[0]).toHaveTextContent('manually excluded');
   });
 
-  it('Archive Lab roots dark by default; light only from the explicit toggle', async () => {
-    const user = userEvent.setup();
+  it('Archive Lab roots dark with no theme toggle', async () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
     });
-    await openTrain(user);
+    await openTrain(userEvent.setup());
     const root = screen.getByTestId('dc-theme-root');
     expect(root).toHaveAttribute('data-theme', 'dark');
-    await user.click(screen.getByTestId('dc-theme-toggle'));
-    expect(root).toHaveAttribute('data-theme', 'light');
-    await user.click(screen.getByTestId('dc-theme-toggle'));
-    expect(root).toHaveAttribute('data-theme', 'dark');
+    expect(screen.queryByTestId('dc-theme-toggle')).not.toBeInTheDocument();
   });
 
   it('estimate -> quote -> confirm -> submit -> trainedEpochs -> ready to publish, ledger credits vote-weighted', async () => {

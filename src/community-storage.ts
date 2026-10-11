@@ -277,29 +277,3 @@ export async function loadViewerIndex(
   }
 }
 
-export type DcTheme = 'dark' | 'light';
-
-export async function saveThemePreference(
-  storage: AppStoragePort,
-  viewerId: number,
-  theme: DcTheme,
-): Promise<StorageAccess> {
-  try {
-    await storage.set(settingsKey(viewerId), { theme });
-    return 'ready';
-  } catch (error) {
-    return classifyStorageError(error);
-  }
-}
-
-export async function loadThemePreference(
-  storage: AppStoragePort,
-  viewerId: number,
-): Promise<{ theme: DcTheme; access: StorageAccess }> {
-  try {
-    const saved = await storage.get<{ theme?: unknown }>(settingsKey(viewerId));
-    return { theme: saved?.theme === 'light' ? 'light' : 'dark', access: 'ready' };
-  } catch (error) {
-    return { theme: 'dark', access: classifyStorageError(error) };
-  }
-}

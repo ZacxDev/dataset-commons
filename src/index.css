@@ -1,7 +1,6 @@
 :root {
-  /* DARK ONLY by default (Archive Lab — Sharpened): the app never follows the
-     browser/OS scheme. Light exists solely under the explicit in-app override
-     selector `[data-theme='light']` below. */
+  /* DARK ONLY (Archive Lab — Sharpened): the app never follows the
+     browser/OS scheme, and there is no light theme at all. */
   color-scheme: dark;
 }
 
@@ -10,8 +9,7 @@
    community/train surfaces share ONE palette family: a deeper charcoal base,
    cyan reserved strictly for the primary action, and amber
    (--civitai-color-warning) reserved for ledger/earnings surfaces only.
-   Dark is the unqualified base; the light block applies ONLY when the user
-   explicitly toggles the override in-app. */
+   Dark only; there is no light block. */
 [data-dc-archive] {
   --civitai-color-primary: #25c2d8;
   --civitai-color-primary-hover: #58d6e8;
@@ -26,20 +24,6 @@
   --dc-archive-surface-2: #1a2833;
   --dc-archive-ledger: #e8a33d;
   color-scheme: dark;
-}
-
-[data-dc-archive][data-theme='light'] {
-  --civitai-color-primary: #0b7285;
-  --civitai-color-primary-hover: #1098ad;
-  --civitai-color-surface: #ffffff;
-  --civitai-color-surface-2: #e8eef2;
-  --civitai-color-text: #16202a;
-  --civitai-color-text-dimmed: #5a6b76;
-  --civitai-color-border: #c9d4db;
-  --dc-archive-bg: #f1f5f8;
-  --dc-archive-surface: #ffffff;
-  --dc-archive-surface-2: #e8eef2;
-  color-scheme: light;
 }
 
 * {

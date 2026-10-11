@@ -2,8 +2,8 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 // Archive Lab theme contract (spec §8 + Zacx's standing dark-mode rule):
-// dark is the default, nothing follows the browser/OS scheme, and light
-// exists only under the explicit in-app override.
+// dark only — the app never follows the browser/OS scheme, and there is no
+// light theme anywhere: no toggle, no override selector, no light tokens.
 
 const indexHtml = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const indexCss = readFileSync(new URL('./index.css', import.meta.url), 'utf8');
@@ -23,12 +23,19 @@ describe('Archive Lab theme', () => {
     expect(indexCss).toContain('color-scheme: dark;');
   });
 
+  it('there is no light theme anywhere', () => {
+    expect(indexCss).not.toContain("[data-dc-archive][data-theme='light']");
+    expect(indexCss).not.toContain('color-scheme: light');
+    expect(communityTsx).not.toContain('Light override');
+    expect(trainFlow).not.toContain('Light override');
+    expect(communityTsx).not.toContain('dc-community-theme-toggle');
+    expect(trainFlow).not.toContain('dc-theme-toggle');
+  });
+
   it('Archive Lab tokens are scoped overrides, amber reserved for the ledger', () => {
     expect(indexCss).toContain("[data-dc-archive]");
     expect(indexCss).toContain('--civitai-color-primary: #25c2d8');
     expect(indexCss).toContain('--civitai-color-warning: #e8a33d');
-    // Light exists ONLY under the explicit override selector.
-    expect(indexCss).toContain("[data-dc-archive][data-theme='light']");
   });
 
   it('Sharpened palette deepens the base and unifies shell + archive surfaces', () => {
@@ -58,9 +65,14 @@ describe('Archive Lab theme', () => {
     expect(trainFlow).toContain('className="od-grid-items"');
   });
 
-  it('the Train surface roots at data-theme=dark and toggles light explicitly', () => {
-    expect(trainFlow).toContain("useState<'dark' | 'light'>('dark')");
+  it('the Train surface roots at data-theme=dark with no toggle', () => {
+    expect(trainFlow).toContain('data-theme="dark"');
     expect(trainFlow).toContain('data-testid="dc-theme-root"');
-    expect(trainFlow).toContain('data-testid="dc-theme-toggle"');
+    expect(trainFlow).not.toContain("useState<'dark' | 'light'>");
+  });
+
+  it('the Community surface roots at data-theme=dark with no toggle', () => {
+    expect(communityTsx).toContain('data-theme="dark"');
+    expect(communityTsx).toContain('data-testid="dc-community"');
   });
 });

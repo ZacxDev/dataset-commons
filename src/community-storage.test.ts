@@ -9,10 +9,8 @@ import {
   describeStorageError,
   hasScopes,
   loadSharedEntries,
-  loadThemePreference,
   loadViewerIndex,
   safeAppStorageKey,
-  saveThemePreference,
   saveViewerIndex,
   upsertOwnSharedEntry,
   type AppStoragePort,
@@ -185,14 +183,11 @@ describe('per-viewer app storage', () => {
     };
   }
 
-  it('round-trips the viewer index and theme; dark is the default theme', async () => {
+  it('round-trips the viewer index', async () => {
     const storage = fakeStorage();
     const index = { itemIds: ['a'], voteTargets: ['item:a'], snapshotIds: ['s1'], updatedAt: '2026-10-06T00:00:00.000Z' };
     expect(await saveViewerIndex(storage, 5, index)).toBe('ready');
     expect(await loadViewerIndex(storage, 5)).toEqual({ index, access: 'ready' });
-    expect(await loadThemePreference(storage, 5)).toEqual({ theme: 'dark', access: 'ready' });
-    expect(await saveThemePreference(storage, 5, 'light')).toBe('ready');
-    expect(await loadThemePreference(storage, 5)).toEqual({ theme: 'light', access: 'ready' });
   });
 
   it('a scope-shaped failure classifies as not-permitted and never fakes a save', async () => {

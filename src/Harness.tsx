@@ -26,7 +26,7 @@ import { mockBuzzBalance } from './mock-buzz.js';
  *   ?viewer=anon        -> anonymous viewer (sign-in CTA)
  *   ?consent=granted    -> start WITH the budgeted scope already granted
  *   ?fail=insufficient  -> SUBMIT returns an insufficient-Buzz failed snapshot
- *   ?theme=light        -> light theme (default dark)
+ *   ?theme=light        -> IGNORED; the app is dark-only (no light theme)
  *   ?balance=0          -> simulate a Buzz balance (a gen over it -> insufficient)
  *   ?latency=2000       -> 2s synthetic gen latency (or ?latency=500-2000 range)
  *   ?costPerGen=12      -> cost reported per generation

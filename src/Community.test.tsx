@@ -150,7 +150,7 @@ describe('Community screens (voting option b)', () => {
     await user.click(await screen.findByTestId('dc-community-enable'));
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
-    await user.click(screen.getByTestId('dc-create-first-dataset'));
+    await user.click(screen.getByTestId('dc-create-dataset'));
     await user.type(screen.getByTestId('dc-dataset-name'), 'Robot Studies');
     await user.type(screen.getByTestId('dc-dataset-description'), 'Reference poses');
     await user.click(screen.getByTestId('dc-dataset-save'));
@@ -194,7 +194,7 @@ describe('Community screens (voting option b)', () => {
     await user.click(await screen.findByTestId('dc-community-enable'));
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
-    await user.click(screen.getByTestId('dc-create-first-dataset'));
+    await user.click(screen.getByTestId('dc-create-dataset'));
     await user.type(screen.getByTestId('dc-dataset-name'), 'Doomed Dataset');
     await user.click(screen.getByTestId('dc-dataset-save'));
 
@@ -214,11 +214,16 @@ describe('Community screens (voting option b)', () => {
     await user.click(await screen.findByTestId('dc-community-enable'));
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
-    await user.click(screen.getByTestId('dc-create-first-dataset'));
+    await user.click(screen.getByTestId('dc-create-dataset'));
     await user.type(screen.getByTestId('dc-dataset-name'), 'Scratch Delete');
     await user.click(screen.getByTestId('dc-dataset-save'));
     expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toHaveTextContent('Scratch Delete');
 
+    // Two-tap confirm: one tap arms but does not delete.
+    await user.click(screen.getByTestId('dc-delete-dataset'));
+    expect(screen.getByTestId('dc-delete-dataset')).toHaveTextContent('Tap again to confirm delete');
+    expect(await screen.findByTestId('dc-dataset-detail')).toHaveTextContent('Scratch Delete');
+    // Second tap deletes.
     await user.click(screen.getByTestId('dc-delete-dataset'));
     expect(await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 })).toBeInTheDocument();
     expect(screen.queryByText('Scratch Delete')).not.toBeInTheDocument();

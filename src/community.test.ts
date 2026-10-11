@@ -313,6 +313,6 @@ describe('ledger event builders', () => {
 
   it('keeps the honesty copy exact', () => {
     expect(ONSITE_EARNINGS_LINE).toMatch(/aren't reported to apps yet/);
-    expect(COSMETIC_TRUST_LINE).toMatch(/cosmetic-trust/);
+    expect(COSMETIC_TRUST_LINE).toMatch(/signal, not proof/);
   });
 });

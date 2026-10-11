@@ -28,7 +28,7 @@ export const ONSITE_EARNINGS_LINE =
   "Onsite generations aren't reported to apps yet — tracked here when the platform exposes them.";
 
 export const COSMETIC_TRUST_LINE =
-  'Shared-storage standings are cosmetic-trust, not anti-cheat grade.';
+  'Vote counts live in shared storage — take them as a signal, not proof.';
 
 /** The minimal shape of a shared-store entry this core folds. */
 export interface SharedEntryLike {
