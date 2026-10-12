@@ -1,7 +1,7 @@
 import { useRef } from 'react';
 
 import { useBlockBreakpoint, useBlockContext, useBlockResize } from '@civitai/blocks-react';
-import { Badge, Card, Group, Stack, injectBlocksStyles } from '@civitai/blocks-react/ui';
+import { Badge, Group, injectBlocksStyles } from '@civitai/blocks-react/ui';
 
 import { Community } from './Community.js';
 
@@ -32,25 +32,19 @@ export function App() {
   if (!ready) {
     return (
       <div ref={rootRef} data-theme={theme} data-dc-archive="true" data-block-tier={bp.tier} style={shell}>
-        <Card padding="lg" style={cardStyle}>
-          <Group gap={10}>
-            <Badge color="info" variant="light">
-              loading
-            </Badge>
-            <span>Connecting to host…</span>
-          </Group>
-        </Card>
+        <Group gap={10}>
+          <Badge color="info" variant="light">
+            loading
+          </Badge>
+          <span>Connecting to host…</span>
+        </Group>
       </div>
     );
   }
 
   return (
     <div ref={rootRef} data-theme={theme} data-dc-archive="true" data-block-tier={bp.tier} style={shell}>
-      <Card padding="lg" style={cardStyle}>
-        <Stack gap={16}>
-          <Community />
-        </Stack>
-      </Card>
+      <Community />
     </div>
   );
 }
@@ -66,4 +60,3 @@ const shell: React.CSSProperties = {
   color: 'var(--civitai-color-text)',
 };
 
-const cardStyle: React.CSSProperties = { width: '100%', maxWidth: 'none' };

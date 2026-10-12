@@ -26,7 +26,10 @@ describe('App shell (single view)', () => {
     render(<App />);
 
     expect(await screen.findByTestId('dc-community')).toBeInTheDocument();
-    expect(screen.getByText('Open Datasets', { selector: 'div' })).toBeInTheDocument();
+    // Brand renders twice in the DOM (sidebar + narrow header); CSS shows
+    // exactly one per breakpoint.
+    expect(screen.getAllByText('Open Datasets', { selector: 'div' }).length).toBeGreaterThan(0);
+    expect(screen.getByTestId('dc-sidebar')).toBeInTheDocument();
     // No segmented mode switch, no scaffold generation surface.
     expect(screen.queryByRole('tab')).not.toBeInTheDocument();
     expect(screen.queryByTestId('pm-generate')).not.toBeInTheDocument();

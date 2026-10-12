@@ -54,8 +54,9 @@ describe('Archive Lab theme', () => {
   });
 
   it('the layout is full-width on desktop with responsive card/item grids', () => {
-    // Shell card no longer caps at 640px; grids take over per-view density.
-    expect(appTsx).toContain("maxWidth: 'none'");
+    // No shell Card wrapper (the "double card" is gone): the shell renders
+    // Community directly, and grids take over per-view density.
+    expect(appTsx).not.toContain('<Card');
     expect(indexCss).toContain('.od-grid-cards');
     expect(indexCss).toContain('.od-grid-items');
     expect(indexCss).toContain('@media (min-width: 1184px)');

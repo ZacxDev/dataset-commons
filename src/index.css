@@ -26,6 +26,47 @@
   color-scheme: dark;
 }
 
+/* App layout: at desktop widths a left sidebar carries the brand, the
+   persistent search, and the section nav; below that the narrow header and
+   the in-toolbar search/create take over. One surface per view — the App
+   shell owns the page frame, views own only their content cards. */
+.od-layout {
+  display: flex;
+  gap: 24px;
+  align-items: flex-start;
+  width: 100%;
+}
+
+.od-sidebar {
+  display: none;
+}
+
+.od-main {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+}
+
+@media (min-width: 1024px) {
+  .od-sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 232px;
+    flex-shrink: 0;
+    position: sticky;
+    top: 12px;
+  }
+
+  .od-narrow-header {
+    display: none !important;
+  }
+
+  .od-hide-desktop {
+    display: none;
+  }
+}
+
 * {
   box-sizing: border-box;
 }

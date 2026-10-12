@@ -85,6 +85,7 @@ export type WriteResult = { ok: boolean; reason: string | null };
 
 type Route =
   | { name: 'explore' }
+  | { name: 'mine' }
   | { name: 'create' }
   | { name: 'edit'; datasetId: string }
   | { name: 'dataset'; datasetId: string }
@@ -587,15 +588,66 @@ export function Community() {
       ? view.datasets.find((d) => d.datasetId === route.datasetId)
       : undefined;
   const selectedLora = route.name === 'lora' ? view.loras.find((l) => l.loraId === route.loraId) : undefined;
-  const explored = useMemo(
-    () => filterAndSortDatasets(view.datasets, { query, sort }),
-    [query, sort, view.datasets],
-  );
+  const explored = useMemo(() => {
+    const pool =
+      route.name === 'mine' && viewerId != null
+        ? view.datasets.filter((d) => d.ownerId === viewerId)
+        : view.datasets;
+    return filterAndSortDatasets(pool, { query, sort });
+  }, [query, sort, view.datasets, route.name, viewerId]);
+
+  const navButtonStyle: React.CSSProperties = { width: '100%', justifyContent: 'flex-start' };
 
   return (
     <div data-testid="dc-community" data-theme="dark" data-dc-archive="true" style={rootStyle}>
+      <div className="od-layout">
+        <aside className="od-sidebar" data-testid="dc-sidebar">
+          <div style={titleStyle}>Open Datasets</div>
+          <input
+            style={inputStyle}
+            value={query}
+            placeholder="Search datasets…"
+            onChange={(e) => {
+              setQuery(e.target.value);
+              if (route.name !== 'explore' && route.name !== 'mine') setRoute({ name: 'explore' });
+            }}
+            data-testid="dc-sidebar-search"
+          />
+          <Button
+            variant={route.name === 'explore' ? 'light' : 'subtle'}
+            style={navButtonStyle}
+            onClick={() => setRoute({ name: 'explore' })}
+            data-testid="dc-nav-explore"
+          >
+            Explore
+          </Button>
+          <Button
+            variant={route.name === 'mine' ? 'light' : 'subtle'}
+            style={navButtonStyle}
+            onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'mine' }))}
+            data-testid="dc-nav-mine"
+          >
+            My datasets
+          </Button>
+          <Button
+            style={navButtonStyle}
+            onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'create' }))}
+            data-testid="dc-nav-create"
+          >
+            Create dataset
+          </Button>
+          <Button
+            variant={route.name === 'ledger' ? 'light' : 'subtle'}
+            style={navButtonStyle}
+            onClick={() => setRoute({ name: 'ledger' })}
+            data-testid="dc-nav-ledger"
+          >
+            My contributions
+          </Button>
+        </aside>
+        <div className="od-main">
       <Stack gap={16}>
-        <div style={headerStyle}>
+        <div style={headerStyle} className="od-narrow-header">
           <div>
             <div style={titleStyle}>Open Datasets</div>
             <span style={hintStyle}>
@@ -678,16 +730,18 @@ export function Community() {
           </Alert>
         )}
 
-        {loadState === 'ready' && route.name === 'explore' && (
+        {loadState === 'ready' && (route.name === 'explore' || route.name === 'mine') && (
           <Stack gap={12}>
             <div style={toolbarStyle}>
-              <input
-                style={inputStyle}
-                value={query}
-                placeholder="Search datasets…"
-                onChange={(e) => setQuery(e.target.value)}
-                data-testid="dc-explore-search"
-              />
+              <span className="od-hide-desktop">
+                <input
+                  style={inputStyle}
+                  value={query}
+                  placeholder="Search datasets…"
+                  onChange={(e) => setQuery(e.target.value)}
+                  data-testid="dc-explore-search"
+                />
+              </span>
               <select
                 style={inputStyle}
                 value={sort}
@@ -698,21 +752,25 @@ export function Community() {
                 <option value="newest">Newest</option>
                 <option value="most-trained">Most trained</option>
               </select>
-              <Button
-                onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'create' }))}
-                data-testid="dc-create-dataset"
-              >
-                Create dataset
-              </Button>
+              <span className="od-hide-desktop">
+                <Button
+                  onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'create' }))}
+                  data-testid="dc-create-dataset"
+                >
+                  Create dataset
+                </Button>
+              </span>
             </div>
 
             {explored.length === 0 ? (
               <div style={cardStyle} data-testid="dc-explore-empty">
-                <span style={cardTitleStyle}>No datasets yet</span>
+                <span style={cardTitleStyle}>{route.name === 'mine' ? 'No datasets of yours yet' : 'No datasets yet'}</span>
                 <span style={hintStyle}>
-                  {view.datasets.length === 0
-                    ? 'Be the first: tap Create dataset above, contribute images, and let the community vote the training set in.'
-                    : 'Nothing matches that search. Try a different term, or create the dataset yourself.'}
+                  {route.name === 'mine'
+                    ? 'You have not created a dataset yet — tap Create dataset to start one.'
+                    : view.datasets.length === 0
+                      ? 'Be the first: tap Create dataset, contribute images, and let the community vote the training set in.'
+                      : 'Nothing matches that search. Try a different term, or create the dataset yourself.'}
                 </span>
               </div>
             ) : (
@@ -859,6 +917,8 @@ export function Community() {
           />
         )}
       </Stack>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1127,6 +1187,10 @@ function DatasetDetail(props: {
   }, [getImages, imageIds]);
   const isOwner = viewerId != null && dataset.ownerId === viewerId;
   const liveItems = dataset.items.filter((i) => !i.removed);
+  // Collapse-by-state: the contribute form is the next step only on an empty
+  // dataset (open by default there); once items exist it collapses behind a
+  // disclosure so Train stays the view's one filled primary.
+  const [contributeOpen, setContributeOpen] = useState(liveItems.length === 0);
   // Two-tap delete confirm: first tap arms, second tap fires. The key on the
   // parent resets this when the dataset changes; the timer disarms a stray tap.
   const [deleteArmed, setDeleteArmed] = useState(false);
@@ -1305,8 +1369,14 @@ function DatasetDetail(props: {
             Sign in
           </Button>
         </Alert>
-      ) : (
+      ) : contributeOpen ? (
         <ContributeForm onContribute={props.onContribute} />
+      ) : (
+        <span>
+          <Button variant="light" onClick={() => setContributeOpen(true)} data-testid="dc-contribute-toggle">
+            Contribute an image
+          </Button>
+        </span>
       )}
       </div>
     </Stack>
@@ -1695,11 +1765,11 @@ function LedgerView(props: {
 // only for ledger amounts, serif display headings, mono for money/weights.
 // ---------------------------------------------------------------------------
 
+// Content-only root: the App shell owns the page background and padding, so
+// views never nest a second framed card inside it (the "double card").
 const rootStyle: React.CSSProperties = {
-  background: 'var(--dc-archive-bg, var(--civitai-color-surface-2))',
   color: 'var(--civitai-color-text)',
-  borderRadius: 6,
-  padding: 12,
+  width: '100%',
 };
 const headerStyle: React.CSSProperties = {
   display: 'flex',
