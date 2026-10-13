@@ -17,6 +17,7 @@ import {
   loraSharedValue,
   makeRecordId,
   nextVoteValue,
+  isPostReference,
   parseImageReference,
   snapshotShareRows,
   snapshotSharedValue,
@@ -268,6 +269,9 @@ describe('image references and validation', () => {
   it('parses bare ids, image urls, and blob urls; refuses non-Civitai input', () => {
     expect(parseImageReference('101')).toEqual({ ok: true, value: { imageId: 101, imageRef: '101' } });
     expect(parseImageReference('https://civitai.com/images/202')).toMatchObject({ ok: true, value: { imageId: 202 } });
+    expect(parseImageReference('https://civitai.com/posts/303')).toMatchObject({ ok: true, value: { postId: 303 } });
+    expect(isPostReference('https://civitai.com/posts/303')).toBe(true);
+    expect(isPostReference('https://civitai.com/images/202')).toBe(false);
     expect(parseImageReference('https://civitai.com/v2/consumer/blobs/abc')).toEqual({
       ok: true,
       value: { imageRef: 'https://civitai.com/v2/consumer/blobs/abc' },

@@ -22,6 +22,7 @@ import {
   buildCommunityView,
   buildViewerLedger,
   contributorKey,
+  isPostReference,
   datasetSharedValue,
   filterAndSortDatasets,
   foldSharedEntries,
@@ -787,7 +788,6 @@ export function Community() {
                     {dataset.loraCount === 1 ? '' : 's'}
                   </span>
                   {dataset.description && <span>{dataset.description}</span>}
-                  {dataset.targetNote && <span style={hintStyle}>Target: {dataset.targetNote}</span>}
                   <span>
                     <Button
                       size="sm"
@@ -965,6 +965,15 @@ function VoteControl(props: {
   );
 }
 
+const NAME_ADJECTIVES = ['Amber', 'Velvet', 'Cobalt', 'Scarlet', 'Quiet', 'Golden', 'Ivory', 'Onyx'];
+const NAME_SUBJECTS = ['Portrait', 'Landscape', 'Character', 'Texture', 'Motion', 'Light', 'Form', 'Muse'];
+
+/** A friendly starter name so creating a dataset never starts from a blank box. */
+export function generateDatasetName(): string {
+  const pick = (list: string[]) => list[Math.floor(Math.random() * list.length)];
+  return `${pick(NAME_ADJECTIVES)} ${pick(NAME_SUBJECTS)} Dataset`;
+}
+
 function DatasetForm(props: {
   title: string;
   submitLabel: string;
@@ -972,14 +981,13 @@ function DatasetForm(props: {
   onCancel: () => void;
   onSubmit: (input: { name: string; description: string; targetNote: string }) => Promise<string | null>;
 }) {
-  const [name, setName] = useState(props.initial?.name ?? '');
+  const [name, setName] = useState(() => props.initial?.name ?? generateDatasetName());
   const [description, setDescription] = useState(props.initial?.description ?? '');
-  const [targetNote, setTargetNote] = useState(props.initial?.targetNote ?? '');
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   const submit = async () => {
-    const checked = validateDatasetInput({ name, description, targetNote });
+    const checked = validateDatasetInput({ name, description, targetNote: '' });
     if (!checked.ok) {
       setError(checked.error);
       return;
@@ -999,22 +1007,12 @@ function DatasetForm(props: {
         <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} data-testid="dc-dataset-name" />
       </label>
       <label style={labelStyle}>
-        Description
+        Description <span style={hintStyle}>(optional)</span>
         <textarea
           style={textareaStyle}
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           data-testid="dc-dataset-description"
-        />
-      </label>
-      <label style={labelStyle}>
-        Target note
-        <input
-          style={inputStyle}
-          value={targetNote}
-          placeholder="e.g. SDXL character LoRA"
-          onChange={(e) => setTargetNote(e.target.value)}
-          data-testid="dc-dataset-target"
         />
       </label>
       <span style={hintStyle}>Datasets are public in v1 — there is no private-dataset switch yet.</span>
@@ -1039,6 +1037,7 @@ function ContributeForm(props: {
   onContribute: (input: { imageRef: string; imageId?: number; caption: string }) => Promise<string | null>;
 }) {
   const { open: openUpload } = useImageUpload();
+  const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('link');
   const [reference, setReference] = useState('');
   const [caption, setCaption] = useState('');
   const [rights, setRights] = useState(false);
@@ -1088,30 +1087,72 @@ function ContributeForm(props: {
   return (
     <div style={subCardStyle} data-testid="dc-contribute">
       <span style={cardTitleStyle}>Contribute an image</span>
-      <label style={labelStyle}>
-        Civitai image URL or ID
-        <input
-          style={inputStyle}
-          value={reference}
-          placeholder="https://civitai.com/images/… or an image ID"
-          onChange={(e) => {
-            setReference(e.target.value);
-            setUploaded(null);
-          }}
-          data-testid="dc-contribute-ref"
-        />
-      </label>
-      <span>
-        <Button size="sm" variant="light" onClick={() => void upload()} data-testid="dc-contribute-upload">
-          Upload an image instead
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }} role="tablist" aria-label="Choose an image source">
+        <Button
+          size="sm"
+          variant={tab === 'mine' ? 'filled' : 'light'}
+          onClick={() => setTab('mine')}
+          data-testid="dc-contribute-tab-mine"
+          role="tab"
+          aria-selected={tab === 'mine'}
+        >
+          My images
         </Button>
-        {uploaded && (
-          <span style={hintStyle} data-testid="dc-contribute-uploaded">
-            {' '}
-            Uploaded image #{uploaded.imageId} selected.
-          </span>
-        )}
-      </span>
+        <Button
+          size="sm"
+          variant={tab === 'upload' ? 'filled' : 'light'}
+          onClick={() => setTab('upload')}
+          data-testid="dc-contribute-tab-upload"
+          role="tab"
+          aria-selected={tab === 'upload'}
+        >
+          Upload
+        </Button>
+        <Button
+          size="sm"
+          variant={tab === 'link' ? 'filled' : 'light'}
+          onClick={() => setTab('link')}
+          data-testid="dc-contribute-tab-link"
+          role="tab"
+          aria-selected={tab === 'link'}
+        >
+          Link
+        </Button>
+      </div>
+      {tab === 'mine' && (
+        <span style={hintStyle} data-testid="dc-contribute-mine-empty">
+          Picking from your Civitai images isn't available to apps yet — there's no picker bridge
+          message for it (filed upstream). Use Upload or Link for now.
+        </span>
+      )}
+      {tab === 'upload' && (
+        <span>
+          <Button size="sm" variant="light" onClick={() => void upload()} data-testid="dc-contribute-upload">
+            Upload an image
+          </Button>
+          {uploaded && (
+            <span style={hintStyle} data-testid="dc-contribute-uploaded">
+              {' '}
+              Uploaded image #{uploaded.imageId} selected.
+            </span>
+          )}
+        </span>
+      )}
+      {tab === 'link' && (
+        <label style={labelStyle}>
+          Civitai image or post URL, or an image ID
+          <input
+            style={inputStyle}
+            value={reference}
+            placeholder="https://civitai.com/images/… or an image ID"
+            onChange={(e) => {
+              setReference(e.target.value);
+              setUploaded(null);
+            }}
+            data-testid="dc-contribute-ref"
+          />
+        </label>
+      )}
       <label style={labelStyle}>
         Caption (the training text)
         <input
@@ -1191,6 +1232,7 @@ function DatasetDetail(props: {
   // dataset (open by default there); once items exist it collapses behind a
   // disclosure so Train stays the view's one filled primary.
   const [contributeOpen, setContributeOpen] = useState(liveItems.length === 0);
+  const [menuOpen, setMenuOpen] = useState(false);
   // Two-tap delete confirm: first tap arms, second tap fires. The key on the
   // parent resets this when the dataset changes; the timer disarms a stray tap.
   const [deleteArmed, setDeleteArmed] = useState(false);
@@ -1219,46 +1261,68 @@ function DatasetDetail(props: {
       </span>
       <div style={itemHeadStyle}>
         <span style={titleStyle}>{dataset.name}</span>
-        <VoteControl
-          net={dataset.netVotes}
-          viewerVote={dataset.viewerVote}
-          busy={props.busyKey === `vote-dataset-${dataset.datasetId}`}
-          testIdPrefix="dc-dataset"
-          onVote={(v) => (viewerId == null ? props.onSignIn() : props.onVote('dataset', dataset.datasetId, v))}
-        />
+        <span style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}>
+          <VoteControl
+            net={dataset.netVotes}
+            viewerVote={dataset.viewerVote}
+            busy={props.busyKey === `vote-dataset-${dataset.datasetId}`}
+            testIdPrefix="dc-dataset"
+            onVote={(v) => (viewerId == null ? props.onSignIn() : props.onVote('dataset', dataset.datasetId, v))}
+          />
+          {isOwner && (
+            <span style={{ position: 'relative', display: 'inline-flex' }}>
+              <Button
+                variant="subtle"
+                size="sm"
+                onClick={() => setMenuOpen((o) => !o)}
+                data-testid="dc-dataset-menu"
+                aria-label="Dataset actions"
+                aria-haspopup="menu"
+                aria-expanded={menuOpen}
+                style={{ minWidth: 44, minHeight: 44, fontSize: 20 }}
+              >
+                ⋯
+              </Button>
+              {menuOpen && (
+                <div style={menuStyle} role="menu" data-testid="dc-dataset-menu-list">
+                  <Button
+                    variant="subtle"
+                    style={menuItemStyle}
+                    onClick={() => {
+                      setMenuOpen(false);
+                      props.onEdit();
+                    }}
+                    data-testid="dc-edit-dataset"
+                  >
+                    Edit dataset
+                  </Button>
+                  <Button
+                    variant="subtle"
+                    color="red"
+                    style={menuItemStyle}
+                    onClick={armOrDelete}
+                    data-testid="dc-delete-dataset"
+                  >
+                    {deleteArmed ? 'Tap again to confirm delete' : 'Delete dataset'}
+                  </Button>
+                </div>
+              )}
+            </span>
+          )}
+        </span>
       </div>
       <span style={hintStyle}>
         by {dataset.ownerName} · {liveItems.length} items · {dataset.trainableCount} trainable now · public in v1
       </span>
       {dataset.description && <span>{dataset.description}</span>}
-      {dataset.targetNote && <span style={hintStyle}>Target: {dataset.targetNote}</span>}
 
-      <div style={rowStyle}>
-        {dataset.items.length === 0 ? (
-          <Button
-            onClick={() =>
-              document.getElementById('dc-contribute-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-            }
-            data-testid="dc-add-first-image"
-          >
-            Add the first image
-          </Button>
-        ) : (
+      {dataset.items.length > 0 && (
+        <div style={rowStyle}>
           <Button onClick={() => (viewerId == null ? props.onSignIn() : props.onTrain())} data-testid="dc-open-train">
             Train a LoRA from this dataset
           </Button>
-        )}
-        {isOwner && (
-          <Button variant="light" onClick={props.onEdit} data-testid="dc-edit-dataset">
-            Edit dataset
-          </Button>
-        )}
-        {isOwner && (
-          <Button variant="subtle" color="red" onClick={armOrDelete} data-testid="dc-delete-dataset">
-            {deleteArmed ? 'Tap again to confirm delete' : 'Delete dataset'}
-          </Button>
-        )}
-      </div>
+        </div>
+      )}
       {dataset.trainableCount === 0 && (
         <Alert color="warning" title="Nothing trainable yet" data-testid="dc-no-trainable">
           {dataset.items.length === 0
@@ -1318,6 +1382,13 @@ function DatasetDetail(props: {
                     Image hidden by your content settings.
                   </span>
                 )
+              ) : isPostReference(item.imageRef) ? (
+                <span style={hintStyle} data-testid={`dc-item-post-${item.itemId}`}>
+                  Linked from a Civitai post —{' '}
+                  <a href={item.imageRef} target="_blank" rel="noreferrer">
+                    view the post
+                  </a>
+                </span>
               ) : /^https?:\/\//.test(item.imageRef) ? (
                 <img src={item.imageRef} alt={item.caption} style={imageStyle} data-testid={`dc-item-image-${item.itemId}`} />
               ) : (
@@ -1805,6 +1876,22 @@ const cardStyle: React.CSSProperties = {
   background: 'var(--civitai-color-surface, transparent)',
 };
 const subCardStyle: React.CSSProperties = { ...cardStyle, background: 'var(--civitai-color-surface, transparent)' };
+const menuStyle: React.CSSProperties = {
+  position: 'absolute',
+  right: 0,
+  top: 'calc(100% + 4px)',
+  zIndex: 30,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 2,
+  minWidth: 200,
+  padding: 6,
+  borderRadius: 8,
+  border: '1px solid var(--civitai-color-border, #243746)',
+  background: 'var(--civitai-color-surface-2, #1a2833)',
+  boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
+};
+const menuItemStyle: React.CSSProperties = { width: '100%', justifyContent: 'flex-start' };
 const toolbarStyle: React.CSSProperties = { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' };
 const rowStyle: React.CSSProperties = {
   display: 'flex',

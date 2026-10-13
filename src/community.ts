@@ -641,6 +641,8 @@ export function validateDatasetInput(input: {
 
 export interface ParsedImageReference {
   imageId?: number;
+  /** Set when the link points at a Civitai post rather than a single image. */
+  postId?: number;
   imageRef: string;
 }
 
@@ -667,7 +669,15 @@ export function parseImageReference(raw: string): Validation<ParsedImageReferenc
   }
   const idMatch = url.pathname.match(/\/images?\/(\d+)/i) ?? url.search.match(/[?&]imageId=(\d+)/i);
   const imageId = idMatch ? Number(idMatch[1]) : undefined;
-  return { ok: true, value: { ...(imageId ? { imageId } : {}), imageRef: url.toString() } };
+  if (imageId) return { ok: true, value: { imageId, imageRef: url.toString() } };
+  const postMatch = url.pathname.match(/\/posts?\/(\d+)/i);
+  if (postMatch) return { ok: true, value: { postId: Number(postMatch[1]), imageRef: url.toString() } };
+  return { ok: true, value: { imageRef: url.toString() } };
+}
+
+/** True when a stored reference points at a Civitai post, not a single image. */
+export function isPostReference(imageRef: string): boolean {
+  return /civitai\.com\/posts?\//i.test(imageRef);
 }
 
 export function validateContribution(input: {

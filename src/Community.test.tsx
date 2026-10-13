@@ -219,6 +219,8 @@ describe('Community screens (voting option b)', () => {
     await user.click(screen.getByTestId('dc-dataset-save'));
     expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toHaveTextContent('Scratch Delete');
 
+    // Delete lives in the three-dots menu now; two-tap confirm still applies.
+    await user.click(screen.getByTestId('dc-dataset-menu'));
     // Two-tap confirm: one tap arms but does not delete.
     await user.click(screen.getByTestId('dc-delete-dataset'));
     expect(screen.getByTestId('dc-delete-dataset')).toHaveTextContent('Tap again to confirm delete');
