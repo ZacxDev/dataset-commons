@@ -99,7 +99,14 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.queryByTestId('dc-theme-toggle')).not.toBeInTheDocument();
   });
 
-  it('estimate -> quote -> confirm -> submit -> trainedEpochs -> ready to publish, ledger credits vote-weighted', async () => {
+  it('prepared-dataset estimate is refused by the host: honest failure, no quote, nothing submitted', async () => {
+    // Platform change (mirrored by the current mock host): a training step
+    // type can no longer run as a confirmed step — the host fails the
+    // estimate with "use kind:'training'". The sanctioned kind:'training'
+    // flow admits only the viewer's own images, so the multi-contributor
+    // prepared arm has no rail; the surface must show the refusal honestly
+    // and charge nothing. (The vote-weighted ledger math itself is covered
+    // by the pure contributorShares tests in community.test.ts.)
     const user = userEvent.setup();
     const submittedBodies: Array<Record<string, unknown>> = [];
     uninstall = installMockMoneyHost({
@@ -119,33 +126,24 @@ describe('TrainFlow (Option A′)', () => {
 
     await user.click(screen.getByTestId('dc-estimate'));
 
-    // The confirm card shows the REAL quote (cost 512 > maxBuzz sentinel 1).
-    expect(await screen.findByTestId('dc-quote')).toHaveTextContent('512');
-    expect(screen.getByTestId('dc-confirm-submit')).toBeEnabled();
-
-    await user.click(screen.getByTestId('dc-confirm-submit'));
-
-    // Trained epochs arrive -> ready to publish, with the wizard CTA.
-    expect(await screen.findByTestId('dc-publish', {}, { timeout: 5000 })).toHaveTextContent('Publish epoch 10');
-    expect(screen.getByTestId('dc-run-state')).toHaveTextContent(/ready to publish/i);
-
-    // The submitted body is the #541 pass-through training shape.
-    const body = submittedBodies.at(-1)!;
-    expect(body.kind).toBe('step');
-    expect(body.$type).toBe('training');
-    expect(body.maxBuzz).toBe(1);
-    const input = body.input as { trainingData: { items: unknown[] }; triggerWord?: string };
-    expect(input.trainingData.items).toHaveLength(2);
-    expect(input.triggerWord).toBe('archivetok');
-
-    // Trainer-fee ledger: 512 split 5:1 -> alice 427, bob 85 (largest remainder).
-    expect(screen.getByTestId('dc-ledger')).toBeInTheDocument();
-    expect(screen.getByTestId('dc-credit-alice')).toHaveTextContent('427');
-    expect(screen.getByTestId('dc-credit-bob')).toHaveTextContent('85');
-    expect(screen.getByTestId('dc-ledger')).toHaveTextContent(/tracked/i);
+    const refusal = await screen.findByTestId('dc-unquoted', {}, { timeout: 5000 });
+    expect(refusal).toHaveTextContent(/no price quote/i);
+    expect(refusal).toHaveTextContent(/No Buzz was charged/);
+    expect(screen.getByTestId('dc-unquoted-detail')).toHaveTextContent(
+      /a training step type cannot run as a confirmed step/i,
+    );
+    // No quote card, no confirm, no run state, no ledger credit.
+    expect(screen.queryByTestId('dc-quote')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-confirm-submit')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-publish')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-ledger')).not.toBeInTheDocument();
+    expect(submittedBodies).toHaveLength(0);
   });
 
-  it('publishedModel on the snapshot renders the LoRA as linked to this snapshot', async () => {
+  it('a refused estimate leaves no publish, moderation, or run state behind', async () => {
+    // Companion to the refusal test above: because no run can start, none
+    // of the post-run surfaces (published link, in-moderation, publish CTA)
+    // may appear — the snapshot simply stays untrained.
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
@@ -160,34 +158,11 @@ describe('TrainFlow (Option A′)', () => {
     });
     await openTrain(user);
     await user.click(screen.getByTestId('dc-estimate'));
-    await screen.findByTestId('dc-confirm-submit');
-    await user.click(screen.getByTestId('dc-confirm-submit'));
 
-    expect(await screen.findByTestId('dc-published', {}, { timeout: 5000 })).toHaveTextContent(
-      'Model version 84 is live',
-    );
-    expect(screen.getByTestId('dc-run-state')).toHaveTextContent(/published/i);
-  });
-
-  it('succeeded with NO trainedEpochs reads as in-moderation, never as publishable', async () => {
-    const user = userEvent.setup();
-    uninstall = installMockMoneyHost({
-      viewer: { id: 2, username: 'dev', status: 'active' },
-      consentGranted: true,
-      cost: 512,
-      pollsUntilDone: 1,
-      buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
-      generation: { trainedEpochs: 0 },
-    });
-    await openTrain(user);
-    await user.click(screen.getByTestId('dc-estimate'));
-    await screen.findByTestId('dc-confirm-submit');
-    await user.click(screen.getByTestId('dc-confirm-submit'));
-
-    expect(await screen.findByTestId('dc-moderation', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(await screen.findByTestId('dc-unquoted', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.queryByTestId('dc-published')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-moderation')).not.toBeInTheDocument();
     expect(screen.queryByTestId('dc-publish')).not.toBeInTheDocument();
-    // No LoRA exists yet, so no trainer-fee credit is shown while moderation holds.
-    expect(screen.queryByTestId('dc-ledger')).not.toBeInTheDocument();
   });
 
   it('an unquoted estimate (cost == maxBuzz) refuses the submit and states no charge', async () => {
@@ -223,7 +198,10 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.queryByTestId('dc-confirm-submit')).not.toBeInTheDocument();
   });
 
-  it('insufficient balance disables the train confirm and charges nothing', async () => {
+  it('a low balance still surfaces the host refusal (no quote exists to afford) and charges nothing', async () => {
+    // With the prepared arm refused at estimate time, the balance check
+    // never runs: there is no quote, so no insufficient-balance card and
+    // no confirm — just the refusal, and no charge.
     const user = userEvent.setup();
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
@@ -234,7 +212,10 @@ describe('TrainFlow (Option A′)', () => {
     await openTrain(user);
     await user.click(screen.getByTestId('dc-estimate'));
 
-    expect(await screen.findByTestId('dc-insufficient')).toBeInTheDocument();
+    expect(await screen.findByTestId('dc-unquoted', {}, { timeout: 5000 })).toHaveTextContent(
+      /No Buzz was charged/,
+    );
+    expect(screen.queryByTestId('dc-insufficient')).not.toBeInTheDocument();
     expect(screen.queryByTestId('dc-confirm-submit')).not.toBeInTheDocument();
   });
 

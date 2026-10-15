@@ -8,6 +8,7 @@ import {
   useBuzzWorkflow,
   useCivitaiNavigate,
   useGatedImages,
+  useImagePicker,
   useImageUpload,
   useRequestConsent,
   useRequestSignIn,
@@ -1037,26 +1038,44 @@ function ContributeForm(props: {
   onContribute: (input: { imageRef: string; imageId?: number; caption: string }) => Promise<string | null>;
 }) {
   const { open: openUpload } = useImageUpload();
+  const { open: openPicker } = useImagePicker();
   const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('link');
   const [reference, setReference] = useState('');
   const [caption, setCaption] = useState('');
   const [rights, setRights] = useState(false);
   const [uploaded, setUploaded] = useState<{ imageId: number; url: string } | null>(null);
+  const [picked, setPicked] = useState<{ imageId?: number; url: string; source: 'posted' | 'generated' } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   const upload = async () => {
-    const picked = await openUpload();
-    if (!picked) return;
-    setUploaded({ imageId: picked.imageId, url: picked.url });
-    setReference(picked.url);
+    const pickedImage = await openUpload();
+    if (!pickedImage) return;
+    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url });
+    setPicked(null);
+    setReference(pickedImage.url);
     setError(null);
+  };
+
+  const pick = async () => {
+    try {
+      const image = await openPicker();
+      if (!image) return;
+      setPicked({ imageId: image.imageId, url: image.url, source: image.source });
+      setUploaded(null);
+      setError(null);
+    } catch {
+      setError("The image picker isn't available here yet — use Upload or Link instead.");
+    }
   };
 
   const submit = async () => {
     let imageRef = reference.trim();
     let imageId: number | undefined = uploaded?.imageId;
-    if (!uploaded) {
+    if (picked) {
+      imageRef = picked.url;
+      imageId = picked.imageId;
+    } else if (!uploaded) {
       const parsed = parseImageReference(reference);
       if (!parsed.ok) {
         setError(parsed.error);
@@ -1082,6 +1101,7 @@ function ContributeForm(props: {
     setCaption('');
     setRights(false);
     setUploaded(null);
+    setPicked(null);
   };
 
   return (
@@ -1120,9 +1140,18 @@ function ContributeForm(props: {
         </Button>
       </div>
       {tab === 'mine' && (
-        <span style={hintStyle} data-testid="dc-contribute-mine-empty">
-          Picking from your Civitai images isn't available to apps yet — there's no picker bridge
-          message for it (filed upstream). Use Upload or Link for now.
+        <span>
+          <Button size="sm" variant="light" onClick={() => void pick()} data-testid="dc-contribute-pick">
+            Pick from my images
+          </Button>
+          {picked && (
+            <span style={hintStyle} data-testid="dc-contribute-picked">
+              {' '}
+              {picked.source === 'posted'
+                ? `Picked image #${picked.imageId} selected.`
+                : 'Picked a generator image — its link can expire over time, so a posted image makes a more permanent reference.'}
+            </span>
+          )}
         </span>
       )}
       {tab === 'upload' && (

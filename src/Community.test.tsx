@@ -231,6 +231,33 @@ describe('Community screens (voting option b)', () => {
     expect(screen.queryByText('Scratch Delete')).not.toBeInTheDocument();
   });
 
+  it('contributing via the My images picker stores the picked image id', async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      declaredScopes: [...ALL_APP_SCOPES],
+      consentGranted: true,
+      shared: { seed: [] },
+    });
+    await openCommunity(user);
+    await user.click(await screen.findByTestId('dc-community-enable'));
+    await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
+
+    await user.click(screen.getByTestId('dc-create-dataset'));
+    await user.click(screen.getByTestId('dc-dataset-save'));
+    expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toBeInTheDocument();
+
+    // The mock host's default pick is a posted image (#12345801).
+    await user.click(screen.getByTestId('dc-contribute-tab-mine'));
+    await user.click(screen.getByTestId('dc-contribute-pick'));
+    expect(await screen.findByTestId('dc-contribute-picked')).toHaveTextContent('Picked image #12345801');
+
+    await user.type(screen.getByTestId('dc-contribute-caption'), 'a picked portrait');
+    await user.click(screen.getByTestId('dc-contribute-rights'));
+    await user.click(screen.getByTestId('dc-contribute-submit'));
+    expect(await screen.findByText('a picked portrait', {}, { timeout: 5000 })).toBeInTheDocument();
+  });
+
   it('gated images render visible, hidden, and rating-pending states without leaking a hidden url', async () => {
     const user = userEvent.setup();
     const dataset: DatasetRecord = {

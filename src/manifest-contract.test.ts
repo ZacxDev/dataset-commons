@@ -65,7 +65,8 @@ describe('block.manifest.json — training contract', () => {
   });
 
   it('pins the SDK pair that types the training hooks + trainedEpochs / publishedModel', () => {
-    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.58.0');
-    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.65.0');
+    // Bumped 2026-10-15 for useImagePicker (blocks-react 0.73 / app-sdk 0.70).
+    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.70.1');
+    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.73.2');
   });
 });
