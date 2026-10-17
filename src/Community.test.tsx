@@ -152,10 +152,13 @@ describe('Community screens (voting option b)', () => {
 
     await user.click(screen.getByTestId('dc-create-dataset'));
     await user.type(screen.getByTestId('dc-dataset-name'), 'Robot Studies');
-    await user.type(screen.getByTestId('dc-dataset-description'), 'Reference poses');
+    // The create flow hides the description input (it is set later via Edit).
+    expect(screen.queryByTestId('dc-dataset-description')).not.toBeInTheDocument();
     await user.click(screen.getByTestId('dc-dataset-save'));
 
     expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toHaveTextContent('Robot Studies');
+    // Contributing opens from the large Add-an-image CTA into a modal.
+    await user.click(screen.getByTestId('dc-add-image'));
     await user.type(screen.getByTestId('dc-contribute-ref'), 'https://civitai.com/images/9001');
     await user.type(screen.getByTestId('dc-contribute-caption'), 'robot, front view');
     await user.click(screen.getByTestId('dc-contribute-rights'));
@@ -248,6 +251,7 @@ describe('Community screens (voting option b)', () => {
     expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toBeInTheDocument();
 
     // The mock host's default pick is a posted image (#12345801).
+    await user.click(screen.getByTestId('dc-add-image'));
     await user.click(screen.getByTestId('dc-contribute-tab-mine'));
     await user.click(screen.getByTestId('dc-contribute-pick'));
     expect(await screen.findByTestId('dc-contribute-picked')).toHaveTextContent('Picked image #12345801');

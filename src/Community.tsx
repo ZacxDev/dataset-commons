@@ -14,7 +14,9 @@ import {
   useRequestSignIn,
   useSharedStorage,
 } from '@civitai/blocks-react';
-import { Alert, Badge, Button, Stack } from '@civitai/blocks-react/ui';
+import { Alert, Badge, Button, Modal, Stack } from '@civitai/blocks-react/ui';
+import '@civitai/components/civitai-nav-item/define';
+import '@civitai/components/civitai-nav-list/define';
 import type { BlockGatedImage } from '@civitai/app-sdk/blocks';
 
 import {
@@ -125,6 +127,8 @@ export function Community() {
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState<ExploreSort>('top-voted');
+  const [sortOpen, setSortOpen] = useState(false);
+  const [trainableOnly, setTrainableOnly] = useState(false);
   const [viewerIndexAccess, setViewerIndexAccess] = useState<StorageAccess>('ready');
 
   const sharedRef = useRef(shared);
@@ -595,10 +599,9 @@ export function Community() {
       route.name === 'mine' && viewerId != null
         ? view.datasets.filter((d) => d.ownerId === viewerId)
         : view.datasets;
-    return filterAndSortDatasets(pool, { query, sort });
-  }, [query, sort, view.datasets, route.name, viewerId]);
-
-  const navButtonStyle: React.CSSProperties = { width: '100%', justifyContent: 'flex-start' };
+    const filtered = trainableOnly ? pool.filter((d) => d.trainableCount > 0) : pool;
+    return filterAndSortDatasets(filtered, { query, sort });
+  }, [query, sort, trainableOnly, view.datasets, route.name, viewerId]);
 
   return (
     <div data-testid="dc-community" data-theme="dark" data-dc-archive="true" style={rootStyle}>
@@ -615,37 +618,50 @@ export function Community() {
             }}
             data-testid="dc-sidebar-search"
           />
-          <Button
-            variant={route.name === 'explore' ? 'light' : 'subtle'}
-            style={navButtonStyle}
-            onClick={() => setRoute({ name: 'explore' })}
-            data-testid="dc-nav-explore"
-          >
-            Explore
-          </Button>
-          <Button
-            variant={route.name === 'mine' ? 'light' : 'subtle'}
-            style={navButtonStyle}
-            onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'mine' }))}
-            data-testid="dc-nav-mine"
-          >
-            My datasets
-          </Button>
-          <Button
-            style={navButtonStyle}
-            onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'create' }))}
-            data-testid="dc-nav-create"
-          >
-            Create dataset
-          </Button>
-          <Button
-            variant={route.name === 'ledger' ? 'light' : 'subtle'}
-            style={navButtonStyle}
-            onClick={() => setRoute({ name: 'ledger' })}
-            data-testid="dc-nav-ledger"
-          >
-            My contributions
-          </Button>
+          <civitai-nav-list label="Open Datasets sections">
+            <civitai-nav-item
+              label="Explore"
+              href="#/explore"
+              current={route.name === 'explore'}
+              onClick={(e) => {
+                e.preventDefault();
+                setRoute({ name: 'explore' });
+              }}
+              data-testid="dc-nav-explore"
+            />
+            <civitai-nav-item
+              label="My datasets"
+              href="#/mine"
+              current={route.name === 'mine'}
+              onClick={(e) => {
+                e.preventDefault();
+                if (viewerId == null) requestSignIn();
+                else setRoute({ name: 'mine' });
+              }}
+              data-testid="dc-nav-mine"
+            />
+            <civitai-nav-item
+              label="Create dataset"
+              href="#/create"
+              current={route.name === 'create'}
+              onClick={(e) => {
+                e.preventDefault();
+                if (viewerId == null) requestSignIn();
+                else setRoute({ name: 'create' });
+              }}
+              data-testid="dc-nav-create"
+            />
+            <civitai-nav-item
+              label="My contributions"
+              href="#/contributions"
+              current={route.name === 'ledger'}
+              onClick={(e) => {
+                e.preventDefault();
+                setRoute({ name: 'ledger' });
+              }}
+              data-testid="dc-nav-ledger"
+            />
+          </civitai-nav-list>
         </aside>
         <div className="od-main">
       <Stack gap={16}>
@@ -744,16 +760,62 @@ export function Community() {
                   data-testid="dc-explore-search"
                 />
               </span>
-              <select
-                style={inputStyle}
-                value={sort}
-                onChange={(e) => setSort(e.target.value as ExploreSort)}
-                data-testid="dc-explore-sort"
-              >
-                <option value="top-voted">Top voted</option>
-                <option value="newest">Newest</option>
-                <option value="most-trained">Most trained</option>
-              </select>
+              <span style={{ position: 'relative', display: 'inline-flex' }}>
+                <Button
+                  size="sm"
+                  variant="light"
+                  onClick={() => setSortOpen((o) => !o)}
+                  data-testid="dc-explore-sort"
+                  aria-label="Sort and filter datasets"
+                  aria-haspopup="menu"
+                  aria-expanded={sortOpen}
+                  style={{ minWidth: 44, minHeight: 44, fontSize: 17 }}
+                >
+                  ⇅
+                </Button>
+                {sortOpen && (
+                  <>
+                    <div
+                      className="od-menu-backdrop"
+                      onClick={() => setSortOpen(false)}
+                      data-testid="dc-sort-backdrop"
+                    />
+                    <div style={{ ...menuStyle, left: 0, right: 'auto' }} role="menu" data-testid="dc-sort-menu">
+                      <span style={menuLabelStyle}>Sort by</span>
+                      {(
+                        [
+                          ['top-voted', 'Top voted'],
+                          ['newest', 'Newest'],
+                          ['most-trained', 'Most trained'],
+                        ] as Array<[ExploreSort, string]>
+                      ).map(([value, label]) => (
+                        <Button
+                          key={value}
+                          variant="subtle"
+                          style={menuItemStyle}
+                          onClick={() => {
+                            setSort(value);
+                            setSortOpen(false);
+                          }}
+                          data-testid={`dc-sort-${value}`}
+                        >
+                          {sort === value ? '✓ ' : ''}
+                          {label}
+                        </Button>
+                      ))}
+                      <span style={menuLabelStyle}>Filter</span>
+                      <Button
+                        variant="subtle"
+                        style={menuItemStyle}
+                        onClick={() => setTrainableOnly((t) => !t)}
+                        data-testid="dc-filter-trainable"
+                      >
+                        {trainableOnly ? '✓ ' : ''}Trainable only
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </span>
               <span className="od-hide-desktop">
                 <Button
                   onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'create' }))}
@@ -1000,42 +1062,51 @@ function DatasetForm(props: {
     if (result) setError(result);
   };
 
+  const isCreate = props.initial == null;
   return (
     <div style={{ ...cardStyle, maxWidth: 760 }} data-testid="dc-dataset-form">
-      <span style={cardTitleStyle}>{props.title}</span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <Button variant="subtle" size="sm" onClick={props.onCancel} data-testid="dc-dataset-back" aria-label="Back">
+          ←
+        </Button>
+        <span style={cardTitleStyle}>{props.title}</span>
+      </div>
       <label style={labelStyle}>
         Name
         <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} data-testid="dc-dataset-name" />
       </label>
-      <label style={labelStyle}>
-        Description <span style={hintStyle}>(optional)</span>
-        <textarea
-          style={textareaStyle}
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          data-testid="dc-dataset-description"
-        />
-      </label>
-      <span style={hintStyle}>Datasets are public in v1 — there is no private-dataset switch yet.</span>
+      {!isCreate && (
+        <label style={labelStyle}>
+          Description <span style={hintStyle}>(optional)</span>
+          <textarea
+            style={textareaStyle}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            data-testid="dc-dataset-description"
+          />
+        </label>
+      )}
       {error && (
         <Alert color="error" title="Could not save" data-testid="dc-dataset-form-error">
           {error}
         </Alert>
       )}
-      <div style={rowStyle}>
-        <Button loading={saving} onClick={() => void submit()} data-testid="dc-dataset-save">
-          {props.submitLabel}
-        </Button>
-        <Button variant="subtle" onClick={props.onCancel} data-testid="dc-dataset-cancel">
-          Cancel
-        </Button>
-      </div>
+      <Button
+        size="lg"
+        loading={saving}
+        onClick={() => void submit()}
+        data-testid="dc-dataset-save"
+        style={{ width: '100%', minHeight: 52, marginTop: 8 }}
+      >
+        {props.submitLabel}
+      </Button>
     </div>
   );
 }
 
 function ContributeForm(props: {
   onContribute: (input: { imageRef: string; imageId?: number; caption: string }) => Promise<string | null>;
+  onSuccess?: () => void;
 }) {
   const { open: openUpload } = useImageUpload();
   const { open: openPicker } = useImagePicker();
@@ -1102,11 +1173,11 @@ function ContributeForm(props: {
     setRights(false);
     setUploaded(null);
     setPicked(null);
+    props.onSuccess?.();
   };
 
   return (
     <div style={subCardStyle} data-testid="dc-contribute">
-      <span style={cardTitleStyle}>Contribute an image</span>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }} role="tablist" aria-label="Choose an image source">
         <Button
           size="sm"
@@ -1116,7 +1187,7 @@ function ContributeForm(props: {
           role="tab"
           aria-selected={tab === 'mine'}
         >
-          My images
+          Select from My Images
         </Button>
         <Button
           size="sm"
@@ -1183,10 +1254,15 @@ function ContributeForm(props: {
         </label>
       )}
       <label style={labelStyle}>
-        Caption (the training text)
+        Caption
+        <span style={hintStyle}>
+          Describe the image in a short phrase — the caption is the training text the LoRA
+          learns from, e.g. “ink portrait, front view”.
+        </span>
         <input
           style={inputStyle}
           value={caption}
+          placeholder="e.g. ink portrait, front view"
           onChange={(e) => setCaption(e.target.value)}
           data-testid="dc-contribute-caption"
         />
@@ -1257,10 +1333,8 @@ function DatasetDetail(props: {
   }, [getImages, imageIds]);
   const isOwner = viewerId != null && dataset.ownerId === viewerId;
   const liveItems = dataset.items.filter((i) => !i.removed);
-  // Collapse-by-state: the contribute form is the next step only on an empty
-  // dataset (open by default there); once items exist it collapses behind a
-  // disclosure so Train stays the view's one filled primary.
-  const [contributeOpen, setContributeOpen] = useState(liveItems.length === 0);
+  // Contributing happens in a modal opened from the large Add-an-image CTA.
+  const [contributeModalOpen, setContributeModalOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   // Two-tap delete confirm: first tap arms, second tap fires. The key on the
   // parent resets this when the dataset changes; the timer disarms a stray tap.
@@ -1291,13 +1365,15 @@ function DatasetDetail(props: {
       <div style={itemHeadStyle}>
         <span style={titleStyle}>{dataset.name}</span>
         <span style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}>
-          <VoteControl
-            net={dataset.netVotes}
-            viewerVote={dataset.viewerVote}
-            busy={props.busyKey === `vote-dataset-${dataset.datasetId}`}
-            testIdPrefix="dc-dataset"
-            onVote={(v) => (viewerId == null ? props.onSignIn() : props.onVote('dataset', dataset.datasetId, v))}
-          />
+          {!isOwner && (
+            <VoteControl
+              net={dataset.netVotes}
+              viewerVote={dataset.viewerVote}
+              busy={props.busyKey === `vote-dataset-${dataset.datasetId}`}
+              testIdPrefix="dc-dataset"
+              onVote={(v) => (viewerId == null ? props.onSignIn() : props.onVote('dataset', dataset.datasetId, v))}
+            />
+          )}
           {isOwner && (
             <span style={{ position: 'relative', display: 'inline-flex' }}>
               <Button
@@ -1313,6 +1389,16 @@ function DatasetDetail(props: {
                 ⋯
               </Button>
               {menuOpen && (
+                <>
+                <div
+                  className="od-menu-backdrop"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setDeleteArmed(false);
+                    if (disarmTimer.current) clearTimeout(disarmTimer.current);
+                  }}
+                  data-testid="dc-dataset-menu-backdrop"
+                />
                 <div style={menuStyle} role="menu" data-testid="dc-dataset-menu-list">
                   <Button
                     variant="subtle"
@@ -1335,13 +1421,14 @@ function DatasetDetail(props: {
                     {deleteArmed ? 'Tap again to confirm delete' : 'Delete dataset'}
                   </Button>
                 </div>
+                </>
               )}
             </span>
           )}
         </span>
       </div>
       <span style={hintStyle}>
-        by {dataset.ownerName} · {liveItems.length} items · {dataset.trainableCount} trainable now · public in v1
+        by {dataset.ownerName} · {liveItems.length} items · {dataset.trainableCount} trainable now
       </span>
       {dataset.description && <span>{dataset.description}</span>}
 
@@ -1352,14 +1439,6 @@ function DatasetDetail(props: {
           </Button>
         </div>
       )}
-      {dataset.trainableCount === 0 && (
-        <Alert color="warning" title="Nothing trainable yet" data-testid="dc-no-trainable">
-          {dataset.items.length === 0
-            ? 'This dataset has no items yet. Contribute the first image below.'
-            : 'Every live item is net-negative or at zero right now, so a training snapshot would be empty. Upvote the items that belong in the training set.'}
-        </Alert>
-      )}
-
       {props.loras.length > 0 && (
         <div style={subCardStyle} data-testid="dc-dataset-loras">
           <span style={cardTitleStyle}>LoRAs trained from this dataset</span>
@@ -1380,7 +1459,7 @@ function DatasetDetail(props: {
       <span style={cardTitleStyle}>Items</span>
       {dataset.items.length === 0 ? (
         <span style={hintStyle} data-testid="dc-dataset-no-items">
-          No items yet — contribute the first image below.
+          No items yet — add the first image.
         </span>
       ) : (
         <div className="od-grid-items">
@@ -1469,14 +1548,23 @@ function DatasetDetail(props: {
             Sign in
           </Button>
         </Alert>
-      ) : contributeOpen ? (
-        <ContributeForm onContribute={props.onContribute} />
       ) : (
-        <span>
-          <Button variant="light" onClick={() => setContributeOpen(true)} data-testid="dc-contribute-toggle">
-            Contribute an image
+        <>
+          <Button
+            size="lg"
+            onClick={() => setContributeModalOpen(true)}
+            data-testid="dc-add-image"
+            style={{ width: '100%', minHeight: 52 }}
+          >
+            Add an image
           </Button>
-        </span>
+          <Modal opened={contributeModalOpen} onClose={() => setContributeModalOpen(false)} title="Add an image">
+            <ContributeForm
+              onContribute={props.onContribute}
+              onSuccess={() => setContributeModalOpen(false)}
+            />
+          </Modal>
+        </>
       )}
       </div>
     </Stack>
@@ -1921,6 +2009,14 @@ const menuStyle: React.CSSProperties = {
   boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
 };
 const menuItemStyle: React.CSSProperties = { width: '100%', justifyContent: 'flex-start' };
+const menuLabelStyle: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 600,
+  letterSpacing: 0.4,
+  textTransform: 'uppercase',
+  color: 'var(--civitai-color-text-dimmed, #9aa7b1)',
+  padding: '4px 10px 2px',
+};
 const toolbarStyle: React.CSSProperties = { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' };
 const rowStyle: React.CSSProperties = {
   display: 'flex',

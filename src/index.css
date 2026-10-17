@@ -41,6 +41,20 @@
   display: none;
 }
 
+/* The upstream civitai-nav-list carries the sidebar sections. */
+.od-sidebar civitai-nav-list {
+  display: block;
+  width: 100%;
+}
+
+/* Transparent layer that closes open menus on any outside tap/click. */
+.od-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: transparent;
+}
+
 .od-main {
   flex: 1;
   min-width: 0;
