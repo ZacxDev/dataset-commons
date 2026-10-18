@@ -47,6 +47,27 @@
   width: 100%;
 }
 
+/* Slide-out navigation: the upstream Modal shell re-anchored as a left
+   drawer for narrow layouts (there is no upstream drawer element). */
+.od-drawer-panel {
+  position: fixed !important;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 280px;
+  max-width: 85vw !important;
+  height: 100%;
+  border-radius: 0 !important;
+  border-left: none !important;
+  border-top: none !important;
+  border-bottom: none !important;
+}
+
+.od-drawer-panel civitai-nav-list {
+  display: block;
+  width: 100%;
+}
+
 /* Transparent layer that closes open menus on any outside tap/click. */
 .od-menu-backdrop {
   position: fixed;

@@ -159,6 +159,8 @@ describe('Community screens (voting option b)', () => {
     expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toHaveTextContent('Robot Studies');
     // Contributing opens from the large Add-an-image CTA into a modal.
     await user.click(screen.getByTestId('dc-add-image'));
+    // The modal defaults to Select from My Images; the Link tab carries the ref input.
+    await user.click(screen.getByTestId('dc-contribute-tab-link'));
     await user.type(screen.getByTestId('dc-contribute-ref'), 'https://civitai.com/images/9001');
     await user.type(screen.getByTestId('dc-contribute-caption'), 'robot, front view');
     await user.click(screen.getByTestId('dc-contribute-rights'));
@@ -367,7 +369,8 @@ describe('Community screens (voting option b)', () => {
     expect(screen.getByTestId('dc-lora-onsite')).toHaveTextContent(/aren't reported to apps yet/i);
     expect(screen.getByTestId('dc-lora-events')).toHaveTextContent('700');
 
-    await user.click(screen.getByTestId('dc-open-ledger'));
+    await user.click(screen.getByTestId('dc-nav-open'));
+    await user.click(await screen.findByTestId('dc-drawer-ledger'));
     expect(await screen.findByTestId('dc-ledger-total', {}, { timeout: 5000 })).toHaveTextContent('583');
     expect(screen.getByTestId('dc-ledger-total')).toHaveTextContent(/no Buzz has moved to you/i);
     expect(screen.getByTestId('dc-ledger-row')).toHaveTextContent('583');

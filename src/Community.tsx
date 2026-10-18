@@ -128,6 +128,7 @@ export function Community() {
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState<ExploreSort>('top-voted');
   const [sortOpen, setSortOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [trainableOnly, setTrainableOnly] = useState(false);
   const [viewerIndexAccess, setViewerIndexAccess] = useState<StorageAccess>('ready');
 
@@ -666,16 +667,21 @@ export function Community() {
         <div className="od-main">
       <Stack gap={16}>
         <div style={headerStyle} className="od-narrow-header">
+          <Button
+            variant="subtle"
+            size="sm"
+            onClick={() => setDrawerOpen(true)}
+            data-testid="dc-nav-open"
+            aria-label="Open navigation"
+            style={{ minWidth: 44, minHeight: 44, fontSize: 18 }}
+          >
+            ☰
+          </Button>
           <div>
             <div style={titleStyle}>Open Datasets</div>
             <span style={hintStyle}>
               Assemble datasets together, vote items in, train LoRAs, and track contributor shares.
             </span>
-          </div>
-          <div style={headerActionsStyle}>
-            <Button variant="subtle" size="sm" onClick={() => setRoute({ name: 'ledger' })} data-testid="dc-open-ledger">
-              My contributions
-            </Button>
           </div>
         </div>
 
@@ -982,6 +988,61 @@ export function Community() {
       </Stack>
         </div>
       </div>
+      <Modal
+        opened={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        title="Open Datasets"
+        className="od-drawer-panel"
+      >
+        <civitai-nav-list label="Open Datasets sections">
+          <civitai-nav-item
+            label="Explore"
+            href="#/explore"
+            current={route.name === 'explore'}
+            onClick={(e) => {
+              e.preventDefault();
+              setDrawerOpen(false);
+              setRoute({ name: 'explore' });
+            }}
+            data-testid="dc-drawer-explore"
+          />
+          <civitai-nav-item
+            label="My datasets"
+            href="#/mine"
+            current={route.name === 'mine'}
+            onClick={(e) => {
+              e.preventDefault();
+              setDrawerOpen(false);
+              if (viewerId == null) requestSignIn();
+              else setRoute({ name: 'mine' });
+            }}
+            data-testid="dc-drawer-mine"
+          />
+          <civitai-nav-item
+            label="Create dataset"
+            href="#/create"
+            current={route.name === 'create'}
+            onClick={(e) => {
+              e.preventDefault();
+              setDrawerOpen(false);
+              if (viewerId == null) requestSignIn();
+              else setRoute({ name: 'create' });
+            }}
+            data-testid="dc-drawer-create"
+          />
+          <civitai-nav-item
+            label="My contributions"
+            href="#/contributions"
+            current={route.name === 'ledger'}
+            onClick={(e) => {
+              e.preventDefault();
+              setDrawerOpen(false);
+              setRoute({ name: 'ledger' });
+            }}
+            data-testid="dc-drawer-ledger"
+          />
+        </civitai-nav-list>
+      </Modal>
     </div>
   );
 }
@@ -1110,7 +1171,7 @@ function ContributeForm(props: {
 }) {
   const { open: openUpload } = useImageUpload();
   const { open: openPicker } = useImagePicker();
-  const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('link');
+  const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('mine');
   const [reference, setReference] = useState('');
   const [caption, setCaption] = useState('');
   const [rights, setRights] = useState(false);
@@ -1118,6 +1179,9 @@ function ContributeForm(props: {
   const [picked, setPicked] = useState<{ imageId?: number; url: string; source: 'posted' | 'generated' } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Progressive reveal: caption + rights + submit appear only once an image
+  // is actually selected (picked, uploaded, or a link typed).
+  const hasSelection = picked != null || uploaded != null || reference.trim().length > 0;
 
   const upload = async () => {
     const pickedImage = await openUpload();
@@ -1253,39 +1317,43 @@ function ContributeForm(props: {
           />
         </label>
       )}
-      <label style={labelStyle}>
-        Caption
-        <span style={hintStyle}>
-          Describe the image in a short phrase — the caption is the training text the LoRA
-          learns from, e.g. “ink portrait, front view”.
-        </span>
-        <input
-          style={inputStyle}
-          value={caption}
-          placeholder="e.g. ink portrait, front view"
-          onChange={(e) => setCaption(e.target.value)}
-          data-testid="dc-contribute-caption"
-        />
-      </label>
-      <label style={checkStyle}>
-        <input
-          type="checkbox"
-          checked={rights}
-          onChange={(e) => setRights(e.target.checked)}
-          data-testid="dc-contribute-rights"
-        />
-        I have the right to contribute this image for dataset training.
-      </label>
       {error && (
         <Alert color="error" title="Could not contribute" data-testid="dc-contribute-error">
           {error}
         </Alert>
       )}
-      <span>
-        <Button loading={saving} onClick={() => void submit()} data-testid="dc-contribute-submit">
-          Add to dataset
-        </Button>
-      </span>
+      {hasSelection && (
+        <>
+          <label style={labelStyle}>
+            Caption
+            <span style={hintStyle}>
+              Describe the image in a short phrase — the caption is the training text the LoRA
+              learns from, e.g. “ink portrait, front view”.
+            </span>
+            <input
+              style={inputStyle}
+              value={caption}
+              placeholder="e.g. ink portrait, front view"
+              onChange={(e) => setCaption(e.target.value)}
+              data-testid="dc-contribute-caption"
+            />
+          </label>
+          <label style={checkStyle}>
+            <input
+              type="checkbox"
+              checked={rights}
+              onChange={(e) => setRights(e.target.checked)}
+              data-testid="dc-contribute-rights"
+            />
+            I have the right to contribute this image for dataset training.
+          </label>
+          <span>
+            <Button loading={saving} onClick={() => void submit()} data-testid="dc-contribute-submit">
+              Add to dataset
+            </Button>
+          </span>
+        </>
+      )}
     </div>
   );
 }
@@ -1966,7 +2034,6 @@ const headerStyle: React.CSSProperties = {
   alignItems: 'flex-start',
   flexWrap: 'wrap',
 };
-const headerActionsStyle: React.CSSProperties = { display: 'flex', gap: 8, flexWrap: 'wrap' };
 const titleStyle: React.CSSProperties = {
   fontFamily: 'Georgia, "Times New Roman", serif',
   fontSize: 22,

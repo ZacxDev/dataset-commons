@@ -50,3 +50,4 @@ describe('App shell (single view)', () => {
     expect(root).toHaveAttribute('data-theme', 'dark');
   });
 });
+

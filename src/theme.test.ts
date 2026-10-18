@@ -77,3 +77,19 @@ describe('Archive Lab theme', () => {
     expect(communityTsx).toContain('data-testid="dc-community"');
   });
 });
+
+describe('v0.1.15 shell contracts', () => {
+  it('the contribute modal defaults to My Images and reveals caption/rights only after a selection', () => {
+    expect(communityTsx).toContain("useState<'mine' | 'upload' | 'link'>('mine')");
+    expect(communityTsx).toContain('const hasSelection = picked != null || uploaded != null || reference.trim().length > 0;');
+    expect(communityTsx).toContain('{hasSelection && (');
+  });
+
+  it('the narrow top nav is a slide-out drawer on the upstream Modal shell', () => {
+    expect(communityTsx).toContain('data-testid="dc-nav-open"');
+    expect(communityTsx).toContain('className="od-drawer-panel"');
+    expect(communityTsx).toContain('data-testid="dc-drawer-ledger"');
+    expect(communityTsx).not.toContain('data-testid="dc-open-ledger"');
+    expect(indexCss).toContain('.od-drawer-panel');
+  });
+});
