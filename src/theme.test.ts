@@ -93,3 +93,36 @@ describe('v0.1.15 shell contracts', () => {
     expect(indexCss).toContain('.od-drawer-panel');
   });
 });
+
+describe('v0.1.16 shell contracts', () => {
+  it('create skips the form: instant create with a generated name', () => {
+    expect(communityTsx).toContain('const createDatasetNow = useCallback');
+    expect(communityTsx).toContain('createDataset({ name: generateDatasetName(), description:');
+    expect(communityTsx).not.toContain("{ name: 'create' }");
+    expect(communityTsx).not.toContain('title="Create dataset"');
+  });
+
+  it('the owner gets a rename icon next to the dataset name and the author uses civitai-avatar', () => {
+    expect(communityTsx).toContain('data-testid="dc-dataset-rename"');
+    expect(communityTsx).toContain('<civitai-avatar name={props.name} size="sm" />');
+    expect(communityTsx).toContain("import '@civitai/components/civitai-avatar/define';");
+  });
+
+  it('zero counts and zero votes are hidden on cards and the detail byline', () => {
+    expect(communityTsx).toContain('dataset.netVotes !== 0');
+    expect(communityTsx).toContain('...(dataset.trainableCount > 0');
+    expect(communityTsx).toContain('...(liveItems.length > 0');
+  });
+
+  it('the detail is sectioned into cards and has no Explore back button', () => {
+    expect(communityTsx).toContain('data-testid="dc-dataset-header"');
+    expect(communityTsx).toContain('data-testid="dc-dataset-items"');
+    expect(communityTsx).toContain('data-testid="dc-dataset-train"');
+    expect(communityTsx).not.toContain('dc-back-explore"');
+  });
+
+  it('the brand + subtitle render only on the explore route', () => {
+    expect(communityTsx).toContain("{route.name === 'explore' && <div style={titleStyle}>Open Datasets</div>}");
+    expect(communityTsx).toContain("{route.name === 'explore' && (");
+  });
+});

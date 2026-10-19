@@ -22,6 +22,14 @@ declare module 'react' {
         current?: boolean;
         disabled?: boolean;
       };
+      'civitai-avatar': React.DetailedHTMLProps<
+        React.HTMLAttributes<HTMLElement>,
+        HTMLElement
+      > & {
+        name?: string;
+        src?: string;
+        size?: 'sm' | 'md' | 'lg' | 'xl';
+      };
     }
   }
 }

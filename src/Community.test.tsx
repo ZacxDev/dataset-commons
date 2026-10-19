@@ -150,10 +150,15 @@ describe('Community screens (voting option b)', () => {
     await user.click(await screen.findByTestId('dc-community-enable'));
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
+    // Create skips the form: one tap makes a dataset with a generated name
+    // and lands on its page.
     await user.click(screen.getByTestId('dc-create-dataset'));
+    expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.queryByTestId('dc-dataset-form')).not.toBeInTheDocument();
+    // The owner renames via the edit icon next to the name.
+    await user.click(screen.getByTestId('dc-dataset-rename'));
+    await user.clear(screen.getByTestId('dc-dataset-name'));
     await user.type(screen.getByTestId('dc-dataset-name'), 'Robot Studies');
-    // The create flow hides the description input (it is set later via Edit).
-    expect(screen.queryByTestId('dc-dataset-description')).not.toBeInTheDocument();
     await user.click(screen.getByTestId('dc-dataset-save'));
 
     expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toHaveTextContent('Robot Studies');
@@ -191,7 +196,7 @@ describe('Community screens (voting option b)', () => {
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
       consentGranted: true,
-      // The shared write itself fails (not a consent problem): the form
+      // The shared write itself fails (not a consent problem): the notice
       // must name the host error instead of blaming consent.
       shared: { seed: [], failNext: 1 },
     });
@@ -200,12 +205,10 @@ describe('Community screens (voting option b)', () => {
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
     await user.click(screen.getByTestId('dc-create-dataset'));
-    await user.type(screen.getByTestId('dc-dataset-name'), 'Doomed Dataset');
-    await user.click(screen.getByTestId('dc-dataset-save'));
 
-    const formError = await screen.findByTestId('dc-dataset-form-error', {}, { timeout: 5000 });
-    expect(formError).toHaveTextContent('SHARED_UNAVAILABLE');
-    expect(formError).not.toHaveTextContent(/may not be granted yet/i);
+    const notice = await screen.findByTestId('dc-community-notice', {}, { timeout: 5000 });
+    expect(notice).toHaveTextContent('SHARED_UNAVAILABLE');
+    expect(notice).not.toHaveTextContent(/may not be granted yet/i);
   });
 
   it('owner can delete a dataset so a scratch dataset leaves no Explore record', async () => {
@@ -220,6 +223,9 @@ describe('Community screens (voting option b)', () => {
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
     await user.click(screen.getByTestId('dc-create-dataset'));
+    expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toBeInTheDocument();
+    await user.click(screen.getByTestId('dc-dataset-rename'));
+    await user.clear(screen.getByTestId('dc-dataset-name'));
     await user.type(screen.getByTestId('dc-dataset-name'), 'Scratch Delete');
     await user.click(screen.getByTestId('dc-dataset-save'));
     expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toHaveTextContent('Scratch Delete');
@@ -249,7 +255,6 @@ describe('Community screens (voting option b)', () => {
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
     await user.click(screen.getByTestId('dc-create-dataset'));
-    await user.click(screen.getByTestId('dc-dataset-save'));
     expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 5000 })).toBeInTheDocument();
 
     // The mock host's default pick is a posted image (#12345801).

@@ -17,6 +17,7 @@ import {
 import { Alert, Badge, Button, Modal, Stack } from '@civitai/blocks-react/ui';
 import '@civitai/components/civitai-nav-item/define';
 import '@civitai/components/civitai-nav-list/define';
+import '@civitai/components/civitai-avatar/define';
 import type { BlockGatedImage } from '@civitai/app-sdk/blocks';
 
 import {
@@ -90,7 +91,6 @@ export type WriteResult = { ok: boolean; reason: string | null };
 type Route =
   | { name: 'explore' }
   | { name: 'mine' }
-  | { name: 'create' }
   | { name: 'edit'; datasetId: string }
   | { name: 'dataset'; datasetId: string }
   | { name: 'train'; datasetId: string }
@@ -321,6 +321,21 @@ export function Community() {
     },
     [requestSignIn, runWrite, viewerId, viewerName],
   );
+
+  // Creating skips the form entirely: one tap makes a dataset with a
+  // generated name and lands on its page, where the owner renames it via
+  // the edit icon next to the name. A failed save surfaces as a notice.
+  const createDatasetNow = useCallback(() => {
+    if (viewerId == null) {
+      requestSignIn();
+      return;
+    }
+    void createDataset({ name: generateDatasetName(), description: '', targetNote: '' }).then(
+      (error) => {
+        if (error) setNotice(error);
+      },
+    );
+  }, [createDataset, requestSignIn, viewerId]);
 
   const updateDataset = useCallback(
     async (
@@ -608,7 +623,7 @@ export function Community() {
     <div data-testid="dc-community" data-theme="dark" data-dc-archive="true" style={rootStyle}>
       <div className="od-layout">
         <aside className="od-sidebar" data-testid="dc-sidebar">
-          <div style={titleStyle}>Open Datasets</div>
+          {route.name === 'explore' && <div style={titleStyle}>Open Datasets</div>}
           <input
             style={inputStyle}
             value={query}
@@ -644,11 +659,9 @@ export function Community() {
             <civitai-nav-item
               label="Create dataset"
               href="#/create"
-              current={route.name === 'create'}
               onClick={(e) => {
                 e.preventDefault();
-                if (viewerId == null) requestSignIn();
-                else setRoute({ name: 'create' });
+                createDatasetNow();
               }}
               data-testid="dc-nav-create"
             />
@@ -677,12 +690,14 @@ export function Community() {
           >
             ☰
           </Button>
-          <div>
-            <div style={titleStyle}>Open Datasets</div>
-            <span style={hintStyle}>
-              Assemble datasets together, vote items in, train LoRAs, and track contributor shares.
-            </span>
-          </div>
+          {route.name === 'explore' && (
+            <div>
+              <div style={titleStyle}>Open Datasets</div>
+              <span style={hintStyle}>
+                Assemble datasets together, vote items in, train LoRAs, and track contributor shares.
+              </span>
+            </div>
+          )}
         </div>
 
         {notice && (
@@ -824,7 +839,7 @@ export function Community() {
               </span>
               <span className="od-hide-desktop">
                 <Button
-                  onClick={() => (viewerId == null ? requestSignIn() : setRoute({ name: 'create' }))}
+                  onClick={() => createDatasetNow()}
                   data-testid="dc-create-dataset"
                 >
                   Create dataset
@@ -845,16 +860,26 @@ export function Community() {
               </div>
             ) : (
               <div className="od-grid-cards">
-              {explored.map((dataset) => (
+              {explored.map((dataset) => {
+                const liveCount = dataset.items.filter((i) => !i.removed).length;
+                const cardMeta = [
+                  ...(liveCount > 0 ? [`${liveCount} item${liveCount === 1 ? '' : 's'}`] : []),
+                  ...(dataset.trainableCount > 0 ? [`${dataset.trainableCount} trainable`] : []),
+                  ...(dataset.loraCount > 0
+                    ? [`${dataset.loraCount} trained LoRA${dataset.loraCount === 1 ? '' : 's'}`]
+                    : []),
+                ];
+                return (
                 <div key={dataset.datasetId} style={{ ...cardStyle, cursor: 'pointer' }} data-testid="dc-dataset-card" onClick={() => setRoute({ name: 'dataset', datasetId: dataset.datasetId })}>
                   <div style={itemHeadStyle}>
                     <span style={cardTitleStyle}>{dataset.name}</span>
-                    <Badge color="info" variant="light">{dataset.netVotes} net votes</Badge>
+                    {dataset.netVotes !== 0 && (
+                      <Badge color="info" variant="light">{dataset.netVotes} net votes</Badge>
+                    )}
                   </div>
-                  <span style={hintStyle}>
-                    by {dataset.ownerName} · {dataset.items.filter((i) => !i.removed).length} items ·{' '}
-                    {dataset.trainableCount} trainable · {dataset.loraCount} trained LoRA
-                    {dataset.loraCount === 1 ? '' : 's'}
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <AuthorByline name={dataset.ownerName} />
+                    {cardMeta.length > 0 && <span style={hintStyle}>{cardMeta.join(' · ')}</span>}
                   </span>
                   {dataset.description && <span>{dataset.description}</span>}
                   <span>
@@ -867,20 +892,12 @@ export function Community() {
                     </Button>
                   </span>
                 </div>
-              ))}
+                );
+              })}
               </div>
             )}
             <span style={hintStyle}>{COSMETIC_TRUST_LINE}</span>
           </Stack>
-        )}
-
-        {loadState === 'ready' && route.name === 'create' && (
-          <DatasetForm
-            title="Create dataset"
-            submitLabel="Create dataset"
-            onCancel={() => setRoute({ name: 'explore' })}
-            onSubmit={createDataset}
-          />
         )}
 
         {loadState === 'ready' && route.name === 'edit' && selectedDataset && (
@@ -910,7 +927,6 @@ export function Community() {
             loras={view.loras.filter((l) => l.datasetId === selectedDataset.datasetId)}
             viewerId={viewerId}
             busyKey={busyKey}
-            onBack={() => setRoute({ name: 'explore' })}
             onEdit={() => setRoute({ name: 'edit', datasetId: selectedDataset.datasetId })}
             onDelete={() => void deleteDataset(selectedDataset.datasetId)}
             onTrain={() => setRoute({ name: 'train', datasetId: selectedDataset.datasetId })}
@@ -1021,12 +1037,10 @@ export function Community() {
           <civitai-nav-item
             label="Create dataset"
             href="#/create"
-            current={route.name === 'create'}
             onClick={(e) => {
               e.preventDefault();
               setDrawerOpen(false);
-              if (viewerId == null) requestSignIn();
-              else setRoute({ name: 'create' });
+              createDatasetNow();
             }}
             data-testid="dc-drawer-create"
           />
@@ -1123,7 +1137,6 @@ function DatasetForm(props: {
     if (result) setError(result);
   };
 
-  const isCreate = props.initial == null;
   return (
     <div style={{ ...cardStyle, maxWidth: 760 }} data-testid="dc-dataset-form">
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -1136,17 +1149,15 @@ function DatasetForm(props: {
         Name
         <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} data-testid="dc-dataset-name" />
       </label>
-      {!isCreate && (
-        <label style={labelStyle}>
-          Description <span style={hintStyle}>(optional)</span>
-          <textarea
-            style={textareaStyle}
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            data-testid="dc-dataset-description"
-          />
-        </label>
-      )}
+      <label style={labelStyle}>
+        Description <span style={hintStyle}>(optional)</span>
+        <textarea
+          style={textareaStyle}
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          data-testid="dc-dataset-description"
+        />
+      </label>
       {error && (
         <Alert color="error" title="Could not save" data-testid="dc-dataset-form-error">
           {error}
@@ -1358,12 +1369,21 @@ function ContributeForm(props: {
   );
 }
 
+/** Author display on the upstream civitai-avatar element (initials + name). */
+function AuthorByline(props: { name: string }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <civitai-avatar name={props.name} size="sm" />
+      <span>{props.name}</span>
+    </span>
+  );
+}
+
 function DatasetDetail(props: {
   dataset: DatasetView;
   loras: LoraView[];
   viewerId: number | null;
   busyKey: string | null;
-  onBack: () => void;
   onEdit: () => void;
   onDelete: () => void;
   onTrain: () => void;
@@ -1423,15 +1443,30 @@ function DatasetDetail(props: {
     disarmTimer.current = setTimeout(() => setDeleteArmed(false), 6000);
   }, [deleteArmed, props]);
 
+  const detailMeta = [
+    ...(liveItems.length > 0 ? [`${liveItems.length} item${liveItems.length === 1 ? '' : 's'}`] : []),
+    ...(dataset.trainableCount > 0 ? [`${dataset.trainableCount} trainable now`] : []),
+  ];
+
   return (
     <Stack gap={12} data-testid="dc-dataset-detail">
-      <span>
-        <Button variant="subtle" size="sm" onClick={props.onBack} data-testid="dc-back-explore">
-          ← Explore
-        </Button>
-      </span>
+      <div style={cardStyle} data-testid="dc-dataset-header">
       <div style={itemHeadStyle}>
-        <span style={titleStyle}>{dataset.name}</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span style={titleStyle}>{dataset.name}</span>
+          {isOwner && (
+            <Button
+              variant="subtle"
+              size="sm"
+              onClick={props.onEdit}
+              data-testid="dc-dataset-rename"
+              aria-label="Rename dataset"
+              style={{ minWidth: 36, minHeight: 36 }}
+            >
+              ✎
+            </Button>
+          )}
+        </span>
         <span style={{ display: 'inline-flex', gap: 8, alignItems: 'center' }}>
           {!isOwner && (
             <VoteControl
@@ -1495,16 +1530,21 @@ function DatasetDetail(props: {
           )}
         </span>
       </div>
-      <span style={hintStyle}>
-        by {dataset.ownerName} · {liveItems.length} items · {dataset.trainableCount} trainable now
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <AuthorByline name={dataset.ownerName} />
+        {detailMeta.length > 0 && <span style={hintStyle}>{detailMeta.join(' · ')}</span>}
       </span>
       {dataset.description && <span>{dataset.description}</span>}
+      </div>
 
       {dataset.items.length > 0 && (
-        <div style={rowStyle}>
-          <Button onClick={() => (viewerId == null ? props.onSignIn() : props.onTrain())} data-testid="dc-open-train">
-            Train a LoRA from this dataset
-          </Button>
+        <div style={cardStyle} data-testid="dc-dataset-train">
+          <span style={cardTitleStyle}>Train</span>
+          <span>
+            <Button onClick={() => (viewerId == null ? props.onSignIn() : props.onTrain())} data-testid="dc-open-train">
+              Train a LoRA from this dataset
+            </Button>
+          </span>
         </div>
       )}
       {props.loras.length > 0 && (
@@ -1524,6 +1564,7 @@ function DatasetDetail(props: {
         </div>
       )}
 
+      <div style={cardStyle} data-testid="dc-dataset-items">
       <span style={cardTitleStyle}>Items</span>
       {dataset.items.length === 0 ? (
         <span style={hintStyle} data-testid="dc-dataset-no-items">
@@ -1634,6 +1675,7 @@ function DatasetDetail(props: {
           </Modal>
         </>
       )}
+      </div>
       </div>
     </Stack>
   );
