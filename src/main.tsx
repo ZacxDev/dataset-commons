@@ -13,7 +13,7 @@ import {
 } from '@civitai/blocks-react/ui';
 
 import { App } from './App.js';
-import { Harness } from './Harness.js';
+import { Harness, installHarnessDocumentStorage } from './Harness.js';
 import {
   getHarnessMode,
   installHarnessTransport,
@@ -53,6 +53,7 @@ if (useHarness && mode === 'mock') {
   // option <Harness> passes) and stamps `spentAccountType` on succeeded
   // snapshots, so no local shim is registered here.
   installHarnessTransport();
+  installHarnessDocumentStorage();
 }
 
 const container = document.getElementById('root');

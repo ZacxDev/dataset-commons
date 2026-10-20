@@ -1,54 +1,91 @@
-// Dataset Commons — storage layer for community (shared) + per-viewer data.
+// Dataset Commons — storage layer for community (shared) + per-viewer data, on
+// the App Blocks DOCUMENT STORE (`app.storage.collection(name)` from
+// `@civitai/sdk`, scopes `apps:storage` + `apps:storage:publish`).
 //
-// Two platform stores, two honesty rules:
-//  - Shared storage holds datasets, items, custom up/down vote records,
-//    snapshots, LoRA records, and ledger events. It is postMessage-only and
-//    cannot be seeded or written from a server, so every write here goes
-//    through the viewer's own host bridge calls.
-//  - Per-viewer app storage holds only the viewer's settings and a derived
-//    index (my items / my votes / my snapshots). The shared fold is always
-//    the source of truth; the per-viewer copy is a cache that can be rebuilt.
+// Until 0.2.0 both halves were legacy stores: one shared feed
+// (`useSharedStorage`) holding every entity behind a `kind` field — votes
+// included, as their own records — and the per-viewer KV (`useAppStorage`).
 //
-// Not-permitted is a first-class outcome, never a fake empty: a scope-shaped
-// rejection, or an empty shared read on a token that does not carry the shared
-// read scope, classifies as 'not-permitted' so the UI can say community data
-// isn't loading instead of showing a false zero/empty state.
+// 🔴 THE SHARED DECLARATION (block.manifest.json → storage.collections) IS A
+// CONTRACT WITH THE CUTOVER COPY (`scripts/appdata-copy/copy-dataset-commons-to-appdata.sql`
+// in the cluster repo), which lays the legacy rows down as:
+//   datasets  { shared, own, marks [up, down] }  ← kind 'dataset'  (data minus `kind`)
+//   items     { shared, own, marks [up, down] }  ← kind 'item'     (data minus `kind`)
+//   snapshots { shared, own }                    ← kind 'snapshot' (data.snapshot)
+//   loras     { shared, own }                    ← kind 'lora'     (data minus `kind`)
+//   ledger    { shared, own }                    ← kind 'ledger'   (data.event)
+//   removals  { shared, own }                    ← kind 'item-removal' (data minus `kind`)
+//   votes (kind 'vote', value ±1) → the voter's `up`/`down` MARK on the target doc.
+// Same keys as the legacy rows, authors and timestamps carried over, NO indexes
+// (the copy writes no index rows; the app reads each collection whole and folds
+// client-side, so it filters on nothing server-side). Renaming a collection or a
+// mark, or adding an index, strands or breaks the copied data.
+//
+// - `write: "own"` everywhere: a viewer creates documents; only the author edits
+//   or deletes one. That is exactly how the app already behaves (an owner
+//   removing SOMEONE ELSE's item writes a `removals` record instead), and it is
+//   the narrowest policy that works. Creating and editing need the
+//   consent-gated `apps:storage:publish`; reading, voting (marks) and deleting
+//   one's own documents need only `apps:storage`.
+// - No `showAuthor`: records carry their own display names, as before.
+// - Private `kv` (settings + the derived "my index"): the legacy KV keys
+//   verbatim, data `{ value }` — the shared copy-kv-to-appdata.sql contract.
+//
+// Not-permitted is a first-class outcome, never a fake empty: a refusal the
+// store explains with a scope/eligibility code classifies as 'not-permitted'.
+// (The legacy "an empty read without the read scope is not-permitted" guess is
+// gone: the document store REFUSES a missing scope instead of answering empty.)
 
-import { classifyAppStorageError } from '@civitai/app-sdk/blocks';
+import type { DocumentStorage, StorageCollection, StorageDocument } from '@civitai/sdk';
 
-import type { SharedEntryLike } from './community.js';
+import {
+  COMMUNITY_COLLECTIONS,
+  DOWN_MARK,
+  UP_MARK,
+  markForVote,
+  type CommunityCollection,
+  type SharedEntryLike,
+  type VoteValue,
+} from './community.js';
 
-export const APP_STORAGE_SCOPES = ['apps:storage:read', 'apps:storage:write'] as const;
-export const SHARED_STORAGE_SCOPES = [
-  'apps:storage:shared:read',
-  'apps:storage:shared:write',
-] as const;
-export const STORAGE_SCOPES = [...APP_STORAGE_SCOPES, ...SHARED_STORAGE_SCOPES] as const;
+/** The private collection (settings + the derived per-viewer index). */
+export const KV_COLLECTION = 'kv';
+/** The consent-gated scope creating or editing a shared document needs. */
+export const PUBLISH_SCOPE = 'apps:storage:publish';
+export const STORAGE_SCOPES = ['apps:storage', PUBLISH_SCOPE] as const;
 export const ALL_APP_SCOPES = ['ai:write:budgeted', ...STORAGE_SCOPES] as const;
+/** The collections that carry the vote marks. */
+export const VOTED_COLLECTIONS: readonly CommunityCollection[] = ['datasets', 'items'];
 
 export type StorageAccess = 'ready' | 'not-permitted' | 'failed';
 
-export interface SharedListPort {
-  list(opts?: {
-    prefix?: string;
-    limit?: number;
-    cursor?: string;
-  }): Promise<{ items: readonly SharedEntryLike[]; nextCursor?: string }>;
-  append(value: { title: string; body?: string; data?: unknown }): Promise<{ key: string }>;
-  update(key: string, value: { title: string; body?: string; data?: unknown }): Promise<void>;
-  withdraw(key: string): Promise<{ ok: boolean; deleted: boolean }>;
+/** The store's `code`, or `null` when a failure carries none. */
+export function storageErrorCode(error: unknown): string | null {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' ? code : null;
 }
 
-export interface AppStoragePort {
-  get<T = unknown>(key: string): Promise<T | null>;
-  set<T = unknown>(key: string, value: T): Promise<{ ok: true; sizeBytes?: number }>;
-  delete(key: string): Promise<{ ok: true; deleted: boolean }>;
-  list(opts?: {
-    prefix?: string;
-    limit?: number;
-    cursor?: string;
-  }): Promise<{ keys: Array<{ key: string; updatedAt: Date }>; nextCursor?: string }>;
-  getQuota(): Promise<{ usedBytes: number; rowCount: number; limitBytes: number; limitRows: number }>;
+/** Refusals a consent grant fixes (and only those). */
+export function isConsentRefusal(error: unknown): boolean {
+  return storageErrorCode(error) === 'consent_required';
+}
+
+/**
+ * Classify a storage failure for the UI, by the store's structured `code`.
+ * Scope / consent / eligibility refusals are 'not-permitted' (consent or
+ * approval fixes them; retrying does not). Everything else is 'failed' — a snag
+ * the UI can offer to retry. The raw message is never the classification.
+ */
+export function classifyStorageError(error: unknown): Exclude<StorageAccess, 'ready'> {
+  switch (storageErrorCode(error)) {
+    case 'insufficient_scope':
+    case 'consent_required':
+    case 'collection_not_declared':
+    case 'not_eligible':
+      return 'not-permitted';
+    default:
+      return 'failed';
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -61,44 +98,24 @@ function errorMessage(error: unknown): string {
   return '';
 }
 
-const SCOPE_DENIED =
-  /(shared storage|storage) [a-z ]*requires the apps:storage:(shared:)?(read|write) scope/i;
-const PERMISSION_SHAPED = /forbidden|unauthori[sz]ed|consent|permission|scope/i;
-
-/**
- * Classify a storage failure for the UI. Scope/permission-shaped failures are
- * 'not-permitted' (consent or approval fixes them; retrying does not). Known
- * app-storage ceilings and every other failure are 'failed' — a snag the UI
- * can offer to retry without mislabelling it as a permissions problem. The raw
- * host message is never rendered to a viewer.
- */
-export function classifyStorageError(error: unknown): Exclude<StorageAccess, 'ready'> {
-  const message = errorMessage(error);
-  if (SCOPE_DENIED.test(message) || PERMISSION_SHAPED.test(message)) return 'not-permitted';
-  void classifyAppStorageError(error);
-  return 'failed';
-}
-
 /**
  * One-line detail for a failed write, safe to show the viewer and precise
- * enough to report from a walk: the host's own error string, capped so a
- * pathological message can't flood the banner. Mirrors the training-side
- * rule (surface the actual error; never swallow it into a silent refusal).
+ * enough to report from a walk: the store's code and its own sentence, capped
+ * so a pathological message can't flood the banner.
  */
 export function describeStorageError(error: unknown): string {
   const message = errorMessage(error).trim();
-  if (!message) return 'shared storage write failed';
-  return message.length > 240 ? `${message.slice(0, 239)}…` : message;
+  const code = storageErrorCode(error);
+  const text = code && message && !message.includes(code) ? `${code}: ${message}` : message || code || '';
+  if (!text) return 'shared storage write failed';
+  return text.length > 240 ? `${text.slice(0, 239)}…` : text;
 }
 
 /**
- * Serialize shared-storage writes. The host bridge answers one request at a
- * time per block in practice; two overlapping mutations (the walker's
- * contribute-then-vote-vote cadence) can race the read-after-write refresh
- * and surface as a generic save failure with nothing folded. Running every
- * write — and its refresh — to completion before the next starts removes
- * that whole class: a queued write always folds the state the previous
- * write actually landed.
+ * Serialize shared-storage writes: every write — and its refresh — runs to
+ * completion before the next starts, so a queued write always folds the state
+ * the previous write actually landed (the walker's contribute-then-vote-vote
+ * cadence).
  */
 export function createSerialWriteQueue(): {
   run<T>(fn: () => Promise<T>): Promise<T>;
@@ -116,29 +133,87 @@ export function createSerialWriteQueue(): {
   };
 }
 
-/** True when the block token already carries every scope in `required`. */
-export function hasScopes(
-  scopes: readonly string[] | undefined | null,
-  required: readonly string[],
-): boolean {
-  if (!scopes) return false;
-  return required.every((s) => scopes.includes(s));
+// ---------------------------------------------------------------------------
+// The shared store
+// ---------------------------------------------------------------------------
+
+/** A store document → the entry the fold reads. The one place a document becomes an entry. */
+export function toEntry(
+  collection: CommunityCollection,
+  doc: StorageDocument<Record<string, unknown>>,
+): SharedEntryLike {
+  const mine = doc.viewer?.marks ?? [];
+  const viewerVote: VoteValue = mine.includes(UP_MARK) ? 1 : mine.includes(DOWN_MARK) ? -1 : 0;
+  return {
+    key: doc.key,
+    collection,
+    data: doc.data,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+    up: doc.marks[UP_MARK] ?? 0,
+    down: doc.marks[DOWN_MARK] ?? 0,
+    viewerVote,
+  };
 }
 
-/**
- * Classify a completed shared read. An empty list on a token WITHOUT the
- * shared read scope is not evidence of an empty community — hosts have
- * answered scope-gated reads with silent empty success before — so it
- * classifies as 'not-permitted', never as a real zero.
- */
-export function classifySharedRead(
-  entries: readonly SharedEntryLike[],
-  tokenScopes: readonly string[] | undefined | null,
-): StorageAccess {
-  if (entries.length === 0 && !hasScopes(tokenScopes, ['apps:storage:shared:read'])) {
-    return 'not-permitted';
-  }
-  return 'ready';
+/** The shared operations the app performs. Every failure REJECTS with the store's error. */
+export interface CommunityStore {
+  list(
+    collection: CommunityCollection,
+    opts: { limit: number; cursor?: string },
+  ): Promise<{ items: SharedEntryLike[]; nextCursor?: string }>;
+  /** Create a document under a SERVER-minted key. */
+  create(collection: CommunityCollection, data: object): Promise<{ key: string }>;
+  /** Replace a document the viewer authored. */
+  put(collection: CommunityCollection, key: string, data: object): Promise<void>;
+  /** Delete a document the viewer authored; `false` = nothing was there. */
+  remove(collection: CommunityCollection, key: string): Promise<{ deleted: boolean }>;
+  /**
+   * Move the viewer's vote on a dataset/item document from `from` to `to`:
+   * unmark the old mark, then mark the new one (both idempotent).
+   */
+  setVote(collection: CommunityCollection, key: string, from: VoteValue, to: VoteValue): Promise<void>;
+}
+
+export function createCommunityStore(
+  docs: () => DocumentStorage | Promise<DocumentStorage>,
+): CommunityStore {
+  const coll = async (name: CommunityCollection): Promise<StorageCollection<Record<string, unknown>>> =>
+    (await docs()).collection<Record<string, unknown>>(name);
+
+  return {
+    async list(collection, opts) {
+      const page = await (await coll(collection)).list({
+        // Oldest first: the fold's latest-wins rules compare timestamps, not order.
+        sort: 'createdAt',
+        limit: opts.limit,
+        ...(opts.cursor !== undefined ? { cursor: opts.cursor } : {}),
+      });
+      return {
+        items: page.items.map((doc) => toEntry(collection, doc)),
+        ...(page.nextCursor !== null ? { nextCursor: page.nextCursor } : {}),
+      };
+    },
+    async create(collection, data) {
+      const doc = await (await coll(collection)).create(data as Record<string, unknown>);
+      return { key: doc.key };
+    },
+    async put(collection, key, data) {
+      await (await coll(collection)).put(key, data as Record<string, unknown>);
+    },
+    async remove(collection, key) {
+      return (await coll(collection)).delete(key);
+    },
+    async setVote(collection, key, from, to) {
+      if (!VOTED_COLLECTIONS.includes(collection)) throw new Error(`${collection} carries no votes`);
+      if (from === to) return;
+      const c = await coll(collection);
+      const old = markForVote(from);
+      const next = markForVote(to);
+      if (old) await c.unmark(key, old);
+      if (next) await c.mark(key, next);
+    },
+  };
 }
 
 export const MAX_SHARED_PAGES = 5;
@@ -147,93 +222,84 @@ export const SHARED_PAGE_SIZE = 100;
 export interface SharedLoadResult {
   entries: SharedEntryLike[];
   access: StorageAccess;
-  /** True when paging stopped at the page cap with more entries unread. */
+  /** True when paging stopped at the page cap with more documents unread in some collection. */
   truncated: boolean;
 }
 
-/** Page the whole shared list (newest-first pages, folded by the caller). */
+/** Read every community collection whole (up to the page cap each), for the caller to fold. */
 export async function loadSharedEntries(
-  shared: SharedListPort,
-  tokenScopes: readonly string[] | undefined | null,
+  store: CommunityStore,
   opts: { maxPages?: number; pageSize?: number } = {},
 ): Promise<SharedLoadResult> {
   const maxPages = opts.maxPages ?? MAX_SHARED_PAGES;
   const pageSize = opts.pageSize ?? SHARED_PAGE_SIZE;
-  const entries: SharedEntryLike[] = [];
-  let cursor: string | undefined;
   let truncated = false;
   try {
-    for (let page = 0; page < maxPages; page++) {
-      const result = await shared.list({ limit: pageSize, cursor });
-      entries.push(...result.items);
-      cursor = result.nextCursor;
-      if (!cursor) break;
-      if (page === maxPages - 1) truncated = true;
-    }
+    const perCollection = await Promise.all(
+      COMMUNITY_COLLECTIONS.map(async (collection) => {
+        const out: SharedEntryLike[] = [];
+        let cursor: string | undefined;
+        for (let page = 0; page < maxPages; page++) {
+          const result = await store.list(collection, { limit: pageSize, cursor });
+          out.push(...result.items);
+          cursor = result.nextCursor;
+          if (!cursor) break;
+          if (page === maxPages - 1) truncated = true;
+        }
+        return out;
+      }),
+    );
+    return { entries: perCollection.flat(), access: 'ready', truncated };
   } catch (error) {
     return { entries: [], access: classifyStorageError(error), truncated: false };
   }
-  return { entries, access: classifySharedRead(entries, tokenScopes), truncated };
-}
-
-function dataOf(entry: SharedEntryLike): Record<string, unknown> | null {
-  const data = entry.value?.data;
-  return typeof data === 'object' && data !== null && !Array.isArray(data)
-    ? (data as Record<string, unknown>)
-    : null;
-}
-
-/**
- * Update the viewer's own existing entry in place when one already matches,
- * instead of appending a duplicate. Mirrors the Arcane Deck pattern: a known
- * key updates; an unknown key adopts the viewer's own matching entry found in
- * the loaded list; only then does it append.
- */
-export async function upsertOwnSharedEntry(
-  shared: SharedListPort,
-  entries: readonly SharedEntryLike[],
-  viewerId: number,
-  matches: (data: Record<string, unknown>) => boolean,
-  value: { title: string; body?: string; data?: unknown },
-  knownKey?: string,
-): Promise<{ key: string; created: boolean }> {
-  if (knownKey) {
-    await shared.update(knownKey, value);
-    return { key: knownKey, created: false };
-  }
-  const own = entries.find((e) => {
-    if (e.authorUserId !== viewerId) return false;
-    const data = dataOf(e);
-    return data ? matches(data) : false;
-  });
-  if (own) {
-    await shared.update(own.key, value);
-    return { key: own.key, created: false };
-  }
-  const { key } = await shared.append(value);
-  return { key, created: true };
 }
 
 // ---------------------------------------------------------------------------
-// Per-viewer app storage: settings + derived index, with capped keys
+// Per-viewer private storage: settings + derived index, with capped keys
 // ---------------------------------------------------------------------------
 
+/** The private `kv` surface: the legacy KV get/set, over `{ value }` documents. */
+export interface KvPort {
+  get<T = unknown>(key: string): Promise<T | null>;
+  set<T = unknown>(key: string, value: T): Promise<{ ok: true }>;
+}
+
+/** The KV façade over the private collection (copy-kv-to-appdata.sql's `{ value }` shape). */
+export function createKvStorage(docs: () => DocumentStorage | Promise<DocumentStorage>): KvPort {
+  const kv = async () => (await docs()).collection<{ value: unknown }>(KV_COLLECTION);
+  return {
+    async get<T = unknown>(key: string): Promise<T | null> {
+      const doc = await (await kv()).get(key);
+      return (doc?.data.value ?? null) as T | null;
+    },
+    async set<T = unknown>(key: string, value: T): Promise<{ ok: true }> {
+      await (await kv()).put(key, { value });
+      return { ok: true };
+    },
+  };
+}
+
+/** The document store's key rule: 1–128 of `[A-Za-z0-9._:-]`. */
+export const DOC_KEY_MAX = 128;
+
 /**
- * Cap a per-viewer storage key at the host's 200-char limit. Long ids are
- * hashed (FNV-1a, deterministic) rather than silently truncated into a
- * collision.
+ * Cap a per-viewer storage key at the document store's 128-char limit. Long ids
+ * are hashed (FNV-1a, deterministic) rather than silently truncated into a
+ * collision. Short keys (every key this app builds today) are unchanged, so they
+ * stay the legacy keys the copy carries over.
  */
 export function safeAppStorageKey(prefix: string, id: string): string {
   const cleanPrefix = prefix.replace(/[^a-zA-Z0-9:_-]/g, '-').slice(0, 60) || 'dc';
   const cleanId = id.replace(/[^a-zA-Z0-9:_-]/g, '-');
   const full = `${cleanPrefix}:${cleanId}`;
-  if (full.length <= 200) return full;
+  if (full.length <= DOC_KEY_MAX) return full;
   let hash = 0x811c9dc5;
   for (let i = 0; i < full.length; i++) {
     hash ^= full.charCodeAt(i);
     hash = Math.imul(hash, 0x01000193);
   }
-  return `${cleanPrefix}:${cleanId.slice(0, 120)}:${(hash >>> 0).toString(16)}`;
+  return `${cleanPrefix}:${cleanId.slice(0, 50)}:${(hash >>> 0).toString(16)}`;
 }
 
 export interface ViewerIndex {
@@ -253,7 +319,7 @@ export function settingsKey(viewerId: number): string {
 
 /** Save the derived per-viewer index. Returns the access outcome, never throws. */
 export async function saveViewerIndex(
-  storage: AppStoragePort,
+  storage: KvPort,
   viewerId: number,
   index: ViewerIndex,
 ): Promise<StorageAccess> {
@@ -266,7 +332,7 @@ export async function saveViewerIndex(
 }
 
 export async function loadViewerIndex(
-  storage: AppStoragePort,
+  storage: KvPort,
   viewerId: number,
 ): Promise<{ index: ViewerIndex | null; access: StorageAccess }> {
   try {
@@ -276,4 +342,3 @@ export async function loadViewerIndex(
     return { index: null, access: classifyStorageError(error) };
   }
 }
-

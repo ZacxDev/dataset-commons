@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
-  useAppStorage,
   useBlockContext,
   useBlockToken,
   useBuzzBalance,
@@ -12,7 +11,6 @@ import {
   useImageUpload,
   useRequestConsent,
   useRequestSignIn,
-  useSharedStorage,
 } from '@civitai/blocks-react';
 import { Alert, Badge, Button, Modal, Stack } from '@civitai/blocks-react/ui';
 import '@civitai/components/civitai-nav-item/define';
@@ -27,24 +25,23 @@ import {
   buildViewerLedger,
   contributorKey,
   isPostReference,
-  datasetSharedValue,
+  datasetDoc,
   filterAndSortDatasets,
   foldSharedEntries,
   generationLedgerEvent,
-  itemSharedValue,
-  ledgerSharedValue,
-  loraSharedValue,
+  itemDoc,
+  ledgerDoc,
+  loraDoc,
   makeRecordId,
   nextVoteValue,
   parseImageReference,
-  removalSharedValue,
-  snapshotSharedValue,
+  removalDoc,
+  snapshotDoc,
   snapshotShareRows,
   trainingItemsForDataset,
   validateContribution,
   validateDatasetInput,
-  viewerVoteRecord,
-  voteSharedValue,
+  voteTarget,
   type DatasetItemRecord,
   type DatasetRecord,
   type DatasetView,
@@ -55,15 +52,15 @@ import {
   type SharedEntryLike,
   type VoteValue,
 } from './community.js';
+import { useCommunityStore, useKvStorage, useStorageReady } from './app-storage.js';
 import {
-  SHARED_STORAGE_SCOPES,
+  PUBLISH_SCOPE,
   classifyStorageError,
   createSerialWriteQueue,
   describeStorageError,
-  hasScopes,
+  isConsentRefusal,
   loadSharedEntries,
   saveViewerIndex,
-  upsertOwnSharedEntry,
   type StorageAccess,
 } from './community-storage.js';
 import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
@@ -75,10 +72,10 @@ import { TrainFlow, type TrainRunLink } from './TrainFlow.js';
  * Dataset Commons community screens (spec §6): Explore, Dataset detail,
  * Create/edit, Train entry, LoRA detail, and My contributions & ledger.
  *
- * Votes are option (b) — custom shared up/down vote records folded by
- * community.ts — because the shared store's native vote is up-only while the
- * spec's split needs net votes. Shared storage is the source of truth; the
- * per-viewer app-storage copy is only a rebuildable index of "mine".
+ * Votes are option (b) — up/down — carried since 0.2.0 by the document store's
+ * per-viewer `up` / `down` MARKS on each dataset and item document (see
+ * community.ts). The shared collections are the source of truth; the per-viewer
+ * private `kv` copy is only a rebuildable index of "mine".
  */
 
 /**
@@ -113,8 +110,9 @@ function formatDate(iso: string): string {
 export function Community() {
   const { viewer } = useBlockContext();
   const token = useBlockToken();
-  const shared = useSharedStorage();
-  const appStorage = useAppStorage();
+  const store = useCommunityStore();
+  const appStorage = useKvStorage();
+  const storageReady = useStorageReady();
   const { requestConsent } = useRequestConsent();
   const { requestSignIn } = useRequestSignIn();
 
@@ -132,10 +130,11 @@ export function Community() {
   const [trainableOnly, setTrainableOnly] = useState(false);
   const [viewerIndexAccess, setViewerIndexAccess] = useState<StorageAccess>('ready');
 
-  const sharedRef = useRef(shared);
-  sharedRef.current = shared;
-  const scopesRef = useRef(token.scopes);
-  scopesRef.current = token.scopes;
+  const storeRef = useRef(store);
+  storeRef.current = store;
+  // The block token as held NOW: a consent grant re-mints it (see ensurePublishConsent).
+  const tokenRawRef = useRef(token.raw);
+  tokenRawRef.current = token.raw;
   // Writes read the LATEST folded state at execution time, not the render
   // that scheduled them: a queued vote must fold what the previous write
   // actually landed, never a stale snapshot of the entry list.
@@ -150,19 +149,21 @@ export function Community() {
   const viewerName = viewer?.username ?? 'you';
 
   const refresh = useCallback(async () => {
-    const result = await loadSharedEntries(sharedRef.current, scopesRef.current);
+    const result = await loadSharedEntries(storeRef.current);
     setEntries(result.entries);
     setLoadState(result.access);
     return result;
   }, []);
 
   useEffect(() => {
+    // Nothing can reach the store before the host has sent its origin + token.
+    if (!storageReady) return;
     void refresh();
-  }, [refresh, token.scopes]);
+  }, [refresh, storageReady, token.scopes]);
 
   const folded: FoldedCommunity = useMemo(() => foldSharedEntries(entries), [entries]);
   foldedRef.current = folded;
-  const view = useMemo(() => buildCommunityView(folded, viewerId), [folded, viewerId]);
+  const view = useMemo(() => buildCommunityView(folded), [folded]);
   const viewerLedger = useMemo(
     () => buildViewerLedger(folded, viewerId, viewerName),
     [folded, viewerId, viewerName],
@@ -177,7 +178,7 @@ export function Community() {
         .filter((i) => i.contributorId === viewerId && !folded.removals.some((r) => r.itemId === i.itemId))
         .map((i) => i.itemId),
       voteTargets: folded.votes
-        .filter((v) => v.voterId === viewerId && v.value !== 0)
+        .filter((v) => v.viewerVote !== 0)
         .map((v) => `${v.targetKind}:${v.targetId}`),
       snapshotIds: viewerLedger.snapshotsIn.map((s) => s.snapshotId),
       updatedAt: new Date().toISOString(),
@@ -202,9 +203,9 @@ export function Community() {
         setNoticeDetail(null);
         setFailedRetry(null);
         setNotice('Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.');
-        requestConsent({ scopes: [...SHARED_STORAGE_SCOPES] });
+        if (isConsentRefusal(error)) requestConsent({ scopes: [PUBLISH_SCOPE] });
       } else {
-        // Surface the host's actual error (walks report it verbatim) and
+        // Surface the store's actual error (walks report it verbatim) and
         // keep the failed write one tap away — never a silent dead banner.
         setNoticeDetail(describeStorageError(error));
         setNotice('That did not save. Nothing was written — try again in a moment.');
@@ -214,42 +215,49 @@ export function Community() {
   );
 
   /**
-   * Ask for the shared-storage scopes, then wait for the host to actually
-   * grant them (the token context carries them once consent lands).
-   * Resolves true as soon as the scopes are present; false after the
+   * Ask the host for `apps:storage:publish` (creating or editing a shared
+   * document needs it; it is consent-gated), then wait for the grant to land.
+   *
+   * 🔴 IT WAITS FOR THE TOKEN TO BE RE-MINTED, NOT FOR A SCOPE NAME TO APPEAR.
+   * The host answers a grant with a fresh token (TOKEN_REFRESH); whether the
+   * grant covered publishing is the STORE's answer, so the caller retries the
+   * write once and a second `consent_required` is a real refusal. (The bridge
+   * SDK this app pins predates the document-store scope names, so a check on
+   * `token.scopes` could never see the grant.) Resolves false after the
    * timeout (dialog dismissed or refused — the save stays unwritten).
    */
-  const ensureSharedConsent = useCallback(async (): Promise<boolean> => {
-    if (hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES)) return true;
-    requestConsent({ scopes: [...SHARED_STORAGE_SCOPES] });
+  const ensurePublishConsent = useCallback(async (): Promise<boolean> => {
+    const before = tokenRawRef.current;
+    requestConsent({ scopes: [PUBLISH_SCOPE] });
     const deadline = Date.now() + 45_000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 200));
-      if (hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES)) return true;
+      if (tokenRawRef.current !== before) return true;
     }
-    return hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES);
+    return tokenRawRef.current !== before;
   }, [requestConsent]);
+
+  /** Run a shared write; a `consent_required` refusal asks, waits for the grant, and retries ONCE. */
+  const withPublishConsent = useCallback(
+    async (fn: () => Promise<void>, onAsk?: () => void): Promise<void> => {
+      try {
+        await fn();
+      } catch (error) {
+        if (!isConsentRefusal(error)) throw error;
+        onAsk?.();
+        if (!(await ensurePublishConsent())) throw error;
+        await fn();
+      }
+    },
+    [ensurePublishConsent],
+  );
 
   /** Run one shared-storage write with sign-in/consent gates and honest failure copy. */
   const runWrite = useCallback(
     async (busy: string, fn: () => Promise<void>, successNote?: string): Promise<WriteResult> => {
       if (!requireViewer()) return { ok: false, reason: 'Sign in to save.' };
-      if (!hasScopes(scopesRef.current, SHARED_STORAGE_SCOPES)) {
-        // Prompt for exactly what's missing, then CONTINUE the same save
-        // once consent lands — the user never has to click Save twice.
-        setNoticeDetail(null);
-        setFailedRetry(null);
-        setNotice('Confirm community storage access in the Civitai dialog — this save will continue automatically.');
-        if (!(await ensureSharedConsent())) {
-          setNotice('Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.');
-          return {
-            ok: false,
-            reason: 'Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.',
-          };
-        }
-      }
       // Serialized: this write (and its refresh) finishes before the next
-      // one starts, so rapid contribute/vote sequences can't overlap host
+      // one starts, so rapid contribute/vote sequences can't overlap store
       // mutations or fold a read taken before the previous write landed.
       return writeQueueRef.current.run(async (): Promise<WriteResult> => {
         setBusyKey(busy);
@@ -257,29 +265,16 @@ export function Community() {
         setNoticeDetail(null);
         setFailedRetry(null);
         try {
-          await fn();
+          // A refused publish prompts, waits for the grant and retries the SAME
+          // write once — the viewer never has to click Save twice.
+          await withPublishConsent(fn, () =>
+            setNotice('Confirm community publishing in the Civitai dialog — this save will continue automatically.'),
+          );
           await refresh();
           setBusyKey((cur) => (cur === busy ? null : cur));
           if (successNote) setNotice(successNote);
           return { ok: true, reason: null };
         } catch (error) {
-          if (classifyStorageError(error) === 'not-permitted') {
-            // The write itself was refused on scope grounds (e.g. a stale
-            // token): prompt, wait for the grant, and retry the same write
-            // once before giving up.
-            setNotice('Confirm community storage access in the Civitai dialog — this save will continue automatically.');
-            if (await ensureSharedConsent()) {
-              try {
-                await fn();
-                await refresh();
-                setBusyKey((cur) => (cur === busy ? null : cur));
-                if (successNote) setNotice(successNote);
-                return { ok: true, reason: null };
-              } catch (retryError) {
-                error = retryError;
-              }
-            }
-          }
           writeFailed(error, busy);
           // The retry re-runs this same write; queued writes recompute
           // from the latest folded state when they execute.
@@ -288,7 +283,7 @@ export function Community() {
         }
       });
     },
-    [ensureSharedConsent, refresh, requireViewer, writeFailed],
+    [refresh, requireViewer, withPublishConsent, writeFailed],
   );
 
   // ------------------------------------------------------------- writes
@@ -313,7 +308,7 @@ export function Community() {
         updatedAt: now,
       };
       const result = await runWrite('create-dataset', async () => {
-        await sharedRef.current.append(datasetSharedValue(record));
+        await storeRef.current.create('datasets', datasetDoc(record));
       });
       if (!result.ok) return result.reason ?? 'That did not save — try again in a moment.';
       setRoute({ name: 'dataset', datasetId: record.datasetId });
@@ -355,20 +350,15 @@ export function Community() {
         updatedAt: new Date().toISOString(),
       };
       const result = await runWrite('edit-dataset', async () => {
-        await upsertOwnSharedEntry(
-          sharedRef.current,
-          entriesRef.current,
-          viewerId,
-          (d) => d.kind === 'dataset' && d.datasetId === datasetId,
-          datasetSharedValue(record),
-          existing.storageKey,
-        );
+        // In place, at the dataset's own document (`own`: only its author may).
+        if (!existing.storageKey) throw new Error('dataset record has no storage key to update');
+        await storeRef.current.put('datasets', existing.storageKey, datasetDoc(record));
       });
       if (!result.ok) return result.reason ?? 'That did not save — try again in a moment.';
       setRoute({ name: 'dataset', datasetId });
       return null;
     },
-    [entries, folded.datasets, runWrite, viewerId],
+    [folded.datasets, runWrite, viewerId],
   );
 
   const deleteDataset = useCallback(
@@ -381,18 +371,18 @@ export function Community() {
       }
       const result = await runWrite(`delete-dataset-${datasetId}`, async () => {
         const datasetItems = folded.items.filter((item) => item.datasetId === datasetId);
-        const itemIds = new Set(datasetItems.map((item) => item.itemId));
         // Remove the dataset's visible contents first. The owner's own
         // entries are withdrawn; another contributor's item gets the same
         // removal record the detail screen writes, so the fold hides it.
         for (const item of datasetItems) {
           if (folded.removals.some((r) => r.itemId === item.itemId)) continue;
           if (item.contributorId === viewerId && item.storageKey) {
-            const withdrawn = await sharedRef.current.withdraw(item.storageKey);
+            const withdrawn = await storeRef.current.remove('items', item.storageKey);
             if (!withdrawn.deleted) throw new Error('an item record was not withdrawn');
           } else {
-            await sharedRef.current.append(
-              removalSharedValue({
+            await storeRef.current.create(
+              'removals',
+              removalDoc({
                 itemId: item.itemId,
                 datasetId,
                 actorId: viewerId,
@@ -402,36 +392,26 @@ export function Community() {
             );
           }
         }
-        // The viewer can withdraw their own votes on the dataset/items;
-        // votes left by other viewers point at records that no longer fold.
-        for (const vote of folded.votes) {
-          if (
-            vote.voterId === viewerId &&
-            vote.storageKey &&
-            ((vote.targetKind === 'dataset' && vote.targetId === datasetId) ||
-              (vote.targetKind === 'item' && itemIds.has(vote.targetId)))
-          ) {
-            await sharedRef.current.withdraw(vote.storageKey);
-          }
-        }
+        // Votes are marks ON the documents: a deleted document takes them with
+        // it, and a removed item no longer folds, so there is nothing to withdraw.
         // Frozen snapshots and LoRA links belong to the dataset's training
         // history; withdrawing them keeps a deleted scratch dataset from
         // resurfacing through LoRA detail or the contributor ledger.
         for (const snapshot of folded.snapshots.filter((s) => s.datasetId === datasetId)) {
           const key = folded.snapshotStorageKeys.get(snapshot.snapshotId);
           if (key) {
-            const withdrawn = await sharedRef.current.withdraw(key);
+            const withdrawn = await storeRef.current.remove('snapshots', key);
             if (!withdrawn.deleted) throw new Error('a snapshot record was not withdrawn');
           }
         }
         for (const lora of folded.loras.filter((l) => l.datasetId === datasetId)) {
           if (lora.storageKey) {
-            const withdrawn = await sharedRef.current.withdraw(lora.storageKey);
+            const withdrawn = await storeRef.current.remove('loras', lora.storageKey);
             if (!withdrawn.deleted) throw new Error('a LoRA record was not withdrawn');
           }
         }
         if (!existing.storageKey) throw new Error('dataset record has no storage key to withdraw');
-        const withdrawn = await sharedRef.current.withdraw(existing.storageKey);
+        const withdrawn = await storeRef.current.remove('datasets', existing.storageKey);
         if (!withdrawn.deleted) throw new Error('dataset record was not withdrawn');
         setRoute({ name: 'explore' });
       }, 'Dataset deleted.');
@@ -444,29 +424,17 @@ export function Community() {
     async (targetKind: 'dataset' | 'item', targetId: string, clicked: 1 | -1) => {
       if (!requireViewer() || viewerId == null) return;
       await runWrite(`vote-${targetKind}-${targetId}`, async () => {
-        // Computed at execution time (writes are serialized): the current
-        // vote and the entry list are whatever the previous write landed,
-        // never the render that scheduled this one.
-        const votesNow = foldedRef.current?.votes ?? [];
-        const current = viewerVoteRecord(votesNow, viewerId, targetKind, targetId);
-        const record = {
-          voterId: viewerId,
-          targetKind,
-          targetId,
-          value: nextVoteValue(current?.value ?? 0, clicked),
-          updatedAt: new Date().toISOString(),
-        };
-        await upsertOwnSharedEntry(
-          sharedRef.current,
-          entriesRef.current,
-          viewerId,
-          (d) =>
-            d.kind === 'vote' &&
-            d.voterId === viewerId &&
-            d.targetKind === targetKind &&
-            d.targetId === targetId,
-          voteSharedValue(record),
-          current?.storageKey,
+        // Computed at execution time (writes are serialized): the current vote
+        // is whatever the previous write landed, never the render that
+        // scheduled this one. A vote is the viewer's `up`/`down` MARK on the
+        // target's own document — marks need no publish consent.
+        const target = voteTarget(foldedRef.current?.votes ?? [], targetKind, targetId);
+        if (!target) throw new Error(`that ${targetKind} is no longer available`);
+        await storeRef.current.setVote(
+          targetKind === 'dataset' ? 'datasets' : 'items',
+          target.storageKey,
+          target.viewerVote,
+          nextVoteValue(target.viewerVote, clicked),
         );
       });
     },
@@ -498,7 +466,7 @@ export function Community() {
         updatedAt: now,
       };
       const result = await runWrite('contribute', async () => {
-        await sharedRef.current.append(itemSharedValue(record));
+        await storeRef.current.create('items', itemDoc(record));
       }, 'Item contributed. It joins the training set once its net votes are positive.');
       return result.ok ? null : (result.reason ?? 'That did not save — try again in a moment.');
     },
@@ -522,11 +490,12 @@ export function Community() {
         // A contributor can withdraw their own shared entry outright; an owner
         // removing someone else's item records a removal the fold applies.
         if (isContributor && item.storageKey) {
-          const res = await sharedRef.current.withdraw(item.storageKey);
+          const res = await storeRef.current.remove('items', item.storageKey);
           if (res.deleted) return;
         }
-        await sharedRef.current.append(
-          removalSharedValue({
+        await storeRef.current.create(
+          'removals',
+          removalDoc({
             itemId: item.itemId,
             datasetId: dataset.datasetId,
             actorId: viewerId,
@@ -544,11 +513,15 @@ export function Community() {
   const persistSnapshot = useCallback(
     async (snapshot: DatasetSnapshot) => {
       if (folded.snapshots.some((s) => s.snapshotId === snapshot.snapshotId)) return;
-      const dataset = folded.datasets.find((d) => d.datasetId === snapshot.datasetId);
-      await sharedRef.current.append(snapshotSharedValue(snapshot, dataset?.name ?? snapshot.datasetId));
+      // Persisted BEFORE the run is charged (TrainFlow): a refusal here means no
+      // Buzz moves. The first shared write a trainer makes may need the publish
+      // grant, so it asks, waits and retries once like every other save.
+      await withPublishConsent(async () => {
+        await storeRef.current.create('snapshots', snapshotDoc(snapshot));
+      });
       await refresh();
     },
-    [folded.datasets, folded.snapshots, refresh],
+    [folded.snapshots, refresh, withPublishConsent],
   );
 
   const persistLedgerEvent = useCallback(
@@ -560,10 +533,12 @@ export function Community() {
       ) {
         return;
       }
-      await sharedRef.current.append(ledgerSharedValue(event));
+      await withPublishConsent(async () => {
+        await storeRef.current.create('ledger', ledgerDoc(event));
+      });
       await refresh();
     },
-    [folded.ledgerEvents, refresh],
+    [folded.ledgerEvents, refresh, withPublishConsent],
   );
 
   const persistRunLink = useCallback(
@@ -596,11 +571,13 @@ export function Community() {
           : {}),
         updatedAt: now,
       };
-      if (existing?.storageKey) await sharedRef.current.update(existing.storageKey, loraSharedValue(next));
-      else if (!existing) await sharedRef.current.append(loraSharedValue(next));
+      await withPublishConsent(async () => {
+        if (existing?.storageKey) await storeRef.current.put('loras', existing.storageKey, loraDoc(next));
+        else if (!existing) await storeRef.current.create('loras', loraDoc(next));
+      });
       await refresh();
     },
-    [folded.datasets, folded.loras, refresh, viewerId, viewerName],
+    [folded.datasets, folded.loras, refresh, viewerId, viewerName, withPublishConsent],
   );
 
   // ------------------------------------------------------------- routing
@@ -751,7 +728,10 @@ export function Community() {
             ) : (
               <Button
                 size="sm"
-                onClick={() => requestConsent({ scopes: [...SHARED_STORAGE_SCOPES] })}
+                onClick={() => {
+                  requestConsent({ scopes: [PUBLISH_SCOPE] });
+                  void refresh();
+                }}
                 data-testid="dc-community-enable"
               >
                 Enable community storage
@@ -1935,7 +1915,7 @@ function LedgerView(props: {
       .map((item) => ({ dataset, item })),
   );
   const myDatasetVotes = props.folded.votes.filter(
-    (v) => viewerId != null && v.voterId === viewerId && v.targetKind === 'dataset' && v.value !== 0,
+    (v) => viewerId != null && v.targetKind === 'dataset' && v.viewerVote !== 0,
   );
 
   return (
@@ -2007,7 +1987,7 @@ function LedgerView(props: {
               {myDatasetVotes.map((voteRow) => (
                 <span key={`${voteRow.targetKind}:${voteRow.targetId}`} style={hintStyle}>
                   {props.view.datasets.find((d) => d.datasetId === voteRow.targetId)?.name ?? voteRow.targetId}:{' '}
-                  {voteRow.value === 1 ? 'up' : 'down'}
+                  {voteRow.viewerVote === 1 ? 'up' : 'down'}
                 </span>
               ))}
             </div>

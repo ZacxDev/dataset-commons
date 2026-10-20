@@ -3,27 +3,35 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { App } from './App.js';
+import { ALL_APP_SCOPES } from './community-storage.js';
 import {
-  ALL_APP_SCOPES,
-} from './community-storage.js';
-import {
-  datasetSharedValue,
+  datasetDoc,
   demoSharedSeed,
-  itemSharedValue,
-  ledgerSharedValue,
-  loraSharedValue,
-  snapshotSharedValue,
-  voteSharedValue,
+  itemDoc,
+  ledgerDoc,
+  loraDoc,
+  snapshotDoc,
   type DatasetItemRecord,
   type DatasetRecord,
   type LoraRecord,
 } from './community.js';
+import { configureDocumentStorage } from './doc-storage.js';
+import { createAppFakeStorage, seedCommunity, withFailingWrites } from './fake-doc-storage.js';
+import { testDocStore } from './test-doc-store.js';
 import { freezeSnapshot, trainingFeeEvent } from './training.js';
 import { installMockMoneyHost } from './mock-buzz.js';
 
 // Component tests for the Dataset Commons community screens against the real
-// SDK transport + mock host. Shared storage is seeded through the mock host's
-// own scenario (the same surface the dev harness uses), never by mocking hooks.
+// SDK transport + mock host for the bridge, and the SDK's `createFakeStorage`
+// for the document store (a fresh one per test, ./test-setup.ts) — seeded the
+// way authors and voters would write it, never by mocking hooks.
+
+/** The next `n` shared writes fail with the store's 503 (SHARED_UNAVAILABLE). */
+function failNextWrites(n: number): void {
+  const fake = testDocStore();
+  const failing = withFailingWrites(fake.storage, { remaining: n });
+  configureDocumentStorage(async () => failing);
+}
 
 async function openCommunity(user: ReturnType<typeof userEvent.setup>) {
   void user;
@@ -41,29 +49,34 @@ describe('Community screens (voting option b)', () => {
 
   it('storage not-permitted is an honest unavailable state, never a fake empty community', async () => {
     const user = userEvent.setup();
+    // The approved version does not serve the store yet (`not_eligible`) — the
+    // store REFUSES; that must not read as an empty community.
+    let eligible = false;
+    const fake = testDocStore();
+    configureDocumentStorage(async () =>
+      eligible ? fake.storage : createAppFakeStorage({ appStatus: 'pending' }).storage,
+    );
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
-      // Manifest-declared (approved) scopes, but the first token carries none
-      // of them yet — the consent-gated state the lazy-consent button resolves.
       declaredScopes: [...ALL_APP_SCOPES],
-      shared: { seed: [] },
     });
     await openCommunity(user);
 
     expect(await screen.findByTestId('dc-community-unavailable')).toBeInTheDocument();
     expect(screen.queryByTestId('dc-explore-empty')).not.toBeInTheDocument();
 
-    // Granting shared storage turns the same empty store into a REAL empty state.
+    // Once the store serves the app, the same button re-reads: a REAL empty state.
+    eligible = true;
     await user.click(screen.getByTestId('dc-community-enable'));
     expect(await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 })).toBeInTheDocument();
   }, 15000);
 
-  it('Explore -> dataset detail folds custom up/down votes; a viewer vote replaces and toggles', async () => {
+  it('Explore -> dataset detail folds up/down votes (marks); a viewer vote replaces and toggles', async () => {
     const user = userEvent.setup();
+    await seedCommunity(testDocStore(), demoSharedSeed());
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
-      shared: { seed: demoSharedSeed() },
     });
     await openCommunity(user);
 
@@ -77,55 +90,66 @@ describe('Community screens (voting option b)', () => {
     expect(screen.getByTestId('dc-item-card-item-a')).toHaveTextContent('in training set');
     expect(screen.getByTestId('dc-item-card-item-c')).toHaveTextContent('not in training set');
 
-    // One click: the consent prompt fires, the grant lands, and the same
-    // save retries itself — no second click needed.
+    // A vote is a MARK — it needs no publish consent, so it lands on the first click.
     await user.click(screen.getByTestId('dc-item-item-a-up'));
     await waitFor(() => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('6'));
 
-    // Clicking the same arrow again clears the vote.
-    await user.click(screen.getByTestId('dc-item-item-a-up'));
+    // The other arrow REPLACES it (the up mark comes off, a down mark goes on)…
+    await user.click(screen.getByTestId('dc-item-item-a-down'));
+    await waitFor(() => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('4'));
+    // …and clicking the same arrow again clears the vote.
+    await user.click(screen.getByTestId('dc-item-item-a-down'));
     await waitFor(() => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5'));
   });
 
-  it('a save prompts for consent once and then lands without a second click', async () => {
+  it('a save prompts for publish consent once and then lands without a second click', async () => {
     const user = userEvent.setup();
-    uninstall = installMockMoneyHost({
-      viewer: { id: 2, username: 'dev', status: 'active' },
-      declaredScopes: [...ALL_APP_SCOPES],
-      // Token starts consent-gated (no shared scopes): the first vote must
-      // prompt, wait for the grant, and retry the same save on its own.
-      shared: { seed: demoSharedSeed() },
-    });
-    await openCommunity(user);
-    await user.click(screen.getByTestId('dc-open-dataset-dataset-archive-ink'));
-    expect(await screen.findByTestId('dc-dataset-detail')).toBeInTheDocument();
-    expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5');
+    // The store refuses publishing (`consent_required`) until the host has
+    // re-minted the token after a grant — the mock host's TOKEN_REFRESH.
+    const fake = testDocStore();
+    let granted = false;
+    const onRefresh = (event: MessageEvent) => {
+      if ((event.data as { type?: unknown } | null)?.type === 'TOKEN_REFRESH') granted = true;
+    };
+    window.addEventListener('message', onRefresh);
+    configureDocumentStorage(async () => (granted ? fake.storage : fake.as({ scopes: ['apps:storage'] }).storage));
+    try {
+      uninstall = installMockMoneyHost({
+        viewer: { id: 2, username: 'dev', status: 'active' },
+        declaredScopes: [...ALL_APP_SCOPES],
+      });
+      await openCommunity(user);
+      await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
-    // ONE click: consent prompt -> grant -> the vote lands by itself.
-    await user.click(screen.getByTestId('dc-item-item-a-up'));
-    await waitFor(
-      () => expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('6'),
-      { timeout: 8000 },
-    );
+      // ONE click: refused -> consent prompt -> grant -> the same create retries.
+      await user.click(screen.getByTestId('dc-create-dataset'));
+      expect(await screen.findByTestId('dc-dataset-detail', {}, { timeout: 8000 })).toBeInTheDocument();
+      expect(granted).toBe(true);
+      const refused = fake.calls.filter((c) => c.method === 'POST' && c.status === 403);
+      const created = fake.calls.filter((c) => c.method === 'POST' && c.status === 201);
+      expect([refused.length, created.length]).toEqual([1, 1]);
+    } finally {
+      window.removeEventListener('message', onRefresh);
+    }
   }, 20000);
 
   it('a failed vote save shows the host error and a Retry that lands the vote', async () => {
     const user = userEvent.setup();
+    await seedCommunity(testDocStore(), demoSharedSeed());
+    // The next shared write fails once (the live walk-2026-10-08-2157 shape:
+    // two quick vote saves, banner up, both items stuck at net 0).
+    failNextWrites(1);
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
       consentGranted: true,
-      // The next shared mutation fails once (the live walk-2026-10-08-2157
-      // shape: two quick vote saves, banner up, both items stuck at net 0).
-      shared: { seed: demoSharedSeed(), failNext: 1 },
     });
     await openCommunity(user);
     await user.click(screen.getByTestId('dc-open-dataset-dataset-archive-ink'));
     expect(await screen.findByTestId('dc-dataset-detail')).toBeInTheDocument();
     expect(screen.getByTestId('dc-item-item-a-net')).toHaveTextContent('5');
 
-    // Consent is prompted and granted en route; the write itself hits the
-    // forced shared-mutation failure and surfaces it with a Retry.
+    // The write itself hits the forced store failure and surfaces it with a Retry.
     await user.click(screen.getByTestId('dc-item-item-a-up'));
     await waitFor(() =>
       expect(screen.getByTestId('dc-community-notice')).toHaveTextContent(/That did not save/),
@@ -144,10 +168,8 @@ describe('Community screens (voting option b)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
-      shared: { seed: [] },
     });
     await openCommunity(user);
-    await user.click(await screen.findByTestId('dc-community-enable'));
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
     // Create skips the form: one tap makes a dataset with a generated name
@@ -196,12 +218,11 @@ describe('Community screens (voting option b)', () => {
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
       consentGranted: true,
-      // The shared write itself fails (not a consent problem): the notice
-      // must name the host error instead of blaming consent.
-      shared: { seed: [], failNext: 1 },
     });
+    // The shared write itself fails (not a consent problem): the notice must
+    // name the store error instead of blaming consent.
+    failNextWrites(1);
     await openCommunity(user);
-    await user.click(await screen.findByTestId('dc-community-enable'));
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
     await user.click(screen.getByTestId('dc-create-dataset'));
@@ -216,10 +237,8 @@ describe('Community screens (voting option b)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
-      shared: { seed: [] },
     });
     await openCommunity(user);
-    await user.click(await screen.findByTestId('dc-community-enable'));
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
     await user.click(screen.getByTestId('dc-create-dataset'));
@@ -248,10 +267,8 @@ describe('Community screens (voting option b)', () => {
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
       consentGranted: true,
-      shared: { seed: [] },
     });
     await openCommunity(user);
-    await user.click(await screen.findByTestId('dc-community-enable'));
     await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 });
 
     await user.click(screen.getByTestId('dc-create-dataset'));
@@ -293,17 +310,15 @@ describe('Community screens (voting option b)', () => {
       createdAt: '2026-10-05T01:00:00.000Z',
       updatedAt: '2026-10-05T01:00:00.000Z',
     });
+    await seedCommunity(testDocStore(), [
+      { collection: 'datasets', author: 'archivist', data: datasetDoc(dataset) },
+      { collection: 'items', author: 'alice', data: itemDoc(mkItem('vis', 9001, 'visible one')) },
+      { collection: 'items', author: 'alice', data: itemDoc(mkItem('hid', 9002, 'hidden one')) },
+      { collection: 'items', author: 'alice', data: itemDoc(mkItem('pen', 9003, 'pending one')) },
+    ]);
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
-      shared: {
-        seed: [
-          { value: datasetSharedValue(dataset), authorUserId: 7 },
-          { value: itemSharedValue(mkItem('vis', 9001, 'visible one')), authorUserId: 11 },
-          { value: itemSharedValue(mkItem('hid', 9002, 'hidden one')), authorUserId: 11 },
-          { value: itemSharedValue(mkItem('pen', 9003, 'pending one')), authorUserId: 11 },
-        ],
-      },
     });
     await openCommunity(user);
     await user.click(await screen.findByTestId('dc-open-dataset-ds-gated'));
@@ -351,19 +366,17 @@ describe('Community screens (voting option b)', () => {
       updatedAt: '2026-10-04T01:00:00.000Z',
     };
     const event = trainingFeeEvent({ snapshot, workflowId: 'wf1', grossBuzz: 700, loraId: 'lora_wf1' });
+    // The dataset carries the viewer's own `up` mark (the fake's viewer is dev-viewer).
+    await seedCommunity(testDocStore(), [
+      { collection: 'datasets', author: 'owner', data: datasetDoc(dataset), up: ['dev-viewer'] },
+      { collection: 'snapshots', author: 'owner', data: snapshotDoc(snapshot) },
+      { collection: 'loras', author: 'owner', data: loraDoc(lora) },
+      { collection: 'ledger', author: 'owner', data: ledgerDoc(event) },
+    ]);
     uninstall = installMockMoneyHost({
       viewer: { id: 11, username: 'alice', status: 'active' },
       consentGranted: true,
       declaredScopes: [...ALL_APP_SCOPES],
-      shared: {
-        seed: [
-          { value: datasetSharedValue(dataset), authorUserId: 7 },
-          { value: snapshotSharedValue(snapshot, dataset.name), authorUserId: 7 },
-          { value: loraSharedValue(lora), authorUserId: 7 },
-          { value: ledgerSharedValue(event), authorUserId: 7 },
-          { value: voteSharedValue({ voterId: 11, targetKind: 'dataset', targetId: 'ds1', value: 1, updatedAt: '2026-10-02T00:00:00.000Z' }), authorUserId: 11 },
-        ],
-      },
     });
     await openCommunity(user);
     await user.click(await screen.findByTestId('dc-open-dataset-ds1'));
@@ -386,6 +399,7 @@ describe('Community screens (voting option b)', () => {
     'training from a real dataset persists snapshot + linked LoRA, and a test generation credits the ledger',
     async () => {
       const user = userEvent.setup();
+      await seedCommunity(testDocStore(), demoSharedSeed());
       uninstall = installMockMoneyHost({
         viewer: { id: 2, username: 'dev', status: 'active' },
         consentGranted: true,
@@ -393,7 +407,6 @@ describe('Community screens (voting option b)', () => {
         pollsUntilDone: 1,
         buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
         declaredScopes: [...ALL_APP_SCOPES],
-        shared: { seed: demoSharedSeed() },
         generation: {
           trainedEpochs: 10,
           trainingPublishedModel: { modelId: 42, modelVersionId: 84, published: true },

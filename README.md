@@ -619,6 +619,21 @@ The two reads use **different credentials** — by design, and security-critical
 > of message types `createMockHost` handles in
 > `@civitai/blocks-react/testing` — this list is checked against it.
 
+> **The community is NOT on the bridge since 0.2.0.** Datasets, items, training
+> snapshots, LoRA links, the tracked-credit ledger and item removals live in the
+> App Blocks **document store**, one shared collection each (`datasets`,
+> `items`, `snapshots`, `loras`, `ledger`, `removals`; `write: "own"`), with
+> votes as the per-viewer `up` / `down` marks on the dataset or item document;
+> the viewer's own index lives in the private `kv` collection. Scopes
+> `apps:storage` + `apps:storage:publish` (consent-gated; asked on the first
+> refused save, which then retries itself). REST under `/api/v1/blocks/storage/*`
+> via `@civitai/sdk`, so the mock host's App-Storage and shared-storage messages
+> above are unused. In `dev:harness` the store is an in-memory
+> `createFakeStorage` (`?community=demo` seeds the demo, `?sharedFail=N` fails
+> the next N shared writes). In `dev:live` the calls go through the `/api` proxy
+> with your dev token, which the store serves only once an approved version
+> declares the collections.
+
 ### Scenarios (exercise the money / error / storage UX for free)
 
 The mock host is configurable, so you can test the full spend / failure /

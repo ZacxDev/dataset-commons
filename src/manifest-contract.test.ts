@@ -14,6 +14,8 @@ interface Manifest {
   scopes: string[];
   scopeJustifications: Record<string, string>;
   page: { buzzBudgetPerGen: number };
+  storage?: unknown;
+  iframe?: Record<string, unknown>;
 }
 
 const manifest = JSON.parse(
@@ -33,29 +35,31 @@ describe('block.manifest.json — training contract', () => {
     }
   });
 
-  it('declares both storage directions plus the shared scopes (community data contract)', () => {
-    // The remaining screens live in shared storage: datasets/items/votes are
-    // cross-viewer, so the manifest needs shared read AND write; the viewer's
-    // own settings/index need per-viewer read AND write. A missing scope here
-    // is the Prompt Lab bug class — storage silently dead in production.
-    expect(manifest.scopes).toEqual(
-      expect.arrayContaining([
-        'apps:storage:read',
-        'apps:storage:write',
-        'apps:storage:shared:read',
-        'apps:storage:shared:write',
-      ]),
-    );
-    for (const scope of [
-      'apps:storage:read',
-      'apps:storage:write',
-      'apps:storage:shared:read',
-      'apps:storage:shared:write',
-    ]) {
-      expect(manifest.scopeJustifications[scope], `justification for ${scope}`).toBeTruthy();
+  it('declares the document-store scopes and the community collections (the copy contract)', () => {
+    // Since 0.2.0 the community lives in the document store. The declaration is
+    // a contract with the cutover copy script (copy-dataset-commons-to-appdata.sql
+    // and copy-kv-to-appdata.sql): these collection names, the `up`/`down`
+    // marks, `write: "own"`, and NO indexes. A missing collection or scope is the
+    // Prompt Lab bug class — storage silently dead in production.
+    expect([...manifest.scopes].sort()).toEqual(['ai:write:budgeted', 'apps:storage', 'apps:storage:publish']);
+    for (const legacy of ['apps:storage:read', 'apps:storage:write', 'apps:storage:shared:read', 'apps:storage:shared:write']) {
+      expect(manifest.scopeJustifications).not.toHaveProperty(legacy);
     }
-    // No scope creep: exactly the money scope + the four storage scopes.
-    expect(manifest.scopes).toHaveLength(5);
+    const voted = { visibility: 'shared', write: 'own', marks: ['up', 'down'] };
+    const plain = { visibility: 'shared', write: 'own' };
+    expect(manifest.storage).toEqual({
+      collections: {
+        kv: { visibility: 'private' },
+        datasets: voted,
+        items: voted,
+        snapshots: plain,
+        loras: plain,
+        ledger: plain,
+        removals: plain,
+      },
+    });
+    // `iframe.src` is server-owned; `civitai app validate` refuses it.
+    expect(manifest.iframe ?? {}).not.toHaveProperty('src');
   });
 
   it('page.buzzBudgetPerGen is 1000 — a training quote must fit the per-call budget', () => {

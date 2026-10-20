@@ -4,7 +4,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { App } from './App.js';
 import { ALL_APP_SCOPES } from './community-storage.js';
 import { demoSharedSeed } from './community.js';
+import { seedCommunity } from './fake-doc-storage.js';
 import { installMockMoneyHost } from './mock-buzz.js';
+import { testDocStore } from './test-doc-store.js';
 
 // Shell contract after the 2026-10-06 consolidation: Open Datasets is a SINGLE
 // view. The scaffold Generate/Comfy tabs and the standalone Train tab are gone;
@@ -18,10 +20,10 @@ describe('App shell (single view)', () => {
   });
 
   it('cold-opens on the datasets view with no mode tabs', async () => {
+    await seedCommunity(testDocStore(), demoSharedSeed());
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
-      shared: { seed: demoSharedSeed() },
     });
     render(<App />);
 
@@ -40,7 +42,6 @@ describe('App shell (single view)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
-      shared: { seed: [] },
     });
     render(<App />);
 

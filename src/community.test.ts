@@ -3,42 +3,45 @@ import { describe, expect, it } from 'vitest';
 import {
   COSMETIC_TRUST_LINE,
   ONSITE_EARNINGS_LINE,
-  applyVote,
   buildCommunityView,
   buildViewerLedger,
   contributorKey,
-  datasetSharedValue,
+  datasetDoc,
   filterAndSortDatasets,
   foldSharedEntries,
   generationLedgerEvent,
   ingestOnsiteLedgerEvent,
-  itemSharedValue,
-  ledgerSharedValue,
-  loraSharedValue,
+  itemDoc,
+  ledgerDoc,
+  loraDoc,
   makeRecordId,
+  markForVote,
   nextVoteValue,
   isPostReference,
   parseImageReference,
+  snapshotDoc,
   snapshotShareRows,
-  snapshotSharedValue,
   tallyVotes,
   trainingItemsForDataset,
   validateContribution,
   validateDatasetInput,
-  voteSharedValue,
+  voteTarget,
   type DatasetItemRecord,
   type DatasetRecord,
   type LoraRecord,
   type SharedEntryLike,
   type VoteRecord,
+  type VoteValue,
 } from './community.js';
 import { freezeSnapshot, trainingFeeEvent, type LedgerEvent } from './training.js';
 
-const entry = (over: Partial<SharedEntryLike> & Pick<SharedEntryLike, 'value'>): SharedEntryLike => ({
+const entry = (over: Partial<SharedEntryLike> & Pick<SharedEntryLike, 'collection' | 'data'>): SharedEntryLike => ({
   key: 'shared_1',
-  authorUserId: 99,
   createdAt: '2026-10-06T00:00:00.000Z',
   updatedAt: '2026-10-06T00:00:00.000Z',
+  up: 0,
+  down: 0,
+  viewerVote: 0,
   ...over,
 });
 
@@ -78,15 +81,25 @@ const itemB: DatasetItemRecord = {
   updatedAt: '2026-10-01T02:00:00.000Z',
 };
 
-function vote(voterId: number, targetKind: 'dataset' | 'item', targetId: string, value: -1 | 0 | 1, updatedAt = '2026-10-02T00:00:00.000Z'): VoteRecord {
-  return { voterId, targetKind, targetId, value, updatedAt };
+function tally(targetKind: 'dataset' | 'item', targetId: string, up: number, down: number, viewerVote: VoteValue = 0, storageKey = `k-${targetId}`): VoteRecord {
+  return { storageKey, targetKind, targetId, up, down, viewerVote };
 }
 
-describe('custom up/down votes (option b)', () => {
-  it('tallies up and down separately and reports the viewer vote', () => {
-    const votes = [vote(1, 'item', 'a', 1), vote(2, 'item', 'a', 1), vote(3, 'item', 'a', -1), vote(4, 'item', 'b', 1)];
-    expect(tallyVotes(votes, 'item', 'a', 3)).toEqual({ up: 2, down: 1, net: 1, viewerVote: -1 });
-    expect(tallyVotes(votes, 'item', 'a', 99).viewerVote).toBe(0);
+describe('up/down votes as marks (option b)', () => {
+  it('tallies the up and down marks and reports the viewer’s own mark', () => {
+    const votes = [tally('item', 'a', 2, 1, -1), tally('item', 'b', 1, 0)];
+    expect(tallyVotes(votes, 'item', 'a')).toEqual({ up: 2, down: 1, net: 1, viewerVote: -1 });
+    expect(tallyVotes(votes, 'item', 'b').viewerVote).toBe(0);
+    expect(tallyVotes(votes, 'item', 'zzz')).toEqual({ up: 0, down: 0, net: 0, viewerVote: 0 });
+  });
+
+  it('sums the marks of duplicate documents for one target, and votes on the one carrying my mark', () => {
+    const votes = [tally('item', 'a', 2, 0, 0, 'k1'), tally('item', 'a', 1, 1, 1, 'k0')];
+    expect(tallyVotes(votes, 'item', 'a')).toEqual({ up: 3, down: 1, net: 2, viewerVote: 1 });
+    expect(voteTarget(votes, 'item', 'a')?.storageKey).toBe('k0');
+    // No mark yet: the newest-keyed document.
+    expect(voteTarget([tally('item', 'a', 0, 0, 0, 'k0'), tally('item', 'a', 0, 0, 0, 'k1')], 'item', 'a')?.storageKey).toBe('k1');
+    expect(voteTarget(votes, 'item', 'missing')).toBeNull();
   });
 
   it('clicking the current value clears it; clicking the other replaces it', () => {
@@ -96,22 +109,17 @@ describe('custom up/down votes (option b)', () => {
     expect(nextVoteValue(0, 1)).toBe(1);
   });
 
-  it('applyVote keeps exactly one record per viewer per target', () => {
-    const start = [vote(1, 'item', 'a', 1), vote(2, 'item', 'a', 1)];
-    const changed = applyVote(start, vote(1, 'item', 'a', -1, '2026-10-03T00:00:00.000Z'));
-    expect(changed).toHaveLength(2);
-    expect(tallyVotes(changed, 'item', 'a', 1)).toEqual({ up: 1, down: 1, net: 0, viewerVote: -1 });
-    const cleared = applyVote(changed, vote(1, 'item', 'a', 0, '2026-10-04T00:00:00.000Z'));
-    expect(tallyVotes(cleared, 'item', 'a', 1).net).toBe(1);
+  it('a vote value maps to exactly one mark name (the manifest declares `up` and `down`)', () => {
+    expect(markForVote(1)).toBe('up');
+    expect(markForVote(-1)).toBe('down');
+    expect(markForVote(0)).toBeNull();
   });
 
-  it('the fold keeps the latest vote when duplicate records exist for one viewer', () => {
+  it('the fold reads the marks off the dataset/item document itself', () => {
     const folded = foldSharedEntries([
-      entry({ key: 'shared_1', authorUserId: 5, value: voteSharedValue(vote(5, 'item', 'a', 1, '2026-10-02T00:00:00.000Z')), updatedAt: '2026-10-02T00:00:00.000Z' }),
-      entry({ key: 'shared_2', authorUserId: 5, value: voteSharedValue(vote(5, 'item', 'a', -1, '2026-10-03T00:00:00.000Z')), updatedAt: '2026-10-03T00:00:00.000Z' }),
+      entry({ key: 'k-a', collection: 'items', data: itemDoc(itemA), up: 4, down: 1, viewerVote: 1 }),
     ]);
-    expect(folded.votes).toHaveLength(1);
-    expect(folded.votes[0]).toMatchObject({ value: -1, storageKey: 'shared_2' });
+    expect(folded.votes).toEqual([tally('item', 'a', 4, 1, 1, 'k-a')]);
   });
 });
 
@@ -140,24 +148,20 @@ describe('foldSharedEntries + buildCommunityView', () => {
 
   function foldedCommunity() {
     return foldSharedEntries([
-      entry({ key: 'k-ds', authorUserId: 7, value: datasetSharedValue(dataset) }),
-      entry({ key: 'k-a', authorUserId: 11, value: itemSharedValue(itemA) }),
-      entry({ key: 'k-b', authorUserId: 12, value: itemSharedValue(itemB) }),
-      entry({ key: 'k-v1', authorUserId: 21, value: voteSharedValue(vote(21, 'item', 'a', 1)) }),
-      entry({ key: 'k-v2', authorUserId: 22, value: voteSharedValue(vote(22, 'item', 'a', 1)) }),
-      entry({ key: 'k-v3', authorUserId: 23, value: voteSharedValue(vote(23, 'item', 'a', 1)) }),
-      entry({ key: 'k-v4', authorUserId: 24, value: voteSharedValue(vote(24, 'item', 'a', 1)) }),
-      entry({ key: 'k-v5', authorUserId: 25, value: voteSharedValue(vote(25, 'item', 'a', 1)) }),
-      entry({ key: 'k-v6', authorUserId: 26, value: voteSharedValue(vote(26, 'item', 'b', 1)) }),
-      entry({ key: 'k-v7', authorUserId: 27, value: voteSharedValue(vote(27, 'dataset', 'ds1', 1)) }),
-      entry({ key: 'k-v8', authorUserId: 28, value: voteSharedValue(vote(28, 'dataset', 'ds1', -1)) }),
-      entry({ key: 'k-snap', authorUserId: 7, value: snapshotSharedValue(snapshot, dataset.name) }),
-      entry({ key: 'k-lora', authorUserId: 7, value: loraSharedValue(lora) }),
-      entry({ key: 'k-led', authorUserId: 7, value: ledgerSharedValue(trainingEvent) }),
+      // ds1: one up, one down → net 0. item a: 5 up; item b: 1 up.
+      entry({ key: 'k-ds', collection: 'datasets', data: datasetDoc(dataset), up: 1, down: 1 }),
+      entry({ key: 'k-a', collection: 'items', data: itemDoc(itemA), up: 5 }),
+      entry({ key: 'k-b', collection: 'items', data: itemDoc(itemB), up: 1 }),
+      entry({ key: 'k-snap', collection: 'snapshots', data: snapshotDoc(snapshot) }),
+      entry({ key: 'k-lora', collection: 'loras', data: loraDoc(lora) }),
+      entry({ key: 'k-led', collection: 'ledger', data: ledgerDoc(trainingEvent) }),
       // A duplicate ledger append for the same source event must not double-count.
-      entry({ key: 'k-led2', authorUserId: 7, value: ledgerSharedValue(trainingEvent), updatedAt: '2026-10-04T02:00:00.000Z' }),
-      entry({ key: 'k-junk', authorUserId: 1, value: { title: 'junk', data: { kind: 'nope' } } }),
-      entry({ key: 'k-bad', authorUserId: 1, value: { title: 'bad', data: { kind: 'vote', targetKind: 'item', targetId: 'a', value: 7 } } }),
+      entry({ key: 'k-led2', collection: 'ledger', data: ledgerDoc(trainingEvent), updatedAt: '2026-10-04T02:00:00.000Z' }),
+      // Junk in each collection is dropped, never thrown.
+      entry({ key: 'k-junk1', collection: 'datasets', data: { name: 'no id' } }),
+      entry({ key: 'k-junk2', collection: 'items', data: { itemId: 'x' } }),
+      entry({ key: 'k-junk3', collection: 'ledger', data: { eventId: 'e', sourceRef: 's', eventType: 'bogus' } }),
+      entry({ key: 'k-junk4', collection: 'snapshots', data: 'not an object' }),
     ]);
   }
 
@@ -165,14 +169,14 @@ describe('foldSharedEntries + buildCommunityView', () => {
     const folded = foldedCommunity();
     expect(folded.datasets).toHaveLength(1);
     expect(folded.items).toHaveLength(2);
-    expect(folded.votes).toHaveLength(8);
+    expect(folded.votes).toHaveLength(3); // one tally per dataset/item document
     expect(folded.snapshots).toHaveLength(1);
     expect(folded.loras).toHaveLength(1);
     expect(folded.ledgerEvents).toHaveLength(1);
   });
 
   it('dataset votes rank only; item votes drive trainable count and training items', () => {
-    const view = buildCommunityView(foldedCommunity(), 21);
+    const view = buildCommunityView(foldedCommunity());
     const ds = view.datasets[0]!;
     expect(ds.netVotes).toBe(0); // +1 and -1 dataset votes cancel; never in the split
     expect(ds.viewerVote).toBe(0);
@@ -213,7 +217,7 @@ describe('foldSharedEntries + buildCommunityView', () => {
       reason: 'owner-remove',
       createdAt: '2026-10-05T00:00:00.000Z',
     });
-    const view = buildCommunityView(folded, null);
+    const view = buildCommunityView(folded);
     const ds = view.datasets[0]!;
     expect(ds.items.find((i) => i.itemId === 'b')?.removed).toBe(true);
     expect(ds.trainableCount).toBe(1);
@@ -225,11 +229,12 @@ describe('foldSharedEntries + buildCommunityView', () => {
 describe('Explore filtering and sorting', () => {
   it('searches name/description/owner/target and sorts by the three modes', () => {
     const folded = foldSharedEntries([
-      entry({ key: 'k1', authorUserId: 7, value: datasetSharedValue(dataset) }),
+      entry({ key: 'k1', collection: 'datasets', data: datasetDoc(dataset) }),
       entry({
         key: 'k2',
-        authorUserId: 8,
-        value: datasetSharedValue({
+        collection: 'datasets',
+        up: 2,
+        data: datasetDoc({
           ...dataset,
           datasetId: 'ds2',
           ownerId: 8,
@@ -239,12 +244,10 @@ describe('Explore filtering and sorting', () => {
           updatedAt: '2026-10-03T00:00:00.000Z',
         }),
       }),
-      entry({ key: 'k3', authorUserId: 30, value: voteSharedValue(vote(30, 'dataset', 'ds2', 1)) }),
-      entry({ key: 'k4', authorUserId: 31, value: voteSharedValue(vote(31, 'dataset', 'ds2', 1)) }),
       entry({
         key: 'k5',
-        authorUserId: 7,
-        value: loraSharedValue({
+        collection: 'loras',
+        data: loraDoc({
           loraId: 'lora_ds1',
           datasetId: 'ds1',
           snapshotId: 'snap-x',
@@ -257,7 +260,7 @@ describe('Explore filtering and sorting', () => {
         }),
       }),
     ]);
-    const view = buildCommunityView(folded, null);
+    const view = buildCommunityView(folded);
     expect(filterAndSortDatasets(view.datasets, { query: 'mecha' }).map((d) => d.datasetId)).toEqual(['ds2']);
     expect(filterAndSortDatasets(view.datasets, { sort: 'top-voted' }).map((d) => d.datasetId)).toEqual(['ds2', 'ds1']);
     expect(filterAndSortDatasets(view.datasets, { sort: 'newest' }).map((d) => d.datasetId)).toEqual(['ds2', 'ds1']);

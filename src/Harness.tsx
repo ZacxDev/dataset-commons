@@ -8,7 +8,35 @@ import {
 
 import { demoSharedSeed } from './community.js';
 import { ALL_APP_SCOPES } from './community-storage.js';
+import { configureDocumentStorage } from './doc-storage.js';
+import { createAppFakeStorage, seedCommunity, withFailingWrites } from './fake-doc-storage.js';
 import { mockBuzzBalance } from './mock-buzz.js';
+
+/**
+ * The community lives in the document store (REST), which the mock host does
+ * not serve, so the harness gets the SDK's in-memory `createFakeStorage`
+ * (committed manifest, signed-in `dev-viewer`). Session-only.
+ *
+ * `?community=demo` seeds the demo dataset; `?sharedFail=N` (which implies the
+ * demo) fails the next N shared writes with the store's 503. The panel's
+ * community buttons re-create it through {@link resetHarnessCommunity}.
+ */
+export function installHarnessDocumentStorage(): void {
+  const params = new URLSearchParams(window.location.search);
+  const sharedFail = Number(params.get('sharedFail') ?? 0);
+  const failures = Number.isInteger(sharedFail) && sharedFail > 0 ? sharedFail : 0;
+  resetHarnessCommunity(params.get('community') === 'demo' || failures > 0, failures);
+}
+
+/** Replace the harness store with a fresh one, optionally seeded with the demo. */
+export function resetHarnessCommunity(demo: boolean, failNext = 0): void {
+  const fake = createAppFakeStorage();
+  const budget = { remaining: failNext };
+  const ready = (demo ? seedCommunity(fake, demoSharedSeed()) : Promise.resolve()).then(() =>
+    withFailingWrites(fake.storage, budget),
+  );
+  configureDocumentStorage(() => ready);
+}
 
 /**
  * Local dev mock host for the Dataset Commons PAGE app.
@@ -34,8 +62,8 @@ import { mockBuzzBalance } from './mock-buzz.js';
  *   ?failRate=0.5       -> probabilistic submit failures
  *   ?training=published -> training finishes with a published LoRA linked
  *   ?community=demo     -> seed the demo dataset/items/votes
- *   ?sharedFail=1       -> fail the next N shared-storage mutations
- *                          (SHARED_UNAVAILABLE) against the demo seed
+ *   ?sharedFail=1       -> fail the next N shared-storage writes (the store's
+ *                          503, SHARED_UNAVAILABLE) against the demo seed
  *
  * The on-screen scenario panel maps the same controls onto buttons so a dev can
  * flip them live (it re-mounts the mock host with the new options).
@@ -54,21 +82,16 @@ export function Harness({ children }: { children: ReactNode }) {
   const [scenario, setScenario] = useState<MockHostOptions>(() => {
     const base = initial.current as MockHostOptions;
     const params = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
-    const wantsDemo = params.get('community') === 'demo';
     // Deterministic training outcome for headless walks: the run
     // finishes with epochs ready and a published LoRA linked (the
     // same state the scenario panel's button applies, without a
     // remount mid-walk).
     const trainingPublished = params.get('training') === 'published';
-    const sharedFail = Number(params.get('sharedFail') ?? 0);
+    // `?community=demo` / `?sharedFail=N` seed the DOCUMENT STORE, not the mock
+    // host (see installHarnessDocumentStorage).
     return {
       ...base,
       declaredScopes: [...new Set([...(base.declaredScopes ?? []), ...ALL_APP_SCOPES])],
-      ...(Number.isInteger(sharedFail) && sharedFail > 0
-        ? { shared: { seed: demoSharedSeed(), failNext: sharedFail } }
-        : wantsDemo && !base.shared
-          ? { shared: { seed: demoSharedSeed() } }
-          : {}),
       ...(trainingPublished
         ? {
             generation: {
@@ -185,16 +208,20 @@ function ScenarioPanel({ onApply }: { onApply: (patch: MockHostOptions) => void 
         <button
           type="button"
           style={btnStyle}
-          onClick={() =>
-            onApply({ declaredScopes: [...ALL_APP_SCOPES], shared: { seed: demoSharedSeed() } })
-          }
+          onClick={() => {
+            resetHarnessCommunity(true);
+            onApply({ declaredScopes: [...ALL_APP_SCOPES] });
+          }}
         >
           community: demo dataset
         </button>
         <button
           type="button"
           style={btnStyle}
-          onClick={() => onApply({ declaredScopes: [...ALL_APP_SCOPES], shared: { seed: [] } })}
+          onClick={() => {
+            resetHarnessCommunity(false);
+            onApply({ declaredScopes: [...ALL_APP_SCOPES] });
+          }}
         >
           community: empty
         </button>

@@ -1,17 +1,29 @@
 // Dataset Commons — community data core for the remaining screens (voting
 // option (b), decided by Zacx 2026-10-06).
 //
-// The platform's shared store has a native UP-vote only. The spec needs net
-// votes (up − down) on datasets and items, so votes are custom shared records:
-// one record per viewer per target, folded client-side. Dataset votes rank
-// Explore only; item votes feed inclusion + the vote-weighted split through
-// training.ts. Later votes on the live dataset never rewrite a frozen snapshot.
+// Since 0.2.0 the community lives in the App Blocks DOCUMENT STORE, one shared
+// collection per entity: datasets, items, snapshots, loras, ledger, removals
+// (declared in block.manifest.json; read and written by ./community-storage.ts).
+// The collection says what a document is — there is no `kind` field any more.
+// The cutover copy (`scripts/appdata-copy/copy-dataset-commons-to-appdata.sql`
+// in the cluster repo) lays the legacy rows down in exactly the shapes below.
 //
-// Identity rule (pinned here, not improvised in the UI): shared entries carry a
-// numeric `authorUserId`. Community records keep that numeric id as the person
-// key, and snapshot contributor ids use the stable string form `user:<id>` so
-// training.ts's string-keyed share math stays intact. Display names travel as
-// separate name fields and are never used as identity.
+// Votes are the store's per-viewer MARKS `up` and `down` on the dataset or item
+// document itself (the app sets at most one of the two per viewer). The tally
+// is `marks.up` − `marks.down` and "my vote" is the store's `viewer.marks`:
+// there are no vote records, no `voterId` and no `targetId` any more. Dataset
+// votes rank Explore only; item votes feed inclusion + the vote-weighted split
+// through training.ts. Later votes on the live dataset never rewrite a frozen
+// snapshot.
+//
+// Identity rule (pinned here, not improvised in the UI): the store never
+// discloses a numeric user id, so community records carry the writer's numeric
+// id in their OWN data (`ownerId`, `contributorId`, `trainerId`, `actorId` — as
+// the legacy rows already did), and snapshot contributor ids use the stable
+// string form `user:<id>` so training.ts's string-keyed share math stays
+// intact. Display names travel as separate name fields and are never used as
+// identity. Who may CHANGE a document is the store's rule: its author only
+// (`write: "own"`).
 
 import {
   creditLedgerEvent,
@@ -30,13 +42,26 @@ export const ONSITE_EARNINGS_LINE =
 export const COSMETIC_TRUST_LINE =
   'Vote counts live in shared storage — take them as a signal, not proof.';
 
-/** The minimal shape of a shared-store entry this core folds. */
+/** The shared collections, one per entity. Must match `block.manifest.json`. */
+export const COMMUNITY_COLLECTIONS = ['datasets', 'items', 'snapshots', 'loras', 'ledger', 'removals'] as const;
+export type CommunityCollection = (typeof COMMUNITY_COLLECTIONS)[number];
+
+/** The two vote marks declared on `datasets` and `items`. */
+export const UP_MARK = 'up';
+export const DOWN_MARK = 'down';
+
+/** One shared document, as the fold reads it (`toEntry` in ./community-storage.ts). */
 export interface SharedEntryLike {
   key: string;
-  authorUserId: number;
-  value: { title: string; body?: string; data?: unknown };
+  collection: CommunityCollection;
+  data: unknown;
   createdAt: Date | string;
   updatedAt: Date | string;
+  /** The `up` / `down` mark counts (0 on a collection that declares no marks). */
+  up: number;
+  down: number;
+  /** The viewer's own vote on this document, from the store's `viewer.marks`. */
+  viewerVote: VoteValue;
 }
 
 export interface DatasetRecord {
@@ -67,13 +92,15 @@ export interface DatasetItemRecord {
   updatedAt: string;
 }
 
+/** The vote marks on ONE dataset or item document. */
 export interface VoteRecord {
-  storageKey?: string;
-  voterId: number;
+  /** The document the marks sit on — what a vote marks / unmarks. */
+  storageKey: string;
   targetKind: VoteTargetKind;
   targetId: string;
-  value: VoteValue;
-  updatedAt: string;
+  up: number;
+  down: number;
+  viewerVote: VoteValue;
 }
 
 export interface ItemRemovalRecord {
@@ -137,10 +164,6 @@ function iso(v: unknown): string {
   return '';
 }
 
-function voteValue(v: unknown): VoteValue | null {
-  return v === 1 || v === -1 || v === 0 ? v : null;
-}
-
 /** Stable snapshot contributor id for a numeric Civitai user id. */
 export function contributorKey(userId: number): string {
   return `user:${userId}`;
@@ -194,66 +217,70 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
   const removals: ItemRemovalRecord[] = [];
 
   for (const entry of entries) {
-    const data = asRecord(entry.value?.data);
+    const data = asRecord(entry.data);
     if (!data) continue;
-    const kind = str(data.kind);
     const at = entryTime(entry);
 
-    if (kind === 'dataset') {
+    if (entry.collection === 'datasets') {
       const datasetId = str(data.datasetId);
-      if (!datasetId) continue;
+      const ownerId = num(data.ownerId);
+      if (!datasetId || ownerId == null) continue;
       datasets.push({
         storageKey: entry.key,
         datasetId,
-        ownerId: num(data.ownerId) ?? entry.authorUserId,
-        ownerName: str(data.ownerName) || entry.value.title || 'unknown',
-        name: str(data.name) || entry.value.title,
-        description: str(data.description) || entry.value.body || '',
+        ownerId,
+        ownerName: str(data.ownerName) || 'unknown',
+        name: str(data.name) || 'Untitled dataset',
+        description: str(data.description),
         targetNote: str(data.targetNote),
         createdAt: iso(data.createdAt) || iso(entry.createdAt),
         updatedAt: iso(data.updatedAt) || at,
       });
-    } else if (kind === 'item') {
+      votes.push({
+        storageKey: entry.key,
+        targetKind: 'dataset',
+        targetId: datasetId,
+        up: entry.up,
+        down: entry.down,
+        viewerVote: entry.viewerVote,
+      });
+    } else if (entry.collection === 'items') {
       const itemId = str(data.itemId);
       const datasetId = str(data.datasetId);
-      if (!itemId || !datasetId) continue;
+      const contributorId = num(data.contributorId);
+      if (!itemId || !datasetId || contributorId == null) continue;
       const imageId = num(data.imageId);
       items.push({
         storageKey: entry.key,
         itemId,
         datasetId,
-        contributorId: num(data.contributorId) ?? entry.authorUserId,
+        contributorId,
         contributorName: str(data.contributorName) || 'unknown',
         ...(imageId != null && imageId > 0 ? { imageId: Math.trunc(imageId) } : {}),
         imageRef: str(data.imageRef) || str(data.imageUrl),
-        caption: str(data.caption) || entry.value.title,
+        caption: str(data.caption),
         rightsAsserted: data.rightsAsserted === true,
         createdAt: iso(data.createdAt) || iso(entry.createdAt),
         updatedAt: iso(data.updatedAt) || at,
       });
-    } else if (kind === 'vote') {
-      const targetId = str(data.targetId);
-      const targetKind = str(data.targetKind);
-      const value = voteValue(data.value);
-      if (!targetId || (targetKind !== 'dataset' && targetKind !== 'item') || value === null) continue;
       votes.push({
         storageKey: entry.key,
-        voterId: num(data.voterId) ?? entry.authorUserId,
-        targetKind,
-        targetId,
-        value,
-        updatedAt: iso(data.updatedAt) || at,
+        targetKind: 'item',
+        targetId: itemId,
+        up: entry.up,
+        down: entry.down,
+        viewerVote: entry.viewerVote,
       });
-    } else if (kind === 'snapshot') {
-      const snap = asRecord(data.snapshot);
-      if (!snap || typeof snap.snapshotId !== 'string' || !Array.isArray(snap.items)) continue;
-      const snapshot = snap as unknown as DatasetSnapshot;
+    } else if (entry.collection === 'snapshots') {
+      if (typeof data.snapshotId !== 'string' || !Array.isArray(data.items)) continue;
+      const snapshot = data as unknown as DatasetSnapshot;
       snapshots.push(snapshot);
       const prev = snapshotStorageKeys.get(snapshot.snapshotId);
       if (!prev || entry.key > prev) snapshotStorageKeys.set(snapshot.snapshotId, entry.key);
-    } else if (kind === 'lora') {
+    } else if (entry.collection === 'loras') {
       const loraId = str(data.loraId);
-      if (!loraId) continue;
+      const trainerId = num(data.trainerId);
+      if (!loraId || trainerId == null) continue;
       const modelId = num(data.modelId);
       const modelVersionId = num(data.modelVersionId);
       loras.push({
@@ -261,9 +288,9 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
         loraId,
         datasetId: str(data.datasetId),
         snapshotId: str(data.snapshotId),
-        trainerId: num(data.trainerId) ?? entry.authorUserId,
+        trainerId,
         trainerName: str(data.trainerName) || 'unknown',
-        name: str(data.name) || entry.value.title,
+        name: str(data.name) || 'LoRA',
         ...(str(data.workflowId) ? { workflowId: str(data.workflowId) } : {}),
         ...(modelId != null ? { modelId: Math.trunc(modelId) } : {}),
         ...(modelVersionId != null ? { modelVersionId: Math.trunc(modelVersionId) } : {}),
@@ -271,10 +298,9 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
         createdAt: iso(data.createdAt) || iso(entry.createdAt),
         updatedAt: iso(data.updatedAt) || at,
       });
-    } else if (kind === 'ledger') {
-      const ev = asRecord(data.event);
-      if (!ev || typeof ev.eventId !== 'string' || typeof ev.sourceRef !== 'string') continue;
-      const event = ev as unknown as LedgerEvent;
+    } else if (entry.collection === 'ledger') {
+      if (typeof data.eventId !== 'string' || typeof data.sourceRef !== 'string') continue;
+      const event = data as unknown as LedgerEvent;
       if (
         event.eventType !== 'training' &&
         event.eventType !== 'generation_in_app' &&
@@ -283,14 +309,15 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
         continue;
       }
       ledgerEvents.push(event);
-    } else if (kind === 'item-removal') {
+    } else if (entry.collection === 'removals') {
       const itemId = str(data.itemId);
-      if (!itemId) continue;
+      const actorId = num(data.actorId);
+      if (!itemId || actorId == null) continue;
       removals.push({
         storageKey: entry.key,
         itemId,
         datasetId: str(data.datasetId),
-        actorId: num(data.actorId) ?? entry.authorUserId,
+        actorId,
         reason: data.reason === 'contributor-withdraw' ? 'contributor-withdraw' : 'owner-remove',
         createdAt: iso(data.createdAt) || at,
       });
@@ -306,12 +333,9 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
   return {
     datasets: latestBy(datasets, (d) => d.datasetId, (d) => d.updatedAt, (d) => d.storageKey ?? ''),
     items: latestBy(items, (i) => i.itemId, (i) => i.updatedAt, (i) => i.storageKey ?? ''),
-    votes: latestBy(
-      votes,
-      (v) => `${v.voterId}:${v.targetKind}:${v.targetId}`,
-      (v) => v.updatedAt,
-      (v) => v.storageKey ?? '',
-    ),
+    // One tally per dataset/item DOCUMENT; duplicates of one id (a legacy double
+    // write) keep their own marks and `tallyVotes` sums them.
+    votes,
     snapshots: latestBy(snapshots, (s) => s.snapshotId, (s) => s.createdAt, (s) => s.snapshotId),
     snapshotStorageKeys,
     loras: latestBy(loras, (l) => l.loraId, (l) => l.updatedAt, (l) => l.storageKey ?? ''),
@@ -331,20 +355,23 @@ export interface VoteTally {
   viewerVote: VoteValue;
 }
 
+/**
+ * The tally for one target: the marks on every document holding it (normally
+ * one). `viewerVote` is the viewer's own mark, from the store.
+ */
 export function tallyVotes(
   votes: readonly VoteRecord[],
   targetKind: VoteTargetKind,
   targetId: string,
-  viewerId?: number | null,
 ): VoteTally {
   let up = 0;
   let down = 0;
   let viewerVote: VoteValue = 0;
   for (const vote of votes) {
     if (vote.targetKind !== targetKind || vote.targetId !== targetId) continue;
-    if (vote.value === 1) up += 1;
-    else if (vote.value === -1) down += 1;
-    if (viewerId != null && vote.voterId === viewerId) viewerVote = vote.value;
+    up += vote.up;
+    down += vote.down;
+    if (vote.viewerVote !== 0) viewerVote = vote.viewerVote;
   }
   return { up, down, net: up - down, viewerVote };
 }
@@ -354,23 +381,27 @@ export function nextVoteValue(current: VoteValue, clicked: 1 | -1): VoteValue {
   return current === clicked ? 0 : clicked;
 }
 
-/** Pure vote replacement: one record per viewer per target, latest wins. */
-export function applyVote(records: readonly VoteRecord[], vote: VoteRecord): VoteRecord[] {
-  const rest = records.filter(
-    (v) => !(v.voterId === vote.voterId && v.targetKind === vote.targetKind && v.targetId === vote.targetId),
-  );
-  return [...rest, vote];
+/** The mark that carries a vote value (`null` for 0, no vote). */
+export function markForVote(value: VoteValue): typeof UP_MARK | typeof DOWN_MARK | null {
+  return value === 1 ? UP_MARK : value === -1 ? DOWN_MARK : null;
 }
 
-/** The viewer's own vote record for a target (carries the storage key to update). */
-export function viewerVoteRecord(
+/**
+ * The document a vote on a target marks: the one already carrying the viewer's
+ * mark, else the newest-keyed document holding the target (normally the only one).
+ */
+export function voteTarget(
   votes: readonly VoteRecord[],
-  viewerId: number | null,
   targetKind: VoteTargetKind,
   targetId: string,
 ): VoteRecord | null {
-  if (viewerId == null) return null;
-  return votes.find((v) => v.voterId === viewerId && v.targetKind === targetKind && v.targetId === targetId) ?? null;
+  let found: VoteRecord | null = null;
+  for (const vote of votes) {
+    if (vote.targetKind !== targetKind || vote.targetId !== targetId) continue;
+    if (vote.viewerVote !== 0) return vote;
+    if (!found || vote.storageKey > found.storageKey) found = vote;
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,10 +440,8 @@ export interface CommunityView {
   loras: LoraView[];
 }
 
-export function buildCommunityView(
-  folded: FoldedCommunity,
-  viewerId: number | null,
-): CommunityView {
+/** The derived views. The viewer's own votes come from the store's marks, already on `folded.votes`. */
+export function buildCommunityView(folded: FoldedCommunity): CommunityView {
   const removedIds = new Set(folded.removals.map((r) => r.itemId));
   const appearances = new Map<string, number>();
   for (const snapshot of folded.snapshots) {
@@ -422,11 +451,11 @@ export function buildCommunityView(
   }
 
   const datasets = folded.datasets.map((dataset) => {
-    const datasetTally = tallyVotes(folded.votes, 'dataset', dataset.datasetId, viewerId);
+    const datasetTally = tallyVotes(folded.votes, 'dataset', dataset.datasetId);
     const items = folded.items
       .filter((item) => item.datasetId === dataset.datasetId)
       .map((item) => {
-        const tally = tallyVotes(folded.votes, 'item', item.itemId, viewerId);
+        const tally = tallyVotes(folded.votes, 'item', item.itemId);
         const removed = removedIds.has(item.itemId);
         return {
           ...item,
@@ -705,71 +734,38 @@ export function validateContribution(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Shared-store values — title/body carry the moderated, user-visible text;
-// `data` carries the structured record the fold reads back.
+// Document data — what each collection stores. `storageKey` is the document's
+// KEY, never part of its data. The cutover copy writes legacy rows in these
+// same shapes (the legacy `data` minus `kind`; a snapshot's / ledger event's
+// inner object), so a copied document and a new one read identically.
 // ---------------------------------------------------------------------------
 
-export function datasetSharedValue(record: DatasetRecord): { title: string; body?: string; data: unknown } {
-  return {
-    title: record.name,
-    body: record.description || undefined,
-    data: { kind: 'dataset', ...record, storageKey: undefined },
-  };
+function withoutStorageKey<T extends { storageKey?: string }>(record: T): Omit<T, 'storageKey'> {
+  const { storageKey: _key, ...rest } = record;
+  void _key;
+  return rest;
 }
 
-export function itemSharedValue(record: DatasetItemRecord): { title: string; body?: string; data: unknown } {
-  return {
-    title: record.caption,
-    body: `Dataset ${record.datasetId}`,
-    data: { kind: 'item', ...record, storageKey: undefined },
-  };
+export const datasetDoc = (record: DatasetRecord) => withoutStorageKey(record);
+export const itemDoc = (record: DatasetItemRecord) => withoutStorageKey(record);
+export const loraDoc = (record: LoraRecord) => withoutStorageKey(record);
+export const removalDoc = (record: ItemRemovalRecord) => withoutStorageKey(record);
+export const snapshotDoc = (snapshot: DatasetSnapshot) => snapshot;
+export const ledgerDoc = (event: LedgerEvent) => event;
+
+/** One seed document: who writes it, where, and which viewers vote on it. */
+export interface CommunitySeedDoc {
+  collection: CommunityCollection;
+  /** The author's username (the fake store's viewer identity). */
+  author: string;
+  data: object;
+  /** Usernames that set the `up` / `down` mark on it. */
+  up?: readonly string[];
+  down?: readonly string[];
 }
 
-export function voteSharedValue(record: VoteRecord): { title: string; body?: string; data: unknown } {
-  return {
-    title: `Vote ${record.value} on ${record.targetKind} ${record.targetId}`,
-    body: `voter ${record.voterId}`,
-    data: { kind: 'vote', ...record, storageKey: undefined },
-  };
-}
-
-export function snapshotSharedValue(
-  snapshot: DatasetSnapshot,
-  datasetName: string,
-): { title: string; body?: string; data: unknown } {
-  return {
-    title: `Snapshot for ${datasetName}`,
-    body: `${snapshot.items.filter((i) => i.included).length} items included`,
-    data: { kind: 'snapshot', snapshot },
-  };
-}
-
-export function loraSharedValue(record: LoraRecord): { title: string; body?: string; data: unknown } {
-  return {
-    title: record.name,
-    body: record.published ? 'Published LoRA' : 'Trained LoRA (unpublished)',
-    data: { kind: 'lora', ...record, storageKey: undefined },
-  };
-}
-
-export function ledgerSharedValue(event: LedgerEvent): { title: string; body?: string; data: unknown } {
-  return {
-    title: `Ledger ${event.eventType} ${event.grossBuzz} Buzz`,
-    body: `LoRA ${event.loraId} · source ${event.sourceRef}`,
-    data: { kind: 'ledger', event },
-  };
-}
-
-export function removalSharedValue(record: ItemRemovalRecord): { title: string; body?: string; data: unknown } {
-  return {
-    title: `Remove item ${record.itemId}`,
-    body: record.reason,
-    data: { kind: 'item-removal', ...record, storageKey: undefined },
-  };
-}
-
-/** A demo seed for the mock harness only — never shipped as production data. */
-export function demoSharedSeed(): Array<{ value: { title: string; body?: string; data: unknown }; authorUserId?: number }> {
+/** A demo seed for the mock harness and tests only — never shipped as production data. */
+export function demoSharedSeed(): CommunitySeedDoc[] {
   const dataset: DatasetRecord = {
     datasetId: 'dataset-archive-ink',
     ownerId: 7,
@@ -815,20 +811,12 @@ export function demoSharedSeed(): Array<{ value: { title: string; body?: string;
       updatedAt: '2026-10-05T00:03:00.000Z',
     },
   ];
-  const votes: VoteRecord[] = [
-    { voterId: 21, targetKind: 'item', targetId: 'item-a', value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-    { voterId: 22, targetKind: 'item', targetId: 'item-a', value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-    { voterId: 23, targetKind: 'item', targetId: 'item-a', value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-    { voterId: 24, targetKind: 'item', targetId: 'item-a', value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-    { voterId: 25, targetKind: 'item', targetId: 'item-a', value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-    { voterId: 26, targetKind: 'item', targetId: 'item-b', value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-    { voterId: 27, targetKind: 'dataset', targetId: dataset.datasetId, value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-    { voterId: 28, targetKind: 'dataset', targetId: dataset.datasetId, value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-    { voterId: 29, targetKind: 'dataset', targetId: dataset.datasetId, value: 1, updatedAt: '2026-10-05T01:00:00.000Z' },
-  ];
+  // item-a: 5 up; item-b: 1 up; the dataset: 3 up — distinct voters, as the legacy demo.
+  const voters = (from: number, n: number) => Array.from({ length: n }, (_, k) => `voter-${from + k}`);
   return [
-    { value: datasetSharedValue(dataset), authorUserId: dataset.ownerId },
-    ...items.map((item) => ({ value: itemSharedValue(item), authorUserId: item.contributorId })),
-    ...votes.map((vote) => ({ value: voteSharedValue(vote), authorUserId: vote.voterId })),
+    { collection: 'datasets', author: 'archivist', data: datasetDoc(dataset), up: voters(27, 3) },
+    { collection: 'items', author: 'alice', data: itemDoc(items[0]!), up: voters(21, 5) },
+    { collection: 'items', author: 'bob', data: itemDoc(items[1]!), up: voters(26, 1) },
+    { collection: 'items', author: 'alice', data: itemDoc(items[2]!) },
   ];
 }
