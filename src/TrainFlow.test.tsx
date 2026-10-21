@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { PAGE_BUZZ_BUDGET } from './generation.js';
 import { TrainFlow, type TrainFlowProps, type TrainRunLink } from './TrainFlow.js';
 import { installMockMoneyHost } from './mock-buzz.js';
-import type { DatasetItem, LedgerEvent } from './training.js';
+import type { DatasetItem, DatasetSnapshot, LedgerEvent } from './training.js';
 
 // Component/e2e tests for the Train flow (Option A′) against the REAL SDK
 // transport + mock host — no hook mocking. The mock host is kind-agnostic, so
@@ -636,6 +636,143 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.queryByTestId('dc-kind-estimate')).not.toBeInTheDocument();
     expect(screen.queryByTestId('dc-train-upload')).not.toBeInTheDocument();
     expect(trainingBodies(outbound, 'RUN_TRAINING')).toHaveLength(1);
+  });
+
+  it('after an unconfirmed run, BOTH paths stop pricing until the trainer says they checked', async () => {
+    const user = userEvent.setup();
+    const outbound: Outbound[] = [];
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+      trainingQuoteTotal: 725,
+      runTrainingError: 'submission-unconfirmed',
+      buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+      onOutbound: (message) => outbound.push(message as Outbound),
+    });
+    await renderTrainFlow({ initialItems: communityItems });
+    await uploadAndPrice(user);
+    await user.click(await screen.findByTestId('dc-kind-run'));
+    await screen.findByTestId('dc-kind-unconfirmed');
+
+    // The pass-through price button stays on screen but cannot price a second,
+    // separately charged run on the same uploads; Civitai's trainer offers none.
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+    expect(screen.queryByTestId('dc-kind-estimate')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('dc-estimate'));
+    expect(outbound.filter((m) => m.type === 'ESTIMATE_WORKFLOW' && (m.payload as { body?: { kind?: string } }).body?.kind === 'step')).toHaveLength(0);
+
+    // Only the trainer's explicit acknowledgement re-opens pricing.
+    await user.click(screen.getByTestId('dc-kind-ack'));
+    expect(screen.queryByTestId('dc-kind-unconfirmed')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-estimate')).toBeEnabled();
+    expect(screen.getByTestId('dc-kind-estimate')).toBeEnabled();
+    expect(trainingBodies(outbound, 'RUN_TRAINING')).toHaveLength(1);
+  });
+
+  it('Find my run links the one new app workflow to the persisted snapshot, so its credit is recorded', async () => {
+    const user = userEvent.setup();
+    const confirmed: DatasetSnapshot[] = [];
+    const ledgerEvents: LedgerEvent[] = [];
+    const links: TrainRunLink[] = [];
+    const old = { workflowId: 'wf_old', status: 'succeeded' as const, images: [], cost: 725, createdAt: '2026-10-20T10:00:00.000Z' };
+    const handle = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+      trainingQuoteTotal: 725,
+      runTrainingError: 'submission-unconfirmed',
+      // What the mock reports for the found run when it is polled: its cost and
+      // (the SDK mock gives a run it did not submit no epochs) its trained epochs.
+      cost: 725,
+      pollsUntilDone: 1,
+      trainedEpochsFor: { wf_lost_run: 10 },
+      appWorkflows: { workflows: [old] },
+      buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+    });
+    uninstall = handle;
+    await renderTrainFlow({
+      initialItems: communityItems,
+      onSnapshotConfirmed: (s) => void confirmed.push(s),
+      onLedgerEvent: (e) => void ledgerEvents.push(e),
+      onRunLinked: (l) => void links.push(l),
+    });
+    await uploadAndPrice(user);
+    await user.click(await screen.findByTestId('dc-kind-run'));
+    await screen.findByTestId('dc-kind-unconfirmed');
+    expect(confirmed).toHaveLength(1);
+    expect(screen.getByTestId('dc-kind-unconfirmed')).toHaveTextContent(confirmed[0]!.snapshotId);
+
+    // The run did start: it is the one workflow new in this app's queue since
+    // just before Civitai's dialog opened.
+    handle.setScenario({
+      appWorkflows: {
+        workflows: [
+          { workflowId: 'wf_lost_run', status: 'processing', images: [], cost: 725, createdAt: '2026-10-20T10:05:00.000Z' },
+          old,
+        ],
+      },
+    });
+    await user.click(screen.getByTestId('dc-kind-find-run'));
+
+    await waitFor(() => expect(ledgerEvents.map((e) => e.sourceRef)).toEqual(['wf_lost_run']), { timeout: 5000 });
+    expect(ledgerEvents[0]!.snapshotId).toBe(confirmed[0]!.snapshotId);
+    expect(links.at(-1)?.workflowId).toBe('wf_lost_run');
+    expect(links.at(-1)?.snapshot?.snapshotId).toBe(confirmed[0]!.snapshotId);
+    expect(screen.queryByTestId('dc-kind-unconfirmed')).not.toBeInTheDocument();
+  });
+
+  it('Find my run links nothing when the new workflows are not exactly one price-compatible match', async () => {
+    const user = userEvent.setup();
+    const links: TrainRunLink[] = [];
+    const old = { workflowId: 'wf_old', status: 'succeeded' as const, images: [], cost: 725, createdAt: '2026-10-20T10:00:00.000Z' };
+    const handle = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+      trainingQuoteTotal: 725,
+      runTrainingError: 'submission-unconfirmed',
+      appWorkflows: { workflows: [old] },
+      buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+    });
+    uninstall = handle;
+    await renderTrainFlow({ initialItems: communityItems, onRunLinked: (l) => void links.push(l) });
+    await uploadAndPrice(user);
+    await user.click(await screen.findByTestId('dc-kind-run'));
+    await screen.findByTestId('dc-kind-unconfirmed');
+
+    // Nothing new: the submission most likely never started.
+    await user.click(screen.getByTestId('dc-kind-find-run'));
+    expect(await screen.findByTestId('dc-kind-find-result')).toHaveTextContent(/no new run/i);
+
+    // Two new candidates: refuse to guess.
+    handle.setScenario({
+      appWorkflows: {
+        workflows: [
+          { workflowId: 'wf_new_a', status: 'processing', images: [], cost: 700, createdAt: '2026-10-20T10:06:00.000Z' },
+          { workflowId: 'wf_new_b', status: 'processing', images: [], cost: null, createdAt: '2026-10-20T10:05:00.000Z' },
+          old,
+        ],
+      },
+    });
+    await user.click(screen.getByTestId('dc-kind-find-run'));
+    await waitFor(() => expect(screen.getByTestId('dc-kind-find-result')).toHaveTextContent(/2 new runs/i));
+
+    // One new workflow, but priced ABOVE the quote: not this run.
+    handle.setScenario({
+      appWorkflows: {
+        workflows: [
+          { workflowId: 'wf_pricier', status: 'processing', images: [], cost: 900, createdAt: '2026-10-20T10:06:00.000Z' },
+          old,
+        ],
+      },
+    });
+    await user.click(screen.getByTestId('dc-kind-find-run'));
+    await waitFor(() => expect(screen.getByTestId('dc-kind-find-result')).toHaveTextContent(/no new run/i));
+
+    expect(links).toHaveLength(0);
+    expect(screen.getByTestId('dc-kind-unconfirmed')).toBeInTheDocument();
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
   });
 
   it('a cap-refused run is explicit that nothing was charged', async () => {

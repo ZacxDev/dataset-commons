@@ -20,6 +20,7 @@ import {
   isPostReference,
   parseImageReference,
   snapshotDoc,
+  snapshotPersistAction,
   snapshotShareRows,
   tallyVotes,
   trainingItemsForDataset,
@@ -120,6 +121,32 @@ describe('up/down votes as marks (option b)', () => {
       entry({ key: 'k-a', collection: 'items', data: itemDoc(itemA), up: 4, down: 1, viewerVote: 1 }),
     ]);
     expect(folded.votes).toEqual([tally('item', 'a', 4, 1, 1, 'k-a')]);
+  });
+});
+
+describe('snapshotPersistAction (a stored snapshot is adopted only when it IS this one)', () => {
+  const items = [
+    { itemId: 'a', contributorId: 'user:11', imageUrl: 'https://civitai.com/images/1', caption: 'x', netVotes: 2 },
+  ];
+  const mine = freezeSnapshot('ds-mine', 'user:2', items, { snapshotId: 'snap_1', now: '2026-10-20T00:00:00.000Z' });
+
+  it('creates when no stored snapshot has the id', () => {
+    expect(snapshotPersistAction([], mine)).toBe('create');
+  });
+
+  it('skips a re-persist of the very same frozen snapshot (a re-click is idempotent)', () => {
+    expect(snapshotPersistAction([structuredClone(mine)], mine)).toBe('already-stored');
+  });
+
+  it("refuses to adopt another dataset's, another trainer's or another freeze's snapshot under the same id", () => {
+    const otherDataset = { ...structuredClone(mine), datasetId: 'ds-other' };
+    const otherTrainer = { ...structuredClone(mine), trainerId: 'user:3' };
+    const otherFreeze = { ...structuredClone(mine), createdAt: '2026-10-19T00:00:00.000Z' };
+    const otherItems = { ...structuredClone(mine), items: [{ ...mine.items[0]!, contributorId: 'user:99' }] };
+    const otherWeight = { ...structuredClone(mine), totalWeight: 99 };
+    for (const stored of [otherDataset, otherTrainer, otherFreeze, otherItems, otherWeight]) {
+      expect(snapshotPersistAction([stored], mine)).toBe('conflict');
+    }
   });
 });
 

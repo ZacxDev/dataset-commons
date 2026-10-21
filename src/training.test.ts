@@ -1,5 +1,5 @@
 import { RunTrainingError } from '@civitai/blocks-react';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   DEFAULT_TRAINING_PRESET,
@@ -7,6 +7,7 @@ import {
   TRAINING_KIND_CATALOG,
   TRAINING_PRESETS,
   TRAINING_STEPS_BOUNDS,
+  appQueueBaseline,
   buildPublishWizardPath,
   buildTrainingBody,
   buildTrainingKindBody,
@@ -25,6 +26,7 @@ import {
   includedItems,
   latestEpoch,
   linkedLoraFromSnapshot,
+  matchUnconfirmedRun,
   trackedTotals,
   trainingFailureCopy,
   trainingFeeEvent,
@@ -47,6 +49,107 @@ const item = (over: Partial<DatasetItem>): DatasetItem => ({
   caption: 'a caption',
   netVotes: 3,
   ...over,
+});
+
+describe('snapshot ids are globally unique (a page load must never re-mint a stored id)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  // Every page load is a fresh module: a per-module counter restarted there, so
+  // every trainer's first priced run was `snap_1` and was linked to whichever
+  // dataset's `snap_1` was already stored.
+  it('two freezes in separate module loads get different ids', async () => {
+    vi.resetModules();
+    const first = await import('./training.js');
+    const a = first.freezeSnapshot('ds-a', 'trainer-a', [item({ itemId: 'a1' })]);
+    vi.resetModules();
+    const second = await import('./training.js');
+    const b = second.freezeSnapshot('ds-b', 'trainer-b', [item({ itemId: 'b1' })]);
+    expect(a.snapshotId).toMatch(/^snap_/);
+    expect(b.snapshotId).toMatch(/^snap_/);
+    expect(a.snapshotId).not.toBe(b.snapshotId);
+  });
+
+  it('without crypto.randomUUID (or without crypto at all) it still mints distinct prefixed ids', async () => {
+    const real = globalThis.crypto;
+    vi.stubGlobal('crypto', { getRandomValues: real.getRandomValues.bind(real) });
+    vi.resetModules();
+    const noUuid = await import('./training.js');
+    const a = noUuid.freezeSnapshot('ds', 't', [item({})]).snapshotId;
+    const b = noUuid.freezeSnapshot('ds', 't', [item({})]).snapshotId;
+    expect(a).toMatch(/^snap_[0-9a-f]{32}$/);
+    expect(a).not.toBe(b);
+
+    vi.stubGlobal('crypto', undefined);
+    vi.resetModules();
+    const noCrypto = await import('./training.js');
+    const c = noCrypto.freezeSnapshot('ds', 't', [item({})]).snapshotId;
+    const d = noCrypto.freezeSnapshot('ds', 't', [item({})]).snapshotId;
+    expect(c).toMatch(/^snap_/);
+    expect(c).not.toBe(d);
+  });
+
+  it('an injected id is kept verbatim (stored snap_<n> ids keep reading)', () => {
+    expect(freezeSnapshot('ds', 't', [item({})], { snapshotId: 'snap_1' }).snapshotId).toBe('snap_1');
+  });
+});
+
+describe('matchUnconfirmedRun (diff against the queue read before the dialog)', () => {
+  const row = (workflowId: string, cost: number | null, createdAt: string) => ({ workflowId, cost, createdAt });
+  const before = [row('wf_old', 725, '2026-10-20T10:00:00.000Z'), row('wf_older', 12, '2026-10-20T09:00:00.000Z')];
+  const baseline = appQueueBaseline(before);
+
+  it('exactly one new, price-compatible workflow is the run', () => {
+    expect(
+      matchUnconfirmedRun({ baseline, current: [row('wf_new', 700, '2026-10-20T10:01:00.000Z'), ...before], quoteTotal: 725 }),
+    ).toEqual({ kind: 'found', workflowId: 'wf_new' });
+    // Not priced yet is still a candidate.
+    expect(
+      matchUnconfirmedRun({ baseline, current: [row('wf_new', null, '2026-10-20T10:01:00.000Z'), ...before], quoteTotal: 725 }),
+    ).toEqual({ kind: 'found', workflowId: 'wf_new' });
+  });
+
+  it('nothing new, or only rows priced above the quote / free, is no run', () => {
+    expect(matchUnconfirmedRun({ baseline, current: before, quoteTotal: 725 })).toEqual({ kind: 'none' });
+    expect(
+      matchUnconfirmedRun({ baseline, current: [row('wf_dear', 726, '2026-10-20T10:01:00.000Z'), ...before], quoteTotal: 725 }),
+    ).toEqual({ kind: 'none' });
+    expect(
+      matchUnconfirmedRun({ baseline, current: [row('wf_free', 0, '2026-10-20T10:01:00.000Z'), ...before], quoteTotal: 725 }),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('a row older than the baseline, or already linked elsewhere, is never a candidate', () => {
+    expect(
+      matchUnconfirmedRun({ baseline, current: [...before, row('wf_paged_in', 700, '2026-10-20T08:00:00.000Z')], quoteTotal: 725 }),
+    ).toEqual({ kind: 'none' });
+    expect(
+      matchUnconfirmedRun({
+        baseline,
+        current: [row('wf_linked', 700, '2026-10-20T10:01:00.000Z'), ...before],
+        quoteTotal: 725,
+        excludeWorkflowIds: new Set(['wf_linked']),
+      }),
+    ).toEqual({ kind: 'none' });
+  });
+
+  it('two candidates link nothing', () => {
+    expect(
+      matchUnconfirmedRun({
+        baseline,
+        current: [row('wf_a', 700, '2026-10-20T10:02:00.000Z'), row('wf_b', null, '2026-10-20T10:01:00.000Z'), ...before],
+        quoteTotal: 725,
+      }),
+    ).toEqual({ kind: 'ambiguous', workflowIds: ['wf_a', 'wf_b'] });
+  });
+
+  it('an empty baseline accepts any new row by membership alone', () => {
+    expect(
+      matchUnconfirmedRun({ baseline: appQueueBaseline([]), current: [row('wf_first', 725, '2026-10-20T10:01:00.000Z')], quoteTotal: 725 }),
+    ).toEqual({ kind: 'found', workflowId: 'wf_first' });
+  });
 });
 
 describe('freezeSnapshot (spec §7.2/§7.3)', () => {

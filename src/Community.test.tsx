@@ -512,6 +512,59 @@ describe('Community screens (voting option b)', () => {
   );
 
   it(
+    "a trainer's run is never credited to another dataset's stored snapshot (ids collide across page loads)",
+    async () => {
+      const user = userEvent.setup();
+      // Another trainer's snapshots of ANOTHER dataset are already stored under the
+      // ids a per-page-load counter would mint (snap_1 … snap_40), credited to a
+      // contributor who is not in this dataset.
+      const others = Array.from({ length: 40 }, (_, i) =>
+        freezeSnapshot(
+          'ds-other',
+          'user:98',
+          [{ itemId: `other-${i}`, contributorId: 'user:99', contributorName: 'mallory', imageUrl: 'https://civitai.com/images/9', caption: 'x', netVotes: 4 }],
+          { snapshotId: `snap_${i + 1}`, now: '2026-10-03T00:00:00.000Z' },
+        ),
+      );
+      await seedCommunity(testDocStore(), [
+        ...demoSharedSeed(),
+        ...others.map((s) => ({ collection: 'snapshots' as const, author: 'other-trainer', data: snapshotDoc(s) })),
+      ]);
+      uninstall = installMockMoneyHost({
+        viewer: { id: 2, username: 'dev', status: 'active' },
+        consentGranted: true,
+        trainingQuoteTotal: 725,
+        pollsUntilDone: 1,
+        buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
+        declaredScopes: [...ALL_APP_SCOPES],
+        generation: { trainedEpochs: 10 },
+        cannedTrainingDataUpload: [
+          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up1.png', air: 'up1.png' },
+          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up2.png', air: 'up2.png' },
+        ],
+      });
+      await openCommunity(user);
+      await user.click(await screen.findByTestId('dc-open-dataset-dataset-archive-ink'));
+      await user.click(await screen.findByTestId('dc-open-train'));
+      await user.click(await screen.findByTestId('dc-train-upload', {}, { timeout: 5000 }));
+      await user.click(await screen.findByTestId('dc-train-attest'));
+      await user.click(screen.getByTestId('dc-kind-estimate'));
+      await user.click(await screen.findByTestId('dc-kind-run', {}, { timeout: 5000 }));
+      expect(await screen.findByTestId('dc-publish', {}, { timeout: 10000 })).toBeInTheDocument();
+
+      await user.click(screen.getByTestId('dc-back-dataset'));
+      await screen.findByTestId('dc-dataset-loras', {}, { timeout: 10000 });
+      await user.click(screen.getByTestId(/dc-open-lora-lora_/));
+      expect(await screen.findByTestId('dc-lora-snapshot', {}, { timeout: 5000 })).toBeInTheDocument();
+      // The split is THIS dataset's contributors (alice + bob), never the other one's.
+      expect(screen.getByTestId('dc-lora-share-user:11')).toBeInTheDocument();
+      expect(screen.getByTestId('dc-lora-share-user:12')).toBeInTheDocument();
+      expect(screen.queryByTestId('dc-lora-share-user:99')).not.toBeInTheDocument();
+    },
+    30000,
+  );
+
+  it(
     "a Civitai-trainer run from a real dataset persists a trainer-attested LoRA record",
     async () => {
       const user = userEvent.setup();

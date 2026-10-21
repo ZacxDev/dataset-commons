@@ -37,6 +37,7 @@ import {
   parseImageReference,
   removalDoc,
   snapshotDoc,
+  snapshotPersistAction,
   snapshotShareRows,
   trainingItemsForDataset,
   validateContribution,
@@ -517,7 +518,12 @@ export function Community() {
 
   const persistSnapshot = useCallback(
     async (snapshot: DatasetSnapshot) => {
-      if (folded.snapshots.some((s) => s.snapshotId === snapshot.snapshotId)) return;
+      // A re-click on the same frozen snapshot is idempotent; a stored snapshot
+      // that merely shares the id is never adopted (its contributors would be
+      // credited this run's fee), so the run is refused before any Buzz moves.
+      const action = snapshotPersistAction(folded.snapshots, snapshot);
+      if (action === 'already-stored') return;
+      if (action === 'conflict') throw new Error('a different snapshot is already stored under this id');
       // Persisted BEFORE the run is charged (TrainFlow): a refusal here means no
       // Buzz moves. The first shared write a trainer makes may need the publish
       // grant, so it asks, waits and retries once like every other save.
@@ -585,6 +591,12 @@ export function Community() {
       await refresh();
     },
     [folded.datasets, folded.loras, refresh, viewerId, viewerName, withPublishConsent],
+  );
+
+  /** Workflows already recorded as some LoRA: "Find my run" must never re-link one. */
+  const linkedWorkflowIds = useMemo(
+    () => new Set(folded.loras.flatMap((l) => (l.workflowId ? [l.workflowId] : []))),
+    [folded.loras],
   );
 
   // ------------------------------------------------------------- routing
@@ -948,6 +960,7 @@ export function Community() {
               onSnapshotConfirmed={persistSnapshot}
               onLedgerEvent={persistLedgerEvent}
               onRunLinked={persistRunLink}
+              linkedWorkflowIds={linkedWorkflowIds}
             />
           </Stack>
         )}

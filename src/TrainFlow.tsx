@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
+  getTransport,
+  sendTypedRequest,
   useBlockContext,
   useBlockToken,
   useBuzzBalance,
@@ -27,6 +29,7 @@ import {
   TRAINING_EPOCHS_BOUNDS,
   TRAINING_PRESETS,
   TRAINING_STEPS_BOUNDS,
+  appQueueBaseline,
   buildPublishWizardPath,
   buildTrainingBody,
   buildTrainingKindBody,
@@ -44,6 +47,7 @@ import {
   includedItems,
   latestEpoch,
   linkedLoraFromSnapshot,
+  matchUnconfirmedRun,
   pairUploadsWithSnapshot,
   passThroughAvailable,
   trainingFailureCopy,
@@ -51,6 +55,8 @@ import {
   trainingKindBlocker,
   trainingKindRunFailure,
   trainingStateForSnapshot,
+  type AppQueueBaseline,
+  type AppQueueRow,
   type DatasetItem,
   type DatasetSnapshot,
   type LedgerEvent,
@@ -107,6 +113,25 @@ interface ActiveRun {
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
 
+/** Bounded so a host that never answers cannot hold up Civitai's dialog. */
+const APP_QUEUE_READ_TIMEOUT_MS = 4000;
+
+/**
+ * One read of this app's own workflow queue (newest first) — the same
+ * `QUERY_APP_WORKFLOWS` bridge `useAppWorkflows()` uses, awaited once rather
+ * than mounted as a hook that re-reads on every render of the Train page.
+ */
+async function readAppQueue(): Promise<AppQueueRow[]> {
+  const reply = await sendTypedRequest(
+    getTransport(),
+    { type: 'QUERY_APP_WORKFLOWS', payload: { params: { limit: 50 } } },
+    'APP_WORKFLOWS_RESULT',
+    { timeoutMs: APP_QUEUE_READ_TIMEOUT_MS },
+  );
+  if (reply.error || !reply.result) throw new Error(reply.error || 'could not read the runs of this app');
+  return reply.result.workflows;
+}
+
 /**
  * The host's refusal (SDK 0.67+) when a pass-through `training` step is priced
  * above the per-call budget: it cannot run as a confirmed step and must use
@@ -147,6 +172,8 @@ export interface TrainFlowProps {
   onLedgerEvent?: (event: LedgerEvent, snapshot: DatasetSnapshot) => Promise<void> | void;
   /** Persist the LoRA record when epochs/publish linkage first appears. */
   onRunLinked?: (link: TrainRunLink) => Promise<void> | void;
+  /** Workflows already recorded as a LoRA — "Find my run" never links one of these. */
+  linkedWorkflowIds?: ReadonlySet<string>;
 }
 
 const MOCK_ITEMS: DatasetItem[] = [
@@ -230,6 +257,14 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   const [kindBody, setKindBody] = useState<WorkflowBodyTraining | null>(null);
   const [kindSnapshot, setKindSnapshot] = useState<DatasetSnapshot | null>(null);
   const [kindError, setKindError] = useState<string | null>(null);
+  /** "Find my run" on an unconfirmed run: in flight, and what it last found. */
+  const [findingRun, setFindingRun] = useState(false);
+  const [findResult, setFindResult] = useState<string | null>(null);
+  /**
+   * The app queue read just before Civitai's dialog opened (null when that read
+   * failed): what "Find my run" diffs against. Without it there is no lookup.
+   */
+  const runBaselineRef = useRef<AppQueueBaseline | null>(null);
 
   /** The run on screen and the snapshot it was submitted with (see ActiveRun). */
   const [activeRun, setActiveRun] = useState<ActiveRun | null>(null);
@@ -329,7 +364,10 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     phase === 'submitting' ||
     phase === 'running' ||
     kindPhase === 'pricing' ||
-    kindPhase === 'running';
+    kindPhase === 'running' ||
+    // A run MAY exist and be charged: neither path prices or submits a second
+    // one on the same uploads until the trainer says they checked (or reloads).
+    kindPhase === 'unconfirmed';
   const afford = quote == null ? null : canAffordQuote(quote, balanceTotal);
   const kindAfford = kindQuote == null ? null : canAffordQuote(kindQuote.total, balanceTotal);
   const trainDisabledReason =
@@ -655,6 +693,15 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       }
     }
 
+    // What this app's queue held just before the dialog: if the submit comes back
+    // unconfirmed, "Find my run" looks only at what is new since. A failed read
+    // only means there is no lookup later — it never blocks the run.
+    try {
+      runBaselineRef.current = appQueueBaseline(await readAppQueue());
+    } catch {
+      runBaselineRef.current = null;
+    }
+
     try {
       const started = await runTraining({ ...kindBody, quoteId: kindQuote.quoteId });
       setActiveRun({ workflowId: started.workflowId, snapshot: kindSnapshot, path: 'civitai-trainer' });
@@ -692,6 +739,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           // A run MAY exist and be charged. Never offer a retry from here.
           setKindPhase('unconfirmed');
           setKindError(failure.message);
+          setFindResult(null);
           return;
         case 'not-uploaded':
           // The host forgot (or never had) these blobs: nothing ran. The
@@ -710,6 +758,66 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     }
   }, [kindBody, kindQuote, kindSnapshot, kindPhase, kindAfford, clearKindQuote, runTraining, applyTrainingSnapshot, runKindWatch, requestSignIn]);
 
+  /**
+   * "Find my run" on an unconfirmed run: if exactly one workflow is new in this
+   * app's queue since just before Civitai's dialog (see matchUnconfirmedRun), it
+   * becomes the active run against the snapshot persisted BEFORE the dialog, so
+   * the normal ledger / LoRA recording follows. Anything else links nothing.
+   */
+  const onFindRunClick = useCallback(async () => {
+    const baseline = runBaselineRef.current;
+    if (kindPhaseRef.current !== 'unconfirmed' || !kindSnapshot || !kindQuote || !baseline) return;
+    setFindingRun(true);
+    setFindResult(null);
+    let rows: AppQueueRow[];
+    try {
+      rows = await readAppQueue();
+    } catch (err) {
+      setFindResult(`Could not read this app's runs just now (${describeEstimateFailure(err)}). Try again in a moment.`);
+      return;
+    } finally {
+      setFindingRun(false);
+    }
+    if (kindPhaseRef.current !== 'unconfirmed') return;
+    const match = matchUnconfirmedRun({
+      baseline,
+      current: rows,
+      quoteTotal: kindQuote.total,
+      ...(propsRef.current.linkedWorkflowIds ? { excludeWorkflowIds: propsRef.current.linkedWorkflowIds } : {}),
+    });
+    if (match.kind === 'none') {
+      setFindResult(
+        "No new run of this app has appeared since Civitai's dialog opened, so it most likely did not start. Check your Civitai trainings, then confirm below.",
+      );
+      return;
+    }
+    if (match.kind === 'ambiguous') {
+      setFindResult(
+        `${match.workflowIds.length} new runs of this app appeared since Civitai's dialog opened, so this app cannot tell which one is this training. Nothing was linked — check your Civitai trainings.`,
+      );
+      return;
+    }
+    const snapshot = kindSnapshot;
+    setActiveRun({ workflowId: match.workflowId, snapshot, path: 'civitai-trainer' });
+    setKindError(null);
+    setFindResult(null);
+    clearKindQuote();
+    setKindPhase('idle');
+    setNotice(`Found your run and linked it to snapshot ${snapshot.snapshotId}.`);
+    setPhase('running');
+    runKindWatch(match.workflowId, snapshot);
+  }, [kindSnapshot, kindQuote, clearKindQuote, runKindWatch]);
+
+  /** The trainer checked their Civitai trainings: pricing re-opens on both paths. */
+  const onAckUnconfirmed = useCallback(() => {
+    if (kindPhaseRef.current !== 'unconfirmed') return;
+    runBaselineRef.current = null;
+    setFindResult(null);
+    setKindError(null);
+    clearKindQuote();
+    setKindPhase('idle');
+  }, [clearKindQuote]);
+
   const onSaveItemClick = useCallback(
     async (item: Pick<DatasetItem, 'imageId' | 'imageUrl'>, position: number) => {
       const filename = `open-datasets-${String(position).padStart(2, '0')}`;
@@ -725,7 +833,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
   /** Pass-through: freeze the snapshot, pair the uploads with it, and price the step. */
   const doEstimate = useCallback(async () => {
-    if (trainDisabledReason || !uploads) return;
+    if (trainDisabledReason || !uploads || kindPhaseRef.current === 'unconfirmed') return;
     setNotice(null);
     setRunError(null);
     setQuoteError(null);
@@ -819,6 +927,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
   const onSubmitClick = useCallback(async () => {
     if (!passSnapshot || !passBody || quote == null || phase !== 'quoted') return;
+    if (kindPhaseRef.current === 'unconfirmed') return;
     if (afford === false) return; // the confirm card already says why
     const snapshot = passSnapshot;
     // The frozen snapshot is the contributors' pay-split contract. Persist it
@@ -1335,7 +1444,45 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
           {kindPhase === 'unconfirmed' && (
             <Alert color="error" title="Training submission unconfirmed" data-testid="dc-kind-unconfirmed">
-              {kindError}
+              {kindError} Pricing is paused on both paths so the same uploads are not charged twice.
+              {kindSnapshot && (
+                <span style={monoStyle} data-testid="dc-kind-unconfirmed-snapshot">
+                  {' '}
+                  Snapshot {kindSnapshot.snapshotId} was recorded before the run was sent.
+                </span>
+              )}
+              {runBaselineRef.current ? (
+                <span>
+                  {' '}
+                  <Button
+                    size="sm"
+                    variant="light"
+                    loading={findingRun}
+                    onClick={() => void onFindRunClick()}
+                    data-testid="dc-kind-find-run"
+                  >
+                    Find my run
+                  </Button>
+                </span>
+              ) : (
+                <span>
+                  {' '}
+                  This app could not look the run up for you. If it appears in your Civitai trainings,
+                  its credit for this snapshot's contributors is not recorded here automatically.
+                </span>
+              )}
+              {findResult && (
+                <span style={hintStyle} data-testid="dc-kind-find-result">
+                  {' '}
+                  {findResult}
+                </span>
+              )}
+              <span>
+                {' '}
+                <Button size="sm" variant="subtle" onClick={onAckUnconfirmed} data-testid="dc-kind-ack">
+                  I checked my Civitai trainings — let me price again
+                </Button>
+              </span>
             </Alert>
           )}
 

@@ -39,6 +39,66 @@ import {
 } from '@civitai/app-sdk/blocks';
 
 // ---------------------------------------------------------------------------
+// Finding an unconfirmed run in the app's own queue
+// ---------------------------------------------------------------------------
+
+/** The fields of a `useAppWorkflows()` row the run lookup reads. */
+export interface AppQueueRow {
+  workflowId: string;
+  cost: number | null;
+  createdAt: string;
+}
+
+/** The app queue as read just BEFORE Civitai's training dialog opened. */
+export interface AppQueueBaseline {
+  workflowIds: ReadonlySet<string>;
+  /** Newest `createdAt` in the baseline (server clock), or null when it was empty. */
+  newestCreatedAt: string | null;
+}
+
+export function appQueueBaseline(rows: readonly AppQueueRow[]): AppQueueBaseline {
+  let newest: string | null = null;
+  for (const row of rows) {
+    if (newest == null || Date.parse(row.createdAt) > Date.parse(newest)) newest = row.createdAt;
+  }
+  return { workflowIds: new Set(rows.map((r) => r.workflowId)), newestCreatedAt: newest };
+}
+
+export type UnconfirmedRunMatch =
+  | { kind: 'found'; workflowId: string }
+  | { kind: 'none' }
+  | { kind: 'ambiguous'; workflowIds: string[] };
+
+/**
+ * Which workflow, if any, an unconfirmed `kind: 'training'` run became.
+ *
+ * The app cannot tag its runs or read their type (the host forces the tags and
+ * `AppWorkflow` carries none), so this is a diff, never a guess: a candidate is a
+ * row of the app's own queue that was NOT there just before Civitai's dialog
+ * opened, was created no earlier than the baseline's newest row (both on the
+ * server's clock), is not already linked elsewhere, and is priced at or below
+ * the quote (the server charges its re-quote, which may only be lower) or not
+ * priced yet. Exactly one candidate is the run; none or several links nothing.
+ */
+export function matchUnconfirmedRun(args: {
+  baseline: AppQueueBaseline;
+  current: readonly AppQueueRow[];
+  quoteTotal: number;
+  excludeWorkflowIds?: ReadonlySet<string>;
+}): UnconfirmedRunMatch {
+  const after = args.baseline.newestCreatedAt == null ? null : Date.parse(args.baseline.newestCreatedAt);
+  const candidates = args.current.filter((row) => {
+    if (args.baseline.workflowIds.has(row.workflowId)) return false;
+    if (args.excludeWorkflowIds?.has(row.workflowId)) return false;
+    if (after != null && !(Date.parse(row.createdAt) >= after)) return false;
+    return row.cost == null || (row.cost > 0 && row.cost <= args.quoteTotal);
+  });
+  if (candidates.length === 1) return { kind: 'found', workflowId: candidates[0]!.workflowId };
+  if (candidates.length === 0) return { kind: 'none' };
+  return { kind: 'ambiguous', workflowIds: candidates.map((c) => c.workflowId) };
+}
+
+// ---------------------------------------------------------------------------
 // Dataset items + uploads
 // ---------------------------------------------------------------------------
 
@@ -105,7 +165,23 @@ export interface FreezeOptions {
   snapshotId?: string;
 }
 
-let snapshotSeq = 0;
+/**
+ * A snapshot id unique across page loads, trainers and datasets. Stored
+ * snapshots, LoRA records and ledger events all key on it, so an id another
+ * trainer already stored would link this run (and its fee) to THAT snapshot.
+ * (A per-page-load counter did exactly that: every first run was `snap_1`.)
+ * Older stored `snap_<n>` ids are only read, never minted again.
+ */
+export function mintSnapshotId(): string {
+  const c = (globalThis as { crypto?: Partial<Crypto> }).crypto;
+  if (typeof c?.randomUUID === 'function') return `snap_${c.randomUUID().replace(/-/g, '')}`;
+  if (typeof c?.getRandomValues === 'function') {
+    const bytes = c.getRandomValues(new Uint8Array(16));
+    return `snap_${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+  }
+  // No Web Crypto at all (not expected in the block iframe): time + randomness.
+  return `snap_${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+}
 
 /**
  * Freeze a snapshot (spec §7.2/§7.3):
@@ -167,9 +243,8 @@ export function freezeSnapshot(
     };
   });
   const totalWeight = snapshotItems.reduce((sum, i) => sum + (i.included ? i.weight : 0), 0);
-  if (!options.snapshotId) snapshotSeq += 1;
   return {
-    snapshotId: options.snapshotId ?? `snap_${snapshotSeq}`,
+    snapshotId: options.snapshotId || mintSnapshotId(),
     datasetId,
     trainerId,
     createdAt: options.now ?? new Date().toISOString(),

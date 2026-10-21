@@ -21,6 +21,9 @@
 //      host's failure snapshots carry a generic error, not the clamp text — so we
 //      rewrite a failed snapshot's error in place when a pool was picked.
 //
+// Plus one training knob: `trainedEpochsFor` gives trained epochs to a workflow
+// the mock did not submit itself (a run found after an unconfirmed submit).
+//
 // In PRODUCTION the real civitai host answers all of this natively, so none of
 // this ships.
 //
@@ -86,6 +89,13 @@ export interface MockMoneyHostOptions extends MockHostOptions {
   balanceError?: boolean;
   /** Rewrite a failed submit that named a pool into the domain-clamp rejection. */
   rejectAccount?: boolean;
+  /**
+   * Trained epochs for workflows this mock did NOT submit (e.g. a run found in
+   * the app queue after an unconfirmed submit). The SDK mock attaches epochs only
+   * to a training body it submitted itself, so its succeeded snapshot for any
+   * other id has none; this adds `count` epochs to those ids' succeeded replies.
+   */
+  trainedEpochsFor?: Readonly<Record<string, number>>;
 }
 
 /** `uninstall()`, plus the SDK mock host's live `setScenario` for mid-test changes. */
@@ -104,27 +114,37 @@ export type MockMoneyHostHandle = (() => void) & {
  * native `buzzBalance` / `viewer` options straight through (no shim needed).
  */
 export function installMockMoneyHost(options: MockMoneyHostOptions = {}): MockMoneyHostHandle {
-  const { balanceError, rejectAccount, onOutbound, ...hostOptions } = options;
+  const { balanceError, rejectAccount, trainedEpochsFor, onOutbound, ...hostOptions } = options;
 
   // Tracks whether the block's last submit named a pool — gates the disallowed
   // rewrite so only a picked-pool failure becomes the domain-clamp rejection.
   let pickedPool = false;
 
-  // Inbound: rewrite a failed snapshot's error into the domain-clamp rejection.
+  // Inbound: rewrite a failed snapshot's error into the domain-clamp rejection,
+  // and add `trainedEpochsFor` epochs to those ids' succeeded snapshots.
   // Registered BEFORE the transport (see the DOM ordering note above) so it
   // mutates the snapshot before the transport reads it.
-  const rewriteDisallowed = (event: MessageEvent) => {
+  const rewriteInbound = (event: MessageEvent) => {
     const data = event.data as
-      | { type?: string; payload?: { snapshot?: { status?: string; error?: string } } }
+      | {
+          type?: string;
+          payload?: {
+            snapshot?: { workflowId?: string; status?: string; error?: string; trainedEpochs?: unknown };
+          };
+        }
       | null
       | undefined;
     if (!data || (data.type !== 'WORKFLOW_STATUS' && data.type !== 'WORKFLOW_SUBMITTED')) return;
     const snap = data.payload?.snapshot;
+    const epochs = snap?.workflowId != null ? trainedEpochsFor?.[snap.workflowId] : undefined;
+    if (snap && epochs && snap.status === 'succeeded' && snap.trainedEpochs == null) {
+      snap.trainedEpochs = Array.from({ length: epochs }, (_, i) => ({ $type: 'training', epochNumber: i + 1 }));
+    }
     if (rejectAccount && snap?.status === 'failed' && pickedPool && snap.error != null) {
       snap.error = DISALLOWED_ACCOUNT_ERROR;
     }
   };
-  window.addEventListener('message', rewriteDisallowed);
+  window.addEventListener('message', rewriteInbound);
   // Re-create the transport AFTER the rewriter so the rewriter's listener is
   // earlier in registration order than the transport's.
   resetHarnessTransport();
@@ -160,7 +180,7 @@ export function installMockMoneyHost(options: MockMoneyHostOptions = {}): MockMo
 
   const uninstall = () => {
     uninstallHost();
-    window.removeEventListener('message', rewriteDisallowed);
+    window.removeEventListener('message', rewriteInbound);
   };
   return Object.assign(uninstall, { setScenario: host.setScenario });
 }

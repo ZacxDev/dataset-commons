@@ -764,6 +764,44 @@ export const removalDoc = (record: ItemRemovalRecord) => withoutStorageKey(recor
 export const snapshotDoc = (snapshot: DatasetSnapshot) => snapshot;
 export const ledgerDoc = (event: LedgerEvent) => event;
 
+/** Same frozen record: the id AND what it froze (dataset, trainer, time, items, weights). */
+function sameFrozenSnapshot(a: DatasetSnapshot, b: DatasetSnapshot): boolean {
+  if (
+    a.snapshotId !== b.snapshotId ||
+    a.datasetId !== b.datasetId ||
+    a.trainerId !== b.trainerId ||
+    a.createdAt !== b.createdAt ||
+    a.totalWeight !== b.totalWeight ||
+    a.items.length !== b.items.length
+  ) {
+    return false;
+  }
+  return a.items.every((item, i) => {
+    const other = b.items[i]!;
+    return (
+      item.itemId === other.itemId &&
+      item.contributorId === other.contributorId &&
+      item.weight === other.weight &&
+      item.included === other.included
+    );
+  });
+}
+
+/**
+ * Whether persisting `snapshot` must create it, may skip it (this exact frozen
+ * snapshot is already stored — a re-click), or must refuse: a stored snapshot
+ * with the same id that froze something else would otherwise be silently
+ * adopted, and this run's fee split across ITS contributors.
+ */
+export function snapshotPersistAction(
+  stored: readonly DatasetSnapshot[],
+  snapshot: DatasetSnapshot,
+): 'create' | 'already-stored' | 'conflict' {
+  const sameId = stored.filter((s) => s.snapshotId === snapshot.snapshotId);
+  if (sameId.length === 0) return 'create';
+  return sameId.every((s) => sameFrozenSnapshot(s, snapshot)) ? 'already-stored' : 'conflict';
+}
+
 /** One seed document: who writes it, where, and which viewers vote on it. */
 export interface CommunitySeedDoc {
   collection: CommunityCollection;
