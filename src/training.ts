@@ -1107,16 +1107,92 @@ export function trainingStateForSnapshot(
  * was polled. A real snapshot of the run, terminal or not, always carries the
  * run's own id. So the discriminator is structural — a reply whose `workflowId`
  * is not the polled id is not this run's verdict — and never the error text.
+ *
+ * That comparison only holds while the POLLED id is a real workflow id. Polling a
+ * sentinel makes the host's own failure reply (`'failed'`) and its rate-limit
+ * placeholder (which echoes the polled id with `status: 'processing'`) match it,
+ * so a sentinel polled id is never trusted: every reply to it is a host failure.
  */
 export function isHostPollFailure(
   snapshot: Pick<BlockWorkflowSnapshot, 'workflowId'>,
   polledWorkflowId: string,
 ): boolean {
-  return snapshot.workflowId !== polledWorkflowId;
+  return isHostSentinelWorkflowId(polledWorkflowId) || snapshot.workflowId !== polledWorkflowId;
+}
+
+/**
+ * The ids the host stamps on a reply that is NOT a workflow (civitai, read at
+ * dd6d276934): `'failed'` — `failureSnapshot(err)` and every refusal
+ * `blocks.submitWorkflow` resolves (spend caps, per-call budget) — and `'whatif'`
+ * — `snapshotFromWorkflow`'s `workflow.id ?? 'whatif'` when the orchestrator
+ * returned no id. The server itself skips persistence and spend attribution for
+ * exactly these two. `''` is included because the SDK drops such a reply anyway
+ * and it names nothing. None of these can be polled, so none may become a run.
+ */
+export const HOST_SENTINEL_WORKFLOW_IDS: ReadonlySet<string> = new Set(['failed', 'whatif', '']);
+
+export function isHostSentinelWorkflowId(workflowId: string): boolean {
+  return HOST_SENTINEL_WORKFLOW_IDS.has(workflowId);
 }
 
 /** Upper bound on the wait between re-polls while the host cannot answer. */
 export const LOST_CONTACT_MAX_BACKOFF_MS = 60_000;
+
+/**
+ * How long the host may go without answering — measured from the first failure of
+ * the current streak, not by attempts — before the page stops checking on its own.
+ * A host failure reply cannot say whether it is temporary (an expired token) or
+ * permanent (consent revoked, App Blocks switched off, a moderation refusal), so
+ * past this the page stops and leaves the trainer a Check again.
+ */
+export const LOST_CONTACT_GIVE_UP_MS = 5 * 60_000;
+
+/**
+ * The retry after the poll made as the tab comes back into view. The host re-mints
+ * its block token on that same visibility change, asynchronously, so the immediate
+ * poll can still carry the lapsed token; this second look catches the fresh one.
+ */
+export const VISIBLE_RETRY_MS = 1500;
+
+/** One continuous run of polls the host could not answer. */
+export interface LostContactStreak {
+  /** Consecutive unanswered polls (drives the backoff). */
+  failures: number;
+  /** `Date.now()` at the streak's first failure; null when there is no streak. */
+  since: number | null;
+  /** The next failure retries after {@link VISIBLE_RETRY_MS} instead of the backoff. */
+  visibleRetry: boolean;
+}
+
+export const NO_LOST_CONTACT: LostContactStreak = { failures: 0, since: null, visibleRetry: false };
+
+/**
+ * Record one unanswered poll at `now`: the updated streak, and either the wait
+ * before the next re-poll or `giveUp` once the streak has lasted
+ * {@link LOST_CONTACT_GIVE_UP_MS}.
+ */
+export function recordLostContact(
+  streak: LostContactStreak,
+  now: number,
+): { streak: LostContactStreak; giveUp: boolean; delayMs: number } {
+  const failures = streak.failures + 1;
+  const since = streak.since ?? now;
+  const delayMs = streak.visibleRetry ? VISIBLE_RETRY_MS : lostContactBackoffMs(failures);
+  return {
+    streak: { failures, since, visibleRetry: false },
+    giveUp: now - since >= LOST_CONTACT_GIVE_UP_MS,
+    delayMs,
+  };
+}
+
+/**
+ * The tab came back into view: restart the backoff (the host is about to hold a
+ * fresh token) and retry quickly once if the immediate poll still fails. The
+ * streak's start is kept — coming back into view is not an answer from the host.
+ */
+export function lostContactOnVisible(streak: LostContactStreak): LostContactStreak {
+  return { failures: 0, since: streak.since, visibleRetry: true };
+}
 
 /**
  * Wait before the next re-poll after `failures` consecutive unanswered polls

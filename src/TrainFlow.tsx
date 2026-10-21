@@ -46,10 +46,13 @@ import {
   freezeSnapshot,
   includedItems,
   isHostPollFailure,
+  isHostSentinelWorkflowId,
   latestEpoch,
   linkedLoraFromSnapshot,
-  lostContactBackoffMs,
+  lostContactOnVisible,
   matchUnconfirmedRun,
+  NO_LOST_CONTACT,
+  recordLostContact,
   pairUploadsWithSnapshot,
   passThroughAvailable,
   trainingFailureCopy,
@@ -62,6 +65,7 @@ import {
   type DatasetItem,
   type DatasetSnapshot,
   type LedgerEvent,
+  type LostContactStreak,
   type TrainingDataSource,
   type TrainingPreset,
   type TrainingRunState,
@@ -280,9 +284,18 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   /**
    * Set while the host cannot answer this run's status (a token / transport
    * error, see isHostPollFailure): what it said, or '' when it said nothing.
-   * Never a run outcome — the run stays tracked and is re-polled with backoff.
+   * Never a run outcome — the run stays tracked and is re-polled with backoff
+   * (until contactStopped). Cleared by a real answer, a new estimate or a new run.
    */
   const [contactLost, setContactLost] = useState<string | null>(null);
+  /**
+   * The host has not answered for LOST_CONTACT_GIVE_UP_MS: automatic checking has
+   * stopped (pricing unlocks), the run stays tracked, and Check again resumes it.
+   */
+  const [contactStopped, setContactStopped] = useState(false);
+  /** The current unanswered-poll streak, shared by both run paths. */
+  const streakRef = useRef<LostContactStreak>(NO_LOST_CONTACT);
+  const mountedRef = useRef(true);
 
   const consentPendingRef = useRef(false);
   /**
@@ -311,7 +324,9 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   const effectiveOwnerOverrides = props.canOwnerOverride === false ? EMPTY_ID_SET : ownerOverrides;
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (pollCancelRef.current) pollCancelRef.current.cancelled = true;
       kindWatchAbortRef.current?.abort();
       if (wakeRef.current) clearTimeout(wakeRef.current.timer);
@@ -321,7 +336,10 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
   // Back in view: check the tracked run now. Long runs are normally watched
   // from a background tab, where timers are throttled and the host lets the
-  // block token lapse (it re-mints on this same event).
+  // block token lapse. The host re-mints it on this same event, asynchronously,
+  // so this poll can still carry the lapsed token: the backoff restarts and, if
+  // it fails, the next poll is VISIBLE_RETRY_MS away (via the same single wake
+  // timer every re-poll uses), not a full lost-contact backoff.
   useEffect(() => {
     if (typeof document === 'undefined') return;
     const onVisible = () => {
@@ -330,6 +348,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       if (!wake) return;
       clearTimeout(wake.timer);
       wakeRef.current = null;
+      streakRef.current = lostContactOnVisible(streakRef.current);
       wake.run();
     };
     document.addEventListener('visibilitychange', onVisible);
@@ -348,6 +367,36 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     };
     wakeRef.current = entry;
   }, []);
+
+  /** A real answer about the run (or a fresh start): the lost-contact streak is over. */
+  const resetContact = useCallback(() => {
+    streakRef.current = NO_LOST_CONTACT;
+    setContactLost(null);
+    setContactStopped(false);
+  }, []);
+
+  /**
+   * The host could not answer a poll of the tracked run (either path). The run is
+   * NOT over: re-poll via `retry` after the bounded backoff — until the streak has
+   * lasted LOST_CONTACT_GIVE_UP_MS, then stop checking on its own, unlock the page
+   * and leave the run tracked for Check again.
+   */
+  const onLostContact = useCallback(
+    (detail: string, retry: () => void) => {
+      const next = recordLostContact(streakRef.current, Date.now());
+      streakRef.current = next.streak;
+      setContactLost(detail);
+      if (next.giveUp) {
+        if (wakeRef.current) clearTimeout(wakeRef.current.timer);
+        wakeRef.current = null;
+        setContactStopped(true);
+        setPhase('idle');
+        return;
+      }
+      scheduleWake(retry, next.delayMs);
+    },
+    [scheduleWake],
+  );
 
   // Any edit to the dataset, config or uploads invalidates a standing
   // pass-through quote — the price was quoted for THAT body, not for whatever
@@ -510,14 +559,9 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       const tok = { cancelled: false };
       pollCancelRef.current = tok;
       let attempt = 0;
-      let unanswered = 0;
       // The host could not answer (thrown, or its failure-shape reply): the run
-      // is NOT over. Keep it tracked and re-poll with a bounded backoff.
-      const lostContact = (detail: string) => {
-        unanswered += 1;
-        setContactLost(detail);
-        scheduleWake(() => void tick(), lostContactBackoffMs(unanswered));
-      };
+      // is NOT over. Keep it tracked and re-poll (see onLostContact).
+      const lostContact = (detail: string) => onLostContact(detail, () => void tick());
       const tick = async () => {
         if (tok.cancelled) return;
         let snap: BlockWorkflowSnapshot;
@@ -533,8 +577,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           lostContact(snap.error ?? '');
           return;
         }
-        unanswered = 0;
-        setContactLost(null);
+        resetContact();
         applyTrainingSnapshot(snap, snapshot);
         // Stop at terminal, at ready-to-publish (epochs listed), or once the
         // publish outcome is visible — the user drives the wizard from here.
@@ -555,11 +598,11 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       };
       scheduleWake(() => void tick(), 0);
     },
-    [applyTrainingSnapshot, scheduleWake],
+    [applyTrainingSnapshot, scheduleWake, onLostContact, resetContact],
   );
 
   const runKindWatch = useCallback(
-    (id: string, snapshot: DatasetSnapshot, unanswered = 0) => {
+    (id: string, snapshot: DatasetSnapshot) => {
       kindWatchAbortRef.current?.abort();
       if (wakeRef.current) clearTimeout(wakeRef.current.timer);
       wakeRef.current = null;
@@ -567,18 +610,15 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       kindWatchAbortRef.current = controller;
       // The host could not answer: SDK `watch` ends on the host's failure-shape
       // reply (its `status: 'failed'` is terminal to it) or rejects after a few
-      // thrown polls. Neither is the run ending — re-arm with a bounded backoff.
-      const lostContact = (detail: string) => {
-        const failures = unanswered + 1;
-        setContactLost(detail);
-        scheduleWake(() => runKindWatch(id, snapshot, failures), lostContactBackoffMs(failures));
-      };
+      // thrown polls. Neither is the run ending — re-arm (see onLostContact).
+      const lostContact = (detail: string) => onLostContact(detail, () => runKindWatch(id, snapshot));
       void watchRef
         .current(id, {
           signal: controller.signal,
           onUpdate: (snap) => {
             if (controller.signal.aborted || isHostPollFailure(snap, id)) return;
-            setContactLost(null);
+            // A real answer ends the lost-contact streak, backoff included.
+            resetContact();
             applyTrainingSnapshot(snap, snapshot);
           },
         })
@@ -588,7 +628,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
             lostContact(finalSnap.error ?? '');
             return;
           }
-          setContactLost(null);
+          resetContact();
           applyTrainingSnapshot(finalSnap, snapshot);
           if (trainingStateForSnapshot(finalSnap) === 'running') {
             // `watch` resolved on its own 10-minute budget while the run is
@@ -604,37 +644,49 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           lostContact(err instanceof Error ? err.message : '');
         });
     },
-    [applyTrainingSnapshot, scheduleWake],
+    [applyTrainingSnapshot, onLostContact, resetContact],
   );
 
   /**
    * One manual re-poll — for the moderation wait and the post-wizard return.
    * Records against the snapshot the run was SUBMITTED with (activeRun), so a
    * quote priced since, or an edit that cleared it, cannot redirect the credit.
+   * After automatic checking stopped (contactStopped) it restarts tracking
+   * instead, with a fresh lost-contact streak.
    */
   const refreshRun = useCallback(async () => {
     const run = activeRun;
     if (!run) return;
+    if (contactStopped) {
+      resetContact();
+      setPhase('running');
+      if (run.path === 'civitai-trainer') runKindWatch(run.workflowId, run.snapshot);
+      else runPollLoop(run.workflowId, run.snapshot);
+      return;
+    }
     let snap: BlockWorkflowSnapshot;
     try {
       snap = await pollRef.current(run.workflowId);
     } catch (err) {
+      if (!mountedRef.current) return;
       setContactLost(err instanceof Error ? err.message : '');
       return;
     }
+    // TrainFlow unmounted while this was in flight: start nothing.
+    if (!mountedRef.current) return;
     // The host's failure-shape reply is not this run's status: the run keeps
     // whatever state it had, and stays tracked.
     if (isHostPollFailure(snap, run.workflowId)) {
       setContactLost(snap.error ?? '');
       return;
     }
-    setContactLost(null);
+    resetContact();
     applyTrainingSnapshot(snap, run.snapshot);
     if (trainingStateForSnapshot(snap) === 'running') {
       if (run.path === 'civitai-trainer') runKindWatch(run.workflowId, run.snapshot);
       else runPollLoop(run.workflowId, run.snapshot);
     }
-  }, [activeRun, applyTrainingSnapshot, runPollLoop, runKindWatch]);
+  }, [activeRun, contactStopped, applyTrainingSnapshot, runPollLoop, runKindWatch, resetContact]);
 
   const clearKindQuote = useCallback(() => {
     kindRequestRef.current += 1;
@@ -674,6 +726,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     const request = ++kindRequestRef.current;
     setNotice(null);
     setRunError(null);
+    resetContact();
     setKindError(null);
     setKindQuote(null);
     setKindBody(null);
@@ -737,6 +790,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     epochs,
     samplePrompt,
     estimate,
+    resetContact,
   ]);
 
   // Auto-resume a Civitai-trainer estimate after the spend-scope grant lands.
@@ -797,6 +851,19 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
     try {
       const started = await runTraining({ ...kindBody, quoteId: kindQuote.quoteId });
+      if (isHostSentinelWorkflowId(started.workflowId)) {
+        // Resolved without a run id this page can follow (e.g. 'whatif'): a run
+        // MAY exist and be charged, so it is handled as unconfirmed — never
+        // tracked under a sentinel id, never retried.
+        setPhase('idle');
+        setKindPhase('unconfirmed');
+        setKindError(
+          "Civitai answered without a run id this page can follow, so it can't tell whether the training started. Check your Civitai trainings before training again — Buzz may have been spent.",
+        );
+        setFindResult(null);
+        return;
+      }
+      resetContact();
       setActiveRun({ workflowId: started.workflowId, snapshot: kindSnapshot, path: 'civitai-trainer' });
       applyTrainingSnapshot(started, kindSnapshot);
       const state = trainingStateForSnapshot(started);
@@ -849,7 +916,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           setKindError(failure.message);
       }
     }
-  }, [kindBody, kindQuote, kindSnapshot, kindPhase, kindAfford, clearKindQuote, runTraining, applyTrainingSnapshot, runKindWatch, requestSignIn]);
+  }, [kindBody, kindQuote, kindSnapshot, kindPhase, kindAfford, clearKindQuote, runTraining, applyTrainingSnapshot, runKindWatch, requestSignIn, resetContact]);
 
   /**
    * "Find my run" on an unconfirmed run: if exactly one workflow is new in this
@@ -891,6 +958,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       return;
     }
     const snapshot = kindSnapshot;
+    resetContact();
     setActiveRun({ workflowId: match.workflowId, snapshot, path: 'civitai-trainer' });
     setKindError(null);
     setFindResult(null);
@@ -899,7 +967,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     setNotice(`Found your run and linked it to snapshot ${snapshot.snapshotId}.`);
     setPhase('running');
     runKindWatch(match.workflowId, snapshot);
-  }, [kindSnapshot, kindQuote, clearKindQuote, runKindWatch]);
+  }, [kindSnapshot, kindQuote, clearKindQuote, runKindWatch, resetContact]);
 
   /** The trainer checked their Civitai trainings: pricing re-opens on both paths. */
   const onAckUnconfirmed = useCallback(() => {
@@ -930,6 +998,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     setNotice(null);
     setRunError(null);
     setQuoteError(null);
+    resetContact();
     setPhase('estimating');
     const snapshot = freezeSnapshot(datasetIdForTraining, props.trainerId ?? viewer?.username ?? 'you', items, {
       manualExclusions,
@@ -994,7 +1063,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       setPassSnapshot(null);
       setPhase('unquoted');
     }
-  }, [trainDisabledReason, uploads, uploadAssignment, items, manualExclusions, effectiveOwnerOverrides, viewer, preset, triggerWord, steps, epochs, samplePrompt, estimate, datasetIdForTraining, props.trainerId]);
+  }, [trainDisabledReason, uploads, uploadAssignment, items, manualExclusions, effectiveOwnerOverrides, viewer, preset, triggerWord, steps, epochs, samplePrompt, estimate, datasetIdForTraining, props.trainerId, resetContact]);
 
   // Auto-resume the estimate after a consent grant lands.
   useEffect(() => {
@@ -1038,8 +1107,25 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       }
     }
     setPhase('submitting');
+    resetContact();
     try {
       const snap = await submit(passBody);
+      if (isHostSentinelWorkflowId(snap.workflowId)) {
+        // Not a run: nothing behind a host sentinel id can be polled, so it never
+        // becomes the active run (no Check again, no polling of 'failed').
+        setActiveRun(null);
+        setPhase('idle');
+        if (snap.status === 'failed') {
+          // A spend-cap / budget refusal: show its reason and the price it refused.
+          applyTrainingSnapshot(snap, snapshot);
+        } else {
+          setRunState(null);
+          setNotice(
+            "Civitai accepted the run but returned no run id this page can follow, so it isn't tracked here. Check your Civitai trainings before training again — Buzz may have been spent.",
+          );
+        }
+        return;
+      }
       setActiveRun({ workflowId: snap.workflowId, snapshot, path: 'pass-through' });
       applyTrainingSnapshot(snap, snapshot);
       if (snap.status === 'pending' || snap.status === 'processing') {
@@ -1053,7 +1139,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       setRunState('failed');
       setRunError(err instanceof Error ? err.message : 'Submit failed.');
     }
-  }, [passSnapshot, passBody, quote, phase, afford, submit, applyTrainingSnapshot, runPollLoop]);
+  }, [passSnapshot, passBody, quote, phase, afford, submit, applyTrainingSnapshot, runPollLoop, resetContact]);
 
   const onPublishClick = useCallback(() => {
     if (!activeRun || epoch == null) return;
@@ -1098,10 +1184,16 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
   const failureCopy = runState ? trainingFailureCopy(runState, runError) : null;
   /**
-   * A trainer can always ask again about a run that has not both succeeded and
-   * had its trainer-fee credit recorded — after a failure display included — so
-   * no state this page shows is a dead end. (The publish states keep their own
-   * "Refresh publish status".)
+   * Check again is offered for the tracked run (activeRun) — while it is being
+   * checked automatically, after automatic checking stopped, and after a failure
+   * display — until its trainer-fee credit is recorded (runEvent) or it reaches a
+   * publish state (which keeps its own "Refresh publish status").
+   *
+   * It relies on activeRun only ever naming a real workflow: onSubmitClick and
+   * onKindRunClick never set it from a reply carrying a host sentinel id
+   * (isHostSentinelWorkflowId), and Find my run takes ids from this app's queue,
+   * which the host never writes a sentinel to. So a refused submit — no run —
+   * shows its refusal with no Check again.
    */
   const canCheckAgain =
     activeRun != null &&
@@ -1658,9 +1750,11 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
           {contactLost != null && (
             <Alert color="warning" title="Lost contact with Civitai" data-testid="dc-lost-contact">
-              {phase === 'running'
-                ? 'Lost contact with Civitai — still checking… '
-                : "Lost contact with Civitai — this run couldn't be checked just now. "}
+              {contactStopped
+                ? 'Civitai stopped answering, so this page stopped checking this run on its own after about 5 minutes. Use Check again to resume. '
+                : phase === 'running'
+                  ? 'Lost contact with Civitai — still checking… '
+                  : "Lost contact with Civitai — this run couldn't be checked just now. "}
               This page could not read the run's status; that says nothing about the run itself,
               which stays tracked here.
               {contactLost && (

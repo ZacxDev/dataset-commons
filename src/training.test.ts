@@ -19,7 +19,11 @@ import {
   contributorShares,
   creditLedgerEvent,
   isHostPollFailure,
+  isHostSentinelWorkflowId,
   lostContactBackoffMs,
+  lostContactOnVisible,
+  NO_LOST_CONTACT,
+  recordLostContact,
   dataSourceLabel,
   dataSourceOf,
   describeEstimateFailure,
@@ -894,5 +898,56 @@ describe('host poll failure vs the run failing', () => {
     expect(lostContactBackoffMs(7)).toBe(60000);
     expect(lostContactBackoffMs(500)).toBe(60000);
     expect(lostContactBackoffMs(0)).toBe(1000);
+  });
+
+  it("a polled HOST SENTINEL id is never trusted — not even when the reply echoes it", () => {
+    // The host's own failure reply to a poll of 'failed' carries 'failed'.
+    expect(isHostPollFailure(hostRefusal, 'failed')).toBe(true);
+    // The host's rate-limit placeholder echoes the polled id, status 'processing'.
+    const placeholder = (workflowId: string) => ({ workflowId, status: 'processing' as const });
+    expect(isHostPollFailure(placeholder('failed'), 'failed')).toBe(true);
+    expect(isHostPollFailure(placeholder('whatif'), 'whatif')).toBe(true);
+    expect(isHostPollFailure({ workflowId: '' }, '')).toBe(true);
+  });
+
+  it('the host sentinel ids are exactly failed, whatif and empty — a real id is not one', () => {
+    expect(['failed', 'whatif', ''].map(isHostSentinelWorkflowId)).toEqual([true, true, true]);
+    expect(isHostSentinelWorkflowId('8753561-20261021150732359-b7wf')).toBe(false);
+    expect(isHostSentinelWorkflowId('Failed')).toBe(false);
+  });
+});
+
+describe('lost-contact streak', () => {
+  const T0 = 1_700_000_123_457; // not a round number, so `since` cannot be a constant
+
+  it('backs off by consecutive failures and measures the streak from its first failure', () => {
+    let s = NO_LOST_CONTACT;
+    const delays: number[] = [];
+    for (const at of [0, 1000, 3000, 7000]) {
+      const r = recordLostContact(s, T0 + at);
+      s = r.streak;
+      delays.push(r.delayMs);
+      expect(r.giveUp).toBe(false);
+    }
+    expect(delays).toEqual([1000, 2000, 4000, 8000]);
+    expect(s).toEqual({ failures: 4, since: T0, visibleRetry: false });
+  });
+
+  it('gives up at 5 minutes since the first failure, not by attempt count', () => {
+    const first = recordLostContact(NO_LOST_CONTACT, T0).streak;
+    expect(recordLostContact(first, T0 + 5 * 60_000 - 1).giveUp).toBe(false);
+    expect(recordLostContact(first, T0 + 5 * 60_000).giveUp).toBe(true);
+    // Many failures inside 5 minutes never give up.
+    expect(recordLostContact({ failures: 400, since: T0, visibleRetry: false }, T0 + 60_000).giveUp).toBe(false);
+  });
+
+  it('coming into view restarts the backoff and retries after 1.5s once, keeping the streak start', () => {
+    const deep = { failures: 9, since: T0, visibleRetry: false };
+    const visible = lostContactOnVisible(deep);
+    expect(visible).toEqual({ failures: 0, since: T0, visibleRetry: true });
+    const r1 = recordLostContact(visible, T0 + 130_000);
+    expect(r1.delayMs).toBe(1500);
+    expect(r1.streak).toEqual({ failures: 1, since: T0, visibleRetry: false });
+    expect(recordLostContact(r1.streak, T0 + 131_500).delayMs).toBe(2000);
   });
 });

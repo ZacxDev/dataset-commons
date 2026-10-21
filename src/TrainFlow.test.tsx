@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { PAGE_BUZZ_BUDGET } from './generation.js';
 import { TrainFlow, type TrainFlowProps, type TrainRunLink } from './TrainFlow.js';
@@ -94,6 +94,7 @@ describe('TrainFlow (Option A′)', () => {
   afterEach(() => {
     uninstall?.();
     uninstall = undefined;
+    vi.useRealTimers();
   });
 
   it('snapshot review: net-positive items in with frozen weights, shares shown', async () => {
@@ -1287,23 +1288,226 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
   });
 
-  it('coming back into view re-polls at once instead of waiting out the backoff', async () => {
+  // --- Fake-timer tests: real time still flows (`shouldAdvanceTime`), so the SDK
+  // transport and testing-library behave as usual, and `advance` jumps the clock
+  // (Date included) to cover minutes of backoff in milliseconds.
+
+  function useFakeClock() {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    return userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  }
+
+  const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
+
+  async function startPassThroughRun(
+    user: ReturnType<typeof userEvent.setup>,
+    extra: Parameters<typeof installMockMoneyHost>[0] = {},
+  ) {
+    const t = trackingHost(extra);
+    await renderTrainFlow(t.props);
+    await uploadAndAttest(user);
+    await user.click(screen.getByTestId('dc-estimate'));
+    await user.click(await screen.findByTestId('dc-confirm-submit'));
+    await waitFor(() => expect(t.polls.length).toBeGreaterThan(0), { timeout: 5000 });
+    return t;
+  }
+
+  async function startKindRun(user: ReturnType<typeof userEvent.setup>) {
+    const t = trackingHost();
+    await renderTrainFlow(t.props);
+    await uploadAndPrice(user);
+    await user.click(await screen.findByTestId('dc-kind-run'));
+    await waitFor(() => expect(t.polls.length).toBeGreaterThan(0), { timeout: 5000 });
+    return t;
+  }
+
+  const STOPPED = /stopped checking this run on its own/;
+
+  it('coming back into view while the token is still stale recovers within seconds, not after the 60s backoff', async () => {
+    const user = useFakeClock();
+    const { host, polls } = await startPassThroughRun(user);
+
+    // Two minutes unanswered: the backoff is at its 60s cap.
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(125_000);
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent('still checking…');
+
+    // Back in view — the host has NOT re-minted yet, so the immediate poll fails.
+    const before = polls.length;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await advance(200);
+    expect(polls.length).toBe(before + 1);
+
+    // The fresh token lands shortly after; the run has finished meanwhile.
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    await advance(3000);
+    expect(screen.getByTestId('dc-publish')).toBeInTheDocument();
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+  }, 30000);
+
+  it('[INVARIANT GUARD] lost contact for under 5 minutes keeps checking and keeps pricing locked', async () => {
+    const user = useFakeClock();
+    const { host, polls } = await startPassThroughRun(user);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(4 * 60_000);
+    const at4 = polls.length;
+    await advance(60_000 + 500); // 4.5 → 5.0 min: still inside the window, one more 60s re-poll
+    expect(polls.length).toBeGreaterThan(at4);
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent('still checking…');
+    expect(screen.getByTestId('dc-lost-contact')).not.toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+  }, 30000);
+
+  it('pass-through: after 5 minutes without an answer it stops checking, unlocks pricing, and Check again resumes the run', async () => {
+    const user = useFakeClock();
+    const { host, polls, ledgerEvents } = await startPassThroughRun(user);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(6 * 60_000);
+
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-lost-contact-detail')).toHaveTextContent(TOKEN_ERROR);
+    expect(screen.getByTestId('dc-estimate')).toBeEnabled();
+    expect(screen.getByTestId('dc-check-again')).toBeInTheDocument();
+    expect(screen.queryByTestId('dc-run-failed')).not.toBeInTheDocument();
+    // Stopped means stopped: no re-poll in the next 3 minutes.
+    const settled = polls.length;
+    await advance(3 * 60_000);
+    expect(polls.length).toBe(settled);
+
+    // The run is still tracked: Check again picks it back up.
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    await user.click(screen.getByTestId('dc-check-again'));
+    await advance(2000);
+    expect(screen.getByTestId('dc-publish')).toBeInTheDocument();
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]!.sourceRef).toBe(polls[0]);
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+  }, 30000);
+
+  it("Civitai's trainer: after 5 minutes without an answer it stops checking, unlocks pricing, and Check again resumes the run", async () => {
+    const user = useFakeClock();
+    const { host, polls, ledgerEvents } = await startKindRun(user);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(6 * 60_000);
+
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-lost-contact-detail')).toHaveTextContent(TOKEN_ERROR);
+    expect(screen.getByTestId('dc-kind-estimate')).toBeEnabled();
+    expect(screen.getByTestId('dc-check-again')).toBeInTheDocument();
+    const settled = polls.length;
+    await advance(3 * 60_000);
+    expect(polls.length).toBe(settled);
+
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    await user.click(screen.getByTestId('dc-check-again'));
+    await advance(5000);
+    expect(screen.getByTestId('dc-publish')).toBeInTheDocument();
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]).toMatchObject({ eventType: 'training', grossBuzz: 725 });
+  }, 30000);
+
+  it('[INVARIANT GUARD] an answer inside the 5 minutes starts a new streak, so it does not stop at 5 minutes from the first failure', async () => {
+    const user = useFakeClock();
+    const { host, polls } = await startPassThroughRun(user);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(4 * 60_000);
+    // The host answers once (the next re-poll is at most 60s away).
+    host.setHostPollError(null);
+    await advance(65_000);
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+    // Then stops again — 9+ minutes after the FIRST streak began, 4 into this one.
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(4 * 60_000);
+    const at4 = polls.length;
+    await advance(60_000 + 500);
+    expect(polls.length).toBeGreaterThan(at4);
+    expect(screen.getByTestId('dc-lost-contact')).not.toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+  }, 30000);
+
+  it("Civitai's trainer: a real answer resets the backoff, so the next lost contact re-polls after 1s, not 60s", async () => {
+    const user = useFakeClock();
+    const { host, polls } = await startKindRun(user);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(125_000); // backoff at its 60s cap
+    host.setHostPollError(null);
+    await advance(65_000); // the capped re-poll lands and the watch gets real snapshots
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-run-state')).toHaveTextContent(/training/i);
+
+    host.setHostPollError(TOKEN_ERROR);
+    await waitFor(() => expect(screen.getByTestId('dc-lost-contact')).toBeInTheDocument(), { timeout: 10000 });
+    const atFailure = polls.length;
+    await advance(3500); // fresh streak: re-polls at +1s and +3s
+    expect(polls.length - atFailure).toBeGreaterThanOrEqual(2);
+  }, 30000);
+
+  it('a Check again still in flight when Train unmounts starts no tracking afterwards', async () => {
     const user = userEvent.setup();
-    const { host, polls, props } = trackingHost();
+    let unmountOnPoll = false;
+    let unmount: () => void = () => {};
+    const polled: string[] = [];
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+      cost: 512,
+      buzzBudget: PAGE_BUZZ_BUDGET,
+      pollsUntilDone: 1000,
+      buzzBalance: { blue: 5000, green: 0, yellow: 5000 },
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+      onOutbound: (m) => {
+        if (m.type !== 'POLL_WORKFLOW') return;
+        polled.push((m.payload as { workflowId: string }).workflowId);
+        // Unmount while this Check again poll is in flight (before its reply).
+        if (unmountOnPoll) {
+          unmountOnPoll = false;
+          unmount();
+        }
+      },
+    });
+    const view = render(
+      <TrainFlow initialItems={communityItems} datasetId="ds-own" trainerId="dev" allowLocalUploads={false} />,
+    );
+    unmount = view.unmount;
+    await screen.findByTestId('dc-train');
+    await uploadAndAttest(user);
+    await user.click(screen.getByTestId('dc-estimate'));
+    await user.click(await screen.findByTestId('dc-confirm-submit'));
+    await waitFor(() => expect(polled.length).toBeGreaterThan(0), { timeout: 5000 });
+
+    unmountOnPoll = true;
+    await user.click(screen.getByTestId('dc-check-again'));
+    expect(unmountOnPoll).toBe(false);
+    const atUnmount = polled.length;
+    await new Promise((r) => setTimeout(r, 4000));
+    expect(polled.length).toBe(atUnmount);
+  }, 15000);
+
+  it("a cap-refused pass-through submit keeps its refusal and price, polls nothing and offers no Check again", async () => {
+    const user = userEvent.setup();
+    const CAP = 'daily Buzz cap reached for this viewer';
+    const { host, polls, props } = trackingHost({ generation: { trainedEpochs: 10, submitCapRefusal: CAP } });
     await renderTrainFlow(props);
     await uploadAndAttest(user);
     await user.click(screen.getByTestId('dc-estimate'));
     await user.click(await screen.findByTestId('dc-confirm-submit'));
 
-    // Three unanswered polls (1s + 2s apart): the next re-poll is 4s away.
-    await tokenLapsesMidRun(host, polls, 3);
-    host.setScenario({ pollsUntilDone: 1 });
-    host.setHostPollError(null);
-    const before = polls.length;
-    document.dispatchEvent(new Event('visibilitychange'));
-    await waitFor(() => expect(polls.length).toBe(before + 1), { timeout: 1000 });
-    await screen.findByTestId('dc-publish', {}, { timeout: 1500 });
-  }, 30000);
+    expect(await screen.findByTestId('dc-run-failed')).toHaveTextContent(CAP);
+    expect(screen.getByTestId('dc-run-cost')).toHaveTextContent('512');
+    // A refusal is not a run: nothing to check again, and 'failed' is never polled.
+    expect(screen.queryByTestId('dc-check-again')).not.toBeInTheDocument();
+    host.setHostPollError(TOKEN_ERROR);
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(polls).toEqual([]);
+    expect(screen.getByTestId('dc-run-failed')).toHaveTextContent(CAP);
+    expect(screen.getByTestId('dc-run-failed')).not.toHaveTextContent(TOKEN_ERROR);
+    expect(screen.getByTestId('dc-run-cost')).toHaveTextContent('512');
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-estimate')).toBeEnabled();
+  }, 15000);
 
   it("a run that really failed ends tracking, and Check again stays available", async () => {
     const user = userEvent.setup();
