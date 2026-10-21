@@ -16,6 +16,7 @@ interface Manifest {
   page: { buzzBudgetPerGen: number };
   storage?: unknown;
   iframe?: Record<string, unknown>;
+  version: string;
 }
 
 const manifest = JSON.parse(
@@ -24,7 +25,7 @@ const manifest = JSON.parse(
 
 const pkg = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
-) as { dependencies: Record<string, string> };
+) as { version: string; dependencies: Record<string, string> };
 
 describe('block.manifest.json — training contract', () => {
   it('declares the budgeted scope with an honest justification', () => {
@@ -68,9 +69,16 @@ describe('block.manifest.json — training contract', () => {
     expect(PAGE_BUZZ_BUDGET).toBe(manifest.page.buzzBudgetPerGen);
   });
 
-  it('pins the SDK pair that types the training hooks + trainedEpochs / publishedModel', () => {
-    // Bumped 2026-10-15 for useImagePicker (blocks-react 0.73 / app-sdk 0.70).
-    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.70.1');
-    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.73.2');
+  it('pins the SDK pair whose kind:\'training\' body is items (uploaded blobs), not datasetId', () => {
+    // 0.77 replaced the prepared-dataset body ({ datasetId }) with
+    // { items: [{ air, caption }] } uploaded through useImageUpload({ purpose:
+    // 'trainingData' }); the TrainFlow upload path is written against it.
+    // (Was ^0.70.1 / ^0.73.2 for useImagePicker, 2026-10-15.)
+    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.77.0');
+    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.77.0');
+  });
+
+  it('package.json and block.manifest.json carry the same app version', () => {
+    expect(manifest.version).toBe(pkg.version);
   });
 });

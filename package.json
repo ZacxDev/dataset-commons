@@ -1,7 +1,7 @@
 {
   "name": "dataset-commons",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Civitai App (page money path) — estimate -> consent -> submit -> poll -> real Buzz spend, wired to the published App SDK.",
   "license": "MIT",
@@ -17,9 +17,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@civitai/app-sdk": "^0.70.1",
-    "@civitai/blocks-react": "^0.73.2",
-    "@civitai/components": "^0.10.1",
+    "@civitai/app-sdk": "^0.77.0",
+    "@civitai/blocks-react": "^0.77.0",
+    "@civitai/components": "^0.13.0",
     "@civitai/sdk": "0.18.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
