@@ -7,6 +7,7 @@ import {
 } from '@civitai/blocks-react/testing';
 
 import { demoSharedSeed } from './community.js';
+import { PAGE_BUZZ_BUDGET } from './generation.js';
 import { ALL_APP_SCOPES } from './community-storage.js';
 import { mockBuzzBalance } from './mock-buzz.js';
 
@@ -61,6 +62,10 @@ export function Harness({ children }: { children: ReactNode }) {
     return {
       ...base,
       declaredScopes: [...new Set([...(base.declaredScopes ?? []), ...ALL_APP_SCOPES])],
+      // Mirror the manifest's per-call budget (page.buzzBudgetPerGen). The mock
+      // defaults to 200, under which a ~500-Buzz pass-through training estimate is
+      // refused as an over-budget confirmed step (SDK 0.67+), unlike production.
+      buzzBudget: base.buzzBudget ?? PAGE_BUZZ_BUDGET,
       ...(wantsDemo && !base.shared ? { shared: { seed: demoSharedSeed() } } : {}),
       ...(trainingPublished
         ? {

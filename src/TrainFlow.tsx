@@ -7,15 +7,15 @@ import {
   useBuzzWorkflow,
   useCivitaiNavigate,
   useImageUpload,
-  usePrepareTrainingDataset,
   useRequestConsent,
   useRequestSignIn,
   useRunTraining,
-  PrepareTrainingDatasetError,
+  useSaveImage,
   RunTrainingError,
 } from '@civitai/blocks-react';
 import { Alert, Badge, Button, Stack } from '@civitai/blocks-react/ui';
 import type {
+  BlockTrainingDataImage,
   BlockTrainingQuote,
   BlockWorkflowSnapshot,
   WorkflowBodyTraining,
@@ -40,9 +40,11 @@ import {
   includedItems,
   latestEpoch,
   linkedLoraFromSnapshot,
+  pairUploadsWithSnapshot,
+  passThroughAvailable,
   trainingFailureCopy,
   trainingFeeEvent,
-  trainingKindEligibility,
+  trainingKindBlocker,
   trainingKindRunFailure,
   trainingStateForSnapshot,
   type DatasetItem,
@@ -61,11 +63,16 @@ import {
  * paid out). Every rule that matters lives in training.ts; this component only
  * drives the hooks and renders state.
  *
- * The dataset shown on first paint is a small MOCK dataset (the full
- * shared-storage datasets/voting build is the next slice) — it exists so the
- * whole training path is exercisable in the mock harness with no real Buzz.
- * Uploads come from the host's own modal, one image per call, exactly as the
- * platform supports.
+ * Two run paths share that snapshot: the pass-through `training` step (SDXL,
+ * within the page's per-call budget, `submit`), and Civitai's trainer
+ * (`kind: 'training'`, every preset, up to 5000 Buzz): the trainer uploads the
+ * snapshot's images through `useImageUpload({ purpose: 'trainingData' })`, each
+ * upload is matched to a snapshot item and carries its caption, and
+ * `useRunTraining()` opens Civitai's own confirmation dialog.
+ *
+ * Without `initialItems` the dataset is a small MOCK dataset so the whole path
+ * is exercisable in the mock harness with no real Buzz; there, "+ Add an
+ * image" uploads one generation-source image per call.
  */
 
 type TrainPhase =
@@ -77,9 +84,17 @@ type TrainPhase =
   | 'submitting'
   | 'running';
 
-type OwnTrainPhase = 'idle' | 'preparing' | 'quoted' | 'running' | 'unconfirmed';
+/** Civitai's trainer (`kind: 'training'`): upload -> price -> Civitai dialog. */
+type KindPhase = 'idle' | 'uploading' | 'pricing' | 'quoted' | 'running' | 'unconfirmed';
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
+
+/**
+ * The host's refusal (SDK 0.67+) when a pass-through `training` step is priced
+ * above the per-call budget: it cannot run as a confirmed step and must use
+ * `kind: 'training'`. Matched on the server's text (there is no errorCode).
+ */
+const OVER_BUDGET_TRAINING_STEP = /use kind:'training'/;
 
 /** A training run the Community shell should record against a real dataset. */
 export interface TrainRunLink {
@@ -140,8 +155,9 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   const [dcTheme, setDcTheme] = useState<'dark' | 'light'>('dark');
   const token = useBlockToken();
   const { estimate, submit, poll, watch } = useBuzzWorkflow();
-  const { prepareDataset } = usePrepareTrainingDataset();
   const { runTraining } = useRunTraining();
+  const { open: openTrainingUpload } = useImageUpload({ purpose: 'trainingData' });
+  const { saveImage } = useSaveImage();
   const { requestConsent } = useRequestConsent();
   const { requestSignIn } = useRequestSignIn();
   const { navigate } = useCivitaiNavigate();
@@ -166,12 +182,15 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   const [quoteClass, setQuoteClass] = useState<'unquoted' | 'missing' | null>(null);
   /** The actual estimate failure text (message + code) — shown, never swallowed (#541). */
   const [quoteError, setQuoteError] = useState<string | null>(null);
-  const [ownPhase, setOwnPhase] = useState<OwnTrainPhase>('idle');
-  const [ownQuote, setOwnQuote] = useState<BlockTrainingQuote | null>(null);
-  const [ownBody, setOwnBody] = useState<WorkflowBodyTraining | null>(null);
-  const [ownSnapshot, setOwnSnapshot] = useState<DatasetSnapshot | null>(null);
-  const [ownPreparedCount, setOwnPreparedCount] = useState<number | null>(null);
-  const [ownError, setOwnError] = useState<string | null>(null);
+  const [kindPhase, setKindPhase] = useState<KindPhase>('idle');
+  /** The host's upload result — the ONLY blobs Civitai's trainer will accept here. */
+  const [kindUploads, setKindUploads] = useState<BlockTrainingDataImage[] | null>(null);
+  /** Snapshot item id per upload (upload order); defaults to the same position. */
+  const [kindAssignment, setKindAssignment] = useState<string[]>([]);
+  const [kindQuote, setKindQuote] = useState<BlockTrainingQuote | null>(null);
+  const [kindBody, setKindBody] = useState<WorkflowBodyTraining | null>(null);
+  const [kindSnapshot, setKindSnapshot] = useState<DatasetSnapshot | null>(null);
+  const [kindError, setKindError] = useState<string | null>(null);
   const [frozen, setFrozen] = useState<DatasetSnapshot | null>(null);
   const [workflowId, setWorkflowId] = useState<string | null>(null);
   const [runState, setRunState] = useState<TrainingRunState | null>(null);
@@ -188,10 +207,11 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   pollRef.current = poll;
   const watchRef = useRef(watch);
   watchRef.current = watch;
-  const ownPhaseRef = useRef<OwnTrainPhase>('idle');
-  ownPhaseRef.current = ownPhase;
-  const ownRequestRef = useRef(0);
-  const ownWatchAbortRef = useRef<AbortController | null>(null);
+  const kindPhaseRef = useRef<KindPhase>('idle');
+  kindPhaseRef.current = kindPhase;
+  const kindRequestRef = useRef(0);
+  const kindConsentPendingRef = useRef(false);
+  const kindWatchAbortRef = useRef<AbortController | null>(null);
   const propsRef = useRef(props);
   propsRef.current = props;
   const persistedSnapshotRef = useRef<string | null>(null);
@@ -203,7 +223,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   useEffect(() => {
     return () => {
       if (pollCancelRef.current) pollCancelRef.current.cancelled = true;
-      ownWatchAbortRef.current?.abort();
+      kindWatchAbortRef.current?.abort();
     };
   }, []);
 
@@ -220,21 +240,21 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items, manualExclusions, effectiveOwnerOverrides, preset, triggerWord, samplePrompt, steps, epochs]);
 
-  // The own-images quote is also for one exact dataset/config body. Any edit
-  // invalidates it; an in-flight prepare/estimate is token-guarded below.
+  // A Civitai-trainer quote is for one exact body (uploads + captions + config).
+  // Any edit invalidates it; an in-flight estimate is token-guarded below. The
+  // uploads themselves are kept — they stay valid for this page session.
   useEffect(() => {
-    if (ownPhaseRef.current === 'preparing' || ownPhaseRef.current === 'quoted') {
-      ownRequestRef.current += 1;
-      setOwnPhase('idle');
-      setOwnQuote(null);
-      setOwnBody(null);
-      setOwnSnapshot(null);
-      setOwnPreparedCount(null);
-      setOwnError(null);
+    if (kindPhaseRef.current === 'pricing' || kindPhaseRef.current === 'quoted') {
+      kindRequestRef.current += 1;
+      setKindPhase('idle');
+      setKindQuote(null);
+      setKindBody(null);
+      setKindSnapshot(null);
+      setKindError(null);
       setFrozen(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items, manualExclusions, effectiveOwnerOverrides, preset, triggerWord, samplePrompt, steps, epochs]);
+  }, [items, manualExclusions, effectiveOwnerOverrides, preset, triggerWord, samplePrompt, steps, epochs, kindUploads, kindAssignment]);
 
   const preview = useMemo(
     () =>
@@ -252,22 +272,27 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     [included],
   );
 
-  const ownEligibility = useMemo(() => trainingKindEligibility(preview), [preview]);
+  const kindBlocker = trainingKindBlocker(included.length);
+  const kindPairing = useMemo(
+    () => (kindUploads ? pairUploadsWithSnapshot(kindUploads, included, kindAssignment) : null),
+    [kindUploads, included, kindAssignment],
+  );
   const busy =
     phase === 'estimating' ||
     phase === 'submitting' ||
     phase === 'running' ||
-    ownPhase === 'preparing' ||
-    ownPhase === 'running';
+    kindPhase === 'uploading' ||
+    kindPhase === 'pricing' ||
+    kindPhase === 'running';
   const afford = quote == null ? null : canAffordQuote(quote, balanceTotal);
-  const ownAfford = ownQuote == null ? null : canAffordQuote(ownQuote.total, balanceTotal);
+  const kindAfford = kindQuote == null ? null : canAffordQuote(kindQuote.total, balanceTotal);
   const trainDisabledReason =
     included.length === 0
       ? 'No items are in the training set — an item needs net-positive votes (or an owner override) and must not be manually excluded.'
-      : assembled.items.length === 0
-        ? 'None of the included items resolve to a Civitai blob the trainer can read.'
-        : !preset.modelAir || !preset.withinCurrentCap
-          ? 'This base model is not available for in-app training yet.'
+      : !passThroughAvailable(preset)
+        ? `${preset.label} trains only on Civitai's trainer below — upload the training set's images there.`
+        : assembled.items.length === 0
+          ? "None of the included items resolve to a Civitai blob this quick path can read — use Civitai's trainer below and upload the images."
           : null;
 
   const applyTrainingSnapshot = useCallback(
@@ -394,11 +419,11 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     }
   }, [workflowId, frozen, applyTrainingSnapshot, runPollLoop]);
 
-  const runOwnWatch = useCallback(
+  const runKindWatch = useCallback(
     (id: string, snapshot: DatasetSnapshot) => {
-      ownWatchAbortRef.current?.abort();
+      kindWatchAbortRef.current?.abort();
       const controller = new AbortController();
-      ownWatchAbortRef.current = controller;
+      kindWatchAbortRef.current = controller;
       void watchRef
         .current(id, {
           signal: controller.signal,
@@ -407,164 +432,176 @@ export function TrainFlow(props: TrainFlowProps = {}) {
         .then((finalSnap) => {
           if (controller.signal.aborted) return;
           applyTrainingSnapshot(finalSnap, snapshot);
-          setOwnPhase('idle');
+          setKindPhase('idle');
           setPhase('idle');
         })
         .catch(() => {
           if (controller.signal.aborted) return;
-          setOwnPhase('idle');
+          setKindPhase('idle');
           setPhase('idle');
-          setNotice('The own-images run started, but following its status stopped. Use Check again if it appears below.');
+          setNotice('The training run started, but following its status stopped. Use Check again if it appears below.');
         });
     },
     [applyTrainingSnapshot],
   );
 
-  const doOwnEstimate = useCallback(async () => {
-    if (!ownEligibility.ready || ownPhaseRef.current === 'running' || ownPhaseRef.current === 'unconfirmed') return;
-    const request = ++ownRequestRef.current;
+  const clearKindQuote = useCallback(() => {
+    kindRequestRef.current += 1;
+    setKindQuote(null);
+    setKindBody(null);
+    setKindSnapshot(null);
+  }, []);
+
+  /** Step 1: the host's own upload modal. Only these blobs can be trained here. */
+  const onKindUploadClick = useCallback(async () => {
+    if (!viewer) {
+      requestSignIn();
+      return;
+    }
+    if (kindPhaseRef.current === 'running' || kindPhaseRef.current === 'unconfirmed') return;
+    clearKindQuote();
+    setKindError(null);
+    setKindPhase('uploading');
+    try {
+      const images = await openTrainingUpload();
+      if (!images) {
+        setKindPhase('idle'); // cancelled — keep whatever was uploaded before
+        return;
+      }
+      setKindUploads(images);
+      setKindAssignment(images.map((_, index) => included[index]?.itemId ?? ''));
+      setKindPhase('idle');
+    } catch (err) {
+      setKindPhase('idle');
+      setKindError(`The upload did not finish: ${describeEstimateFailure(err)} Nothing was charged.`);
+    }
+  }, [viewer, requestSignIn, clearKindQuote, openTrainingUpload, included]);
+
+  /** Step 2: freeze the snapshot, pair uploads with it, and get Civitai's quote. */
+  const doKindEstimate = useCallback(async () => {
+    if (!kindUploads || kindPhaseRef.current === 'running' || kindPhaseRef.current === 'unconfirmed') return;
+    const request = ++kindRequestRef.current;
     setNotice(null);
     setRunError(null);
-    setOwnError(null);
-    setOwnQuote(null);
-    setOwnBody(null);
-    setOwnSnapshot(null);
-    setOwnPreparedCount(null);
-    setOwnPhase('preparing');
+    setKindError(null);
+    setKindQuote(null);
+    setKindBody(null);
+    setKindSnapshot(null);
+    setKindPhase('pricing');
 
     const snapshot = freezeSnapshot(datasetIdForTraining, props.trainerId ?? viewer?.username ?? 'you', items, {
       manualExclusions,
       ownerOverrides: effectiveOwnerOverrides,
     });
-    const eligibility = trainingKindEligibility(snapshot);
-    if (!eligibility.ready) {
-      setOwnPhase('idle');
-      setOwnError('The own-images path is not available for every item in this training set.');
+    const pairing = pairUploadsWithSnapshot(kindUploads, includedItems(snapshot), kindAssignment);
+    if (pairing.problems.length > 0) {
+      setKindPhase('idle');
+      setKindError(`${pairing.problems.join(' ')} No price was asked for and nothing was charged.`);
       return;
     }
-
+    let body: WorkflowBodyTraining;
     try {
-      const prepared = await prepareDataset(
-        eligibility.candidates.map((candidate) => ({ imageId: candidate.imageId, caption: candidate.caption })),
-      );
-      if (ownRequestRef.current !== request) return;
-      setOwnPreparedCount(prepared.count);
-      if (prepared.rejected.length > 0) {
-        const rejected = prepared.rejected
-          .map((item) => `image #${item.imageId}: ${item.reason}`)
-          .join('; ');
-        setOwnPhase('idle');
-        setOwnError(
-          `Civitai left ${prepared.rejected.length} of the trainer's images out of the prepared dataset (${rejected}). No price was quoted and no run was submitted. No Buzz was charged.`,
-        );
-        return;
-      }
-      if (prepared.count !== eligibility.candidates.length) {
-        setOwnPhase('idle');
-        setOwnError(
-          `Civitai prepared ${prepared.count} image(s), but this snapshot has ${eligibility.candidates.length}. No price was quoted and no run was submitted. No Buzz was charged.`,
-        );
-        return;
-      }
-
-      const body = buildTrainingKindBody({
-        preparedDatasetId: prepared.datasetId,
+      body = buildTrainingKindBody({
+        items: pairing.items,
         config: { preset, triggerWord, steps, epochs, samplePrompt },
       });
-      let est: Awaited<ReturnType<typeof estimate>>;
-      try {
-        est = await estimate(body);
-      } catch (err) {
-        if (ownRequestRef.current !== request) return;
-        setOwnPhase('idle');
-        setOwnError(
-          `No own-images price quote — run not submitted. Details: ${describeEstimateFailure(err)} No Buzz was charged.`,
-        );
-        return;
-      }
-      if (ownRequestRef.current !== request) return;
-      const cls = classifyTrainingKindQuote(est);
-      if (cls.kind !== 'quoted') {
-        setOwnPhase('idle');
-        setOwnError(`No own-images price quote — run not submitted. ${cls.detail} No Buzz was charged.`);
-        return;
-      }
-      setOwnBody(body);
-      setOwnQuote(cls.quote);
-      setOwnSnapshot(snapshot);
-      setFrozen(snapshot);
-      setOwnPhase('quoted');
     } catch (err) {
-      if (ownRequestRef.current !== request) return;
-      setOwnPhase('idle');
-      if (err instanceof PrepareTrainingDatasetError && err.signInRequired) {
-        requestSignIn();
-        setOwnError('Sign in to train, then price the own-images run again. No Buzz was charged.');
-      } else if (err instanceof PrepareTrainingDatasetError && err.timedOut) {
-        setOwnError('Preparing the training dataset timed out. Nothing was charged; price the run again.');
-      } else {
-        setOwnError(`${describeEstimateFailure(err)} No Buzz was charged.`);
-      }
+      setKindPhase('idle');
+      setKindError(err instanceof Error ? err.message : 'Could not build the training run.');
+      return;
     }
+    let est: Awaited<ReturnType<typeof estimate>>;
+    try {
+      est = await estimate(body);
+    } catch (err) {
+      if (kindRequestRef.current !== request) return;
+      setKindPhase('idle');
+      setKindError(`No price quote — run not submitted. Details: ${describeEstimateFailure(err)} No Buzz was charged.`);
+      return;
+    }
+    if (kindRequestRef.current !== request) return;
+    const cls = classifyTrainingKindQuote(est);
+    if (cls.kind !== 'quoted') {
+      setKindPhase('idle');
+      setKindError(`No price quote — run not submitted. ${cls.detail} No Buzz was charged.`);
+      return;
+    }
+    setKindBody(body);
+    setKindQuote(cls.quote);
+    setKindSnapshot(snapshot);
+    setFrozen(snapshot);
+    setKindPhase('quoted');
   }, [
-    ownEligibility.ready,
+    kindUploads,
+    kindAssignment,
     datasetIdForTraining,
     props.trainerId,
     viewer,
     items,
     manualExclusions,
     effectiveOwnerOverrides,
-    prepareDataset,
     preset,
     triggerWord,
     steps,
     epochs,
     samplePrompt,
     estimate,
-    requestSignIn,
   ]);
 
-  const onOwnEstimateClick = useCallback(() => {
+  // Auto-resume a Civitai-trainer estimate after the spend-scope grant lands.
+  useEffect(() => {
+    if (granted && kindConsentPendingRef.current) {
+      kindConsentPendingRef.current = false;
+      void doKindEstimate();
+    }
+  }, [granted, doKindEstimate]);
+
+  const onKindEstimateClick = useCallback(() => {
     if (!viewer) {
       requestSignIn();
       return;
     }
-    void doOwnEstimate();
-  }, [viewer, requestSignIn, doOwnEstimate]);
+    if (!granted) {
+      kindConsentPendingRef.current = true;
+      requestConsent({ scopes: ['ai:write:budgeted'] });
+      return;
+    }
+    void doKindEstimate();
+  }, [viewer, granted, requestSignIn, requestConsent, doKindEstimate]);
 
-  const onOwnRunClick = useCallback(async () => {
-    if (!ownBody || !ownQuote || !ownSnapshot || ownPhase !== 'quoted') return;
-    if (ownAfford === false) return;
-    if (Date.parse(ownQuote.expiresAt) <= Date.now()) {
-      setOwnPhase('idle');
-      setOwnQuote(null);
-      setOwnBody(null);
-      setOwnSnapshot(null);
-      setOwnError('That own-images quote has expired. Price the run again; no Buzz was charged.');
+  /** Step 3: Civitai's own dialog shows the server's price and is the charge. */
+  const onKindRunClick = useCallback(async () => {
+    if (!kindBody || !kindQuote || !kindSnapshot || kindPhase !== 'quoted') return;
+    if (kindAfford === false) return;
+    if (Date.parse(kindQuote.expiresAt) <= Date.now()) {
+      setKindPhase('idle');
+      clearKindQuote();
+      setKindError('That quote has expired. Price the run again; no Buzz was charged.');
       return;
     }
 
-    setOwnError(null);
-    setOwnPhase('running');
+    setKindError(null);
+    setKindPhase('running');
     // Persist the frozen snapshot before Civitai's dialog can charge the
     // viewer. If storage refuses, the run never opens and nothing is charged.
-    if (propsRef.current.onSnapshotConfirmed && persistedSnapshotRef.current !== ownSnapshot.snapshotId) {
+    if (propsRef.current.onSnapshotConfirmed && persistedSnapshotRef.current !== kindSnapshot.snapshotId) {
       try {
-        await propsRef.current.onSnapshotConfirmed(ownSnapshot);
-        persistedSnapshotRef.current = ownSnapshot.snapshotId;
+        await propsRef.current.onSnapshotConfirmed(kindSnapshot);
+        persistedSnapshotRef.current = kindSnapshot.snapshotId;
       } catch {
-        setOwnPhase('quoted');
-        setOwnError('Could not record the frozen snapshot in Open Datasets, so Civitai\'s training dialog was not opened. No Buzz was charged.');
+        setKindPhase('quoted');
+        setKindError("Could not record the frozen snapshot in Open Datasets, so Civitai's training dialog was not opened. No Buzz was charged.");
         return;
       }
     }
 
     try {
-      const started = await runTraining({ ...ownBody, quoteId: ownQuote.quoteId });
+      const started = await runTraining({ ...kindBody, quoteId: kindQuote.quoteId });
       setWorkflowId(started.workflowId);
-      setFrozen(ownSnapshot);
-      applyTrainingSnapshot(started, ownSnapshot);
+      setFrozen(kindSnapshot);
+      applyTrainingSnapshot(started, kindSnapshot);
       const state = trainingStateForSnapshot(started);
+      setKindPhase('idle');
       if (
         started.status === 'succeeded' ||
         started.status === 'failed' ||
@@ -573,42 +610,59 @@ export function TrainFlow(props: TrainFlowProps = {}) {
         state === 'ready-to-publish' ||
         started.publishedModel
       ) {
-        setOwnPhase('idle');
         setPhase('idle');
       } else {
-        setOwnPhase('idle');
         setPhase('running');
-        runOwnWatch(started.workflowId, ownSnapshot);
+        runKindWatch(started.workflowId, kindSnapshot);
       }
     } catch (err) {
       const failure = trainingKindRunFailure(err);
-      if (err instanceof RunTrainingError && err.signInRequired) requestSignIn();
-      if (failure.kind === 'declined') {
-        // The viewer dismissed Civitai's dialog. Keep the still-valid quote
-        // on screen so the next step remains obvious, without an error alarm.
-        setOwnPhase('quoted');
-        setPhase('idle');
-        return;
-      }
-      if (failure.kind === 'sign-in') {
-        setOwnPhase('quoted');
-        setPhase('idle');
-        setOwnError(failure.message);
-        return;
-      }
-      if (failure.kind === 'unconfirmed') {
-        setOwnPhase('unconfirmed');
-        setPhase('idle');
-        setOwnError(failure.message);
-        return;
-      }
-      setOwnPhase('idle');
       setPhase('idle');
-      setOwnQuote(null);
-      setOwnBody(null);
-      setOwnError(failure.message);
+      if (err instanceof RunTrainingError && err.signInRequired) requestSignIn();
+      switch (failure.kind) {
+        case 'declined':
+          // The viewer dismissed Civitai's dialog: no run. Keep the still-valid
+          // quote on screen so the next step stays obvious, without an alarm.
+          setKindPhase('quoted');
+          return;
+        case 'sign-in':
+          setKindPhase('quoted');
+          setKindError(failure.message);
+          return;
+        case 'unconfirmed':
+          // A run MAY exist and be charged. Never offer a retry from here.
+          setKindPhase('unconfirmed');
+          setKindError(failure.message);
+          return;
+        case 'not-uploaded':
+          // The host forgot (or never had) these blobs: nothing ran. The
+          // uploads are useless now, so drop them and ask for a fresh upload.
+          setKindPhase('idle');
+          clearKindQuote();
+          setKindUploads(null);
+          setKindAssignment([]);
+          setKindError(failure.message);
+          return;
+        default:
+          setKindPhase('idle');
+          clearKindQuote();
+          setKindError(failure.message);
+      }
     }
-  }, [ownBody, ownQuote, ownSnapshot, ownPhase, ownAfford, runTraining, applyTrainingSnapshot, runOwnWatch, requestSignIn]);
+  }, [kindBody, kindQuote, kindSnapshot, kindPhase, kindAfford, clearKindQuote, runTraining, applyTrainingSnapshot, runKindWatch, requestSignIn]);
+
+  const onSaveItemClick = useCallback(
+    async (item: Pick<DatasetItem, 'imageId' | 'imageUrl'>, position: number) => {
+      const filename = `open-datasets-${String(position).padStart(2, '0')}`;
+      try {
+        if (item.imageId != null) await saveImage({ imageId: item.imageId, filename });
+        else await saveImage({ url: item.imageUrl, filename });
+      } catch (err) {
+        setNotice(`Could not save image #${position}: ${describeEstimateFailure(err)}`);
+      }
+    },
+    [saveImage],
+  );
 
   const doEstimate = useCallback(async () => {
     if (trainDisabledReason) return;
@@ -662,9 +716,14 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     } catch (err) {
       // Never swallow the estimate error: the viewer (and any upstream
       // report) needs the actual message/code the host failed with.
+      const detail = describeEstimateFailure(err);
       setQuote(null);
       setQuoteClass('missing');
-      setQuoteError(describeEstimateFailure(err));
+      setQuoteError(
+        OVER_BUDGET_TRAINING_STEP.test(detail)
+          ? `${detail} — this run costs more than the quick path's per-call budget; use Civitai's trainer below.`
+          : detail,
+      );
       setFrozen(null);
       setPhase('unquoted');
     }
@@ -923,8 +982,8 @@ export function TrainFlow(props: TrainFlowProps = {}) {
               }}
             >
               {TRAINING_PRESETS.map((p) => (
-                <option key={p.id} value={p.id} disabled={!p.modelAir || !p.withinCurrentCap}>
-                  {p.label} · ~{p.approxBuzz} Buzz
+                <option key={p.id} value={p.id} disabled={!passThroughAvailable(p) && !p.trainingKind}>
+                  {p.label} · ~{p.approxBuzz} Buzz{passThroughAvailable(p) ? '' : " · Civitai's trainer only"}
                 </option>
               ))}
             </select>
@@ -971,90 +1030,157 @@ export function TrainFlow(props: TrainFlowProps = {}) {
         </div>
       </div>
 
-      {/* --- Dedicated training kind: prepare → quote → Civitai consent --- */}
+      {/* --- Civitai's trainer (kind: 'training'): upload → quote → Civitai dialog --- */}
       {viewer && (
-        <div style={fieldStyle} data-testid="dc-own-training">
+        <div style={fieldStyle} data-testid="dc-kind-training">
           <span style={fieldLabelStyle}>
-            Own-images training{' '}
-            <Badge color={ownEligibility.ready ? 'primary' : 'gray'} variant="light">
-              {ownEligibility.ready
-                ? `${ownEligibility.candidates.length} own image${ownEligibility.candidates.length === 1 ? '' : 's'} ready`
-                : `${ownEligibility.blockers.length} blocker${ownEligibility.blockers.length === 1 ? '' : 's'}`}
+            Train on Civitai's trainer{' '}
+            <Badge color={kindBlocker ? 'gray' : 'primary'} variant="light">
+              {kindBlocker ? 'not available' : `${included.length} image${included.length === 1 ? '' : 's'} to upload`}
             </Badge>
           </span>
           <span style={hintStyle}>
-            Civitai can train directly from the trainer's own Civitai images. It prepares the
-            dataset first, quotes that exact run, then shows its own confirmation dialog before
-            charging.
+            Works for every base model above, including Flux, Qwen and Chroma (up to 5,000 Buzz a
+            run). Civitai only trains on images uploaded from this page, so you upload the training
+            set yourself: save the numbered images below, then upload exactly those files in
+            Civitai's upload window. Each upload is matched to one training-set image — in order by
+            default — and carries that image's frozen caption. Uploads are forgotten if this page
+            reloads. Civitai shows the final price in its own dialog before anything is charged.
           </span>
 
-          {!ownEligibility.ready && ownEligibility.blockers.length > 0 && (
-            <Alert color="warning" title="Own-images training can't cover this snapshot yet" data-testid="dc-own-blocked">
-              {ownEligibility.blockers
-                .slice(0, 3)
-                .map((blocker) => {
-                  const item = preview.items.find((candidate) => candidate.itemId === blocker.itemId);
-                  return `${item?.caption || blocker.itemId}: ${blocker.reason}`;
-                })
-                .join('; ')}
-              {ownEligibility.blockers.length > 3 ? `; +${ownEligibility.blockers.length - 3} more.` : '.'}
+          {kindBlocker ? (
+            <Alert color="warning" title="Civitai's trainer can't take this training set" data-testid="dc-kind-blocked">
+              {kindBlocker}
             </Alert>
+          ) : (
+            <ol style={kindListStyle} data-testid="dc-kind-list">
+              {included.map((item, index) => (
+                <li key={item.itemId} style={kindRowStyle}>
+                  <span style={monoStyle}>#{index + 1}</span>
+                  <span style={itemCaptionStyle}>{item.caption || '(no caption)'}</span>
+                  <span style={hintStyle}>by {item.contributorName ?? item.contributorId}</span>
+                  {(item.imageId != null || /^https:\/\//.test(item.imageUrl)) && (
+                    <Button
+                      size="sm"
+                      variant="subtle"
+                      onClick={() => void onSaveItemClick(item, index + 1)}
+                      data-testid={`dc-kind-save-${item.itemId}`}
+                    >
+                      Save #{index + 1}
+                    </Button>
+                  )}
+                </li>
+              ))}
+            </ol>
           )}
 
-          {ownEligibility.ready && ownPhase !== 'quoted' && ownPhase !== 'running' && ownPhase !== 'unconfirmed' && (
+          {!kindBlocker && kindPhase !== 'quoted' && kindPhase !== 'running' && kindPhase !== 'unconfirmed' && (
             <span>
               <Button
                 variant="light"
                 size="sm"
-                loading={ownPhase === 'preparing'}
-                disabled={busy || phase === 'quoted' || !preset.trainingKindModel}
-                onClick={onOwnEstimateClick}
-                data-testid="dc-own-estimate"
+                loading={kindPhase === 'uploading'}
+                disabled={busy || phase === 'quoted' || !preset.trainingKind}
+                onClick={() => void onKindUploadClick()}
+                data-testid="dc-kind-upload"
               >
-                {ownPhase === 'preparing' ? 'Preparing and pricing…' : 'Price own-images run'}
+                {kindUploads ? 'Upload again' : `Upload these ${included.length} image${included.length === 1 ? '' : 's'}`}
               </Button>
             </span>
           )}
 
-          {(ownPhase === 'quoted' || ownPhase === 'running') && ownQuote && (
-            <div style={confirmStyle} data-testid="dc-own-confirm">
-              <span style={fieldLabelStyle}>Confirm own-images training</span>
-              <span style={monoStyle} data-testid="dc-own-quote">
-                {formatCost(ownQuote.total)} Buzz
+          {kindUploads && kindPhase !== 'unconfirmed' && (
+            <div style={fieldStyle} data-testid="dc-kind-pairs">
+              {kindUploads.map((upload, index) => (
+                <div key={`${upload.air}-${index}`} style={kindRowStyle} data-testid="dc-kind-pair">
+                  <img src={upload.url} alt={`upload ${index + 1}`} style={kindThumbStyle} />
+                  <label style={miniLabelStyle}>
+                    upload #{index + 1} is
+                    <select
+                      style={inputStyle}
+                      value={kindAssignment[index] ?? ''}
+                      disabled={kindPhase === 'quoted' || kindPhase === 'running'}
+                      data-testid={`dc-kind-match-${index}`}
+                      onChange={(e) =>
+                        setKindAssignment((cur) => {
+                          const next = [...cur];
+                          next[index] = e.target.value;
+                          return next;
+                        })
+                      }
+                    >
+                      <option value="">— pick the training-set image —</option>
+                      {included.map((item, itemIndex) => (
+                        <option key={item.itemId} value={item.itemId}>
+                          #{itemIndex + 1} · {item.caption || '(no caption)'}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              ))}
+              {kindPairing && kindPairing.problems.length > 0 && (
+                <Alert color="warning" title="Fix the uploads before pricing" data-testid="dc-kind-problems">
+                  {kindPairing.problems.join(' ')}
+                </Alert>
+              )}
+              {kindPhase !== 'quoted' && kindPhase !== 'running' && (
+                <span>
+                  <Button
+                    variant="light"
+                    size="sm"
+                    loading={kindPhase === 'pricing'}
+                    disabled={busy || phase === 'quoted' || !preset.trainingKind || (kindPairing?.problems.length ?? 1) > 0}
+                    onClick={onKindEstimateClick}
+                    data-testid="dc-kind-estimate"
+                  >
+                    {kindPhase === 'pricing' ? 'Pricing…' : `Price this run on Civitai's trainer`}
+                  </Button>
+                </span>
+              )}
+            </div>
+          )}
+
+          {(kindPhase === 'quoted' || kindPhase === 'running') && kindQuote && (
+            <div style={confirmStyle} data-testid="dc-kind-confirm">
+              <span style={fieldLabelStyle}>Confirm training on Civitai's trainer</span>
+              <span style={monoStyle} data-testid="dc-kind-quote">
+                {formatCost(kindQuote.total)} Buzz
               </span>
               <span style={hintStyle}>
-                {ownPreparedCount ?? ownQuote.imageCount} prepared image{(ownPreparedCount ?? ownQuote.imageCount) === 1 ? '' : 's'} · snapshot
-                weight {ownSnapshot?.totalWeight ?? preview.totalWeight} · {preset.label}. Quote
-                expires {new Date(ownQuote.expiresAt).toLocaleString()}. Civitai's dialog is the
-                final charge confirmation.
+                {kindQuote.imageCount} uploaded image{kindQuote.imageCount === 1 ? '' : 's'} · snapshot
+                weight {kindSnapshot?.totalWeight ?? preview.totalWeight} · {preset.label}. Quote
+                expires {new Date(kindQuote.expiresAt).toLocaleString()}. Civitai's dialog is the
+                final charge confirmation. This is the trainer fee the snapshot's contributors will
+                be credited from (tracked, not paid out).
               </span>
-              {ownAfford === false ? (
-                <Alert color="warning" title="Not enough Buzz" data-testid="dc-own-insufficient">
-                  This run is quoted at {formatCost(ownQuote.total)} Buzz and your balance is{' '}
+              {kindAfford === false ? (
+                <Alert color="warning" title="Not enough Buzz" data-testid="dc-kind-insufficient">
+                  This run is quoted at {formatCost(kindQuote.total)} Buzz and your balance is{' '}
                   {formatCost(balanceTotal)}. Top up and price the run again — nothing was charged.
                 </Alert>
               ) : (
                 <Button
                   fullWidth
-                  loading={ownPhase === 'running'}
-                  onClick={() => void onOwnRunClick()}
-                  data-testid="dc-own-run"
+                  loading={kindPhase === 'running'}
+                  onClick={() => void onKindRunClick()}
+                  data-testid="dc-kind-run"
                 >
-                  Open Civitai confirmation · {formatCost(ownQuote.total)} Buzz
+                  Open Civitai confirmation · {formatCost(kindQuote.total)} Buzz
                 </Button>
               )}
             </div>
           )}
 
-          {ownPhase === 'unconfirmed' && (
-            <Alert color="error" title="Training submission unconfirmed" data-testid="dc-own-unconfirmed">
-              {ownError}
+          {kindPhase === 'unconfirmed' && (
+            <Alert color="error" title="Training submission unconfirmed" data-testid="dc-kind-unconfirmed">
+              {kindError}
             </Alert>
           )}
 
-          {ownError && ownPhase !== 'unconfirmed' && (
-            <Alert color="error" title="Own-images training not started" data-testid="dc-own-error">
-              {ownError}
+          {kindError && kindPhase !== 'unconfirmed' && (
+            <Alert color="error" title="Training on Civitai's trainer not started" data-testid="dc-kind-error">
+              {kindError}
             </Alert>
           )}
         </div>
@@ -1065,7 +1191,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
         <Button fullWidth onClick={() => requestSignIn()} data-testid="dc-signin">
           Sign in to train
         </Button>
-      ) : phase !== 'quoted' && phase !== 'submitting' && ownPhase !== 'quoted' ? (
+      ) : phase !== 'quoted' && phase !== 'submitting' && kindPhase !== 'quoted' ? (
         <Button
           fullWidth
           loading={phase === 'estimating'}
@@ -1326,6 +1452,23 @@ const checkLabelStyle: React.CSSProperties = {
   alignItems: 'center',
   fontSize: 12,
   paddingBottom: 6,
+};
+const kindListStyle: React.CSSProperties = { display: 'grid', gap: 4, margin: 0, paddingLeft: 0, listStyle: 'none' };
+const kindRowStyle: React.CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: 8,
+  alignItems: 'center',
+  fontSize: 13,
+  minWidth: 0,
+};
+const kindThumbStyle: React.CSSProperties = {
+  width: 48,
+  height: 48,
+  objectFit: 'cover',
+  borderRadius: 4,
+  border: '1px solid var(--civitai-color-border)',
+  flex: '0 0 auto',
 };
 const confirmStyle: React.CSSProperties = {
   display: 'grid',

@@ -105,3 +105,13 @@ your own script under one of them, yours is what runs.
   clean local validate is necessary, never sufficient.
 
 <!-- END civitai agent-setup -->
+
+## This app: training (outside the managed block)
+
+- `kind: 'training'` (SDK 0.77) takes `items: [{ air, caption }]` from
+  `useImageUpload({ purpose: 'trainingData' })` — never a `datasetId`
+  (`usePrepareTrainingDataset` is gone). The host refuses any blob it did not
+  upload for this block instance, and forgets them on reload.
+- Never auto-retry after `submission-unconfirmed`: a retry is a new charged run.
+- The rules live in `src/training.ts` (pure, unit-tested); `src/TrainFlow.tsx`
+  only drives hooks. See README "Training a LoRA".

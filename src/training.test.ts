@@ -1,3 +1,4 @@
+import { RunTrainingError } from '@civitai/blocks-react';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -23,7 +24,11 @@ import {
   trackedTotals,
   trainingFailureCopy,
   trainingFeeEvent,
-  trainingKindEligibility,
+  pairUploadsWithSnapshot,
+  passThroughAvailable,
+  TRAINING_KIND_CAPTION_MAX_CHARS,
+  TRAINING_KIND_MAX_ITEMS,
+  trainingKindBlocker,
   trainingKindRunFailure,
   trainingStateForSnapshot,
   type DatasetItem,
@@ -300,92 +305,152 @@ describe('buildTrainingBody (the #541 pass-through shape)', () => {
   });
 });
 
-describe("dedicated kind: 'training' (the viewer's own images)", () => {
+describe('freezeSnapshot carries image ids', () => {
   it('freezeSnapshot carries Civitai image ids into the frozen record', () => {
     const snap = freezeSnapshot('ds1', 'trainer', [item({ itemId: 'a', imageId: 101 })], {
       snapshotId: 's-image-id',
     });
     expect(snap.items[0]).toMatchObject({ imageId: 101 });
   });
+});
 
-  it('eligibility is ready only when every included item is the trainer\'s own image with an id', () => {
-    const snap = freezeSnapshot('ds1', 'trainer', [
-      item({ itemId: 'a', contributorId: 'trainer', imageId: 101, caption: 'one' }),
-      item({ itemId: 'b', contributorId: 'trainer', imageId: 102, caption: 'two' }),
-      item({ itemId: 'out', contributorId: 'someone-else', imageId: 103, netVotes: 0 }),
-    ]);
-    const eligibility = trainingKindEligibility(snap);
-    expect(eligibility.ready).toBe(true);
-    expect(eligibility.candidates).toEqual([
-      { itemId: 'a', imageId: 101, caption: 'one' },
-      { itemId: 'b', imageId: 102, caption: 'two' },
-    ]);
-    expect(eligibility.blockers).toEqual([]);
-  });
+describe("Civitai's trainer (kind: 'training', SDK 0.77 items body)", () => {
+  const preset = TRAINING_PRESETS.find((p) => p.id === 'flux')!;
+  const config = { preset, triggerWord: ' mytok ', steps: 2000, epochs: 10, samplePrompt: '' };
+  const snapshotItems = [
+    { itemId: 'a', caption: 'front view' },
+    { itemId: 'b', caption: 'profile view' },
+    { itemId: 'c', caption: 'back view' },
+  ];
+  const uploads = [
+    { url: 'https://civitai.com/v2/consumer/blobs/up-1.png', air: 'up-1.png' },
+    { url: 'https://civitai.com/v2/consumer/blobs/up-2.png', air: 'up-2.png' },
+    { url: 'https://civitai.com/v2/consumer/blobs/up-3.png', air: 'up-3.png' },
+  ];
 
-  it('eligibility names blockers instead of silently training a subset', () => {
-    const snap = freezeSnapshot('ds1', 'trainer', [
-      item({ itemId: 'other', contributorId: 'bob', imageId: 201 }),
-      item({ itemId: 'no-id', contributorId: 'trainer' }),
-      item({ itemId: 'dup-a', contributorId: 'trainer', imageId: 202 }),
-      item({ itemId: 'dup-b', contributorId: 'trainer', imageId: 202 }),
-      item({ itemId: 'long', contributorId: 'trainer', imageId: 203, caption: 'x'.repeat(1001) }),
-    ]);
-    const eligibility = trainingKindEligibility(snap);
-    expect(eligibility.ready).toBe(false);
-    expect(eligibility.candidates.map((candidate) => candidate.itemId)).toEqual(['dup-a']);
-    expect(eligibility.blockers.map((blocker) => blocker.itemId)).toEqual(['other', 'no-id', 'dup-b', 'long']);
-    expect(eligibility.blockers[0]!.reason).toMatch(/contributed by someone else/);
-    expect(eligibility.blockers[1]!.reason).toMatch(/no Civitai image ID/);
-    expect(eligibility.blockers[2]!.reason).toMatch(/duplicates Civitai image #202/);
-    expect(eligibility.blockers[3]!.reason).toMatch(/longer than 1000/);
-  });
-
-  it('eligibility blocks items beyond the 50-image prepared-dataset limit', () => {
-    const many = Array.from({ length: 51 }, (_, index) =>
-      item({ itemId: `i${index}`, contributorId: 'trainer', imageId: index + 1 }),
-    );
-    const eligibility = trainingKindEligibility(freezeSnapshot('ds1', 'trainer', many));
-    expect(eligibility.ready).toBe(false);
-    expect(eligibility.candidates).toHaveLength(50);
-    expect(eligibility.blockers).toEqual([
-      expect.objectContaining({ itemId: 'i50', reason: expect.stringMatching(/50-image limit/) }),
+  it('pairs uploads with snapshot captions by position by default', () => {
+    const pairing = pairUploadsWithSnapshot(uploads, snapshotItems);
+    expect(pairing.problems).toEqual([]);
+    expect(pairing.itemIds).toEqual(['a', 'b', 'c']);
+    expect(pairing.items).toEqual([
+      { air: 'up-1.png', caption: 'front view' },
+      { air: 'up-2.png', caption: 'profile view' },
+      { air: 'up-3.png', caption: 'back view' },
     ]);
   });
 
-  it('builds the exact training-kind body the quote and run must share', () => {
-    const body = buildTrainingKindBody({
-      preparedDatasetId: 'tds_0123456789abcdef0123456789abcdef',
-      config: {
-        preset: DEFAULT_TRAINING_PRESET,
-        triggerWord: ' mytok ',
+  it('an explicit assignment moves each caption to the upload it was matched to', () => {
+    const pairing = pairUploadsWithSnapshot(uploads, snapshotItems, ['c', 'a', 'b']);
+    expect(pairing.problems).toEqual([]);
+    expect(pairing.items).toEqual([
+      { air: 'up-1.png', caption: 'back view' },
+      { air: 'up-2.png', caption: 'front view' },
+      { air: 'up-3.png', caption: 'profile view' },
+    ]);
+  });
+
+  it('refuses a count mismatch, a double match, a duplicate blob and an unmatched upload — never a subset', () => {
+    expect(pairUploadsWithSnapshot(uploads.slice(0, 2), snapshotItems)).toEqual({
+      items: [],
+      itemIds: ['a', 'b'],
+      problems: ['You uploaded 2 images, but the training set has 3. Upload exactly the 3 images listed.'],
+    });
+    expect(pairUploadsWithSnapshot(uploads, snapshotItems, ['a', 'a', 'c']).problems).toEqual([
+      'Training-set image #1 is matched to both upload #1 and upload #2.',
+    ]);
+    const dupe = [uploads[0]!, { ...uploads[1]!, air: 'UP-1.PNG' }, uploads[2]!];
+    expect(pairUploadsWithSnapshot(dupe, snapshotItems).problems).toEqual([
+      'Upload #2 is the same file as upload #1.',
+    ]);
+    expect(pairUploadsWithSnapshot(uploads, snapshotItems, ['a', '', 'c']).problems).toEqual([
+      'Upload #2 is not matched to an image in the training set.',
+    ]);
+  });
+
+  it('caps the set at 50 and captions at 8192 characters (the 0.77 host bounds)', () => {
+    expect(TRAINING_KIND_MAX_ITEMS).toBe(50);
+    expect(TRAINING_KIND_CAPTION_MAX_CHARS).toBe(8192);
+    expect(trainingKindBlocker(0)).toMatch(/No items/);
+    expect(trainingKindBlocker(50)).toBeNull();
+    expect(trainingKindBlocker(51)).toMatch(/at most 50/);
+    const long = [{ itemId: 'a', caption: 'x'.repeat(8193) }];
+    expect(pairUploadsWithSnapshot([uploads[0]!], long).problems).toEqual([
+      "Training-set image #1's caption is longer than 8192 characters.",
+    ]);
+    expect(pairUploadsWithSnapshot([uploads[0]!], [{ itemId: 'a', caption: 'x'.repeat(8192) }]).problems).toEqual([]);
+  });
+
+  it('builds the items body from the upload result + captions (no datasetId, no quoteId)', () => {
+    const { items } = pairUploadsWithSnapshot(uploads, snapshotItems, ['b', 'c', 'a']);
+    const body = buildTrainingKindBody({ items, config });
+    expect(body).toEqual({
+      kind: 'training',
+      items: [
+        { air: 'up-1.png', caption: 'profile view' },
+        { air: 'up-2.png', caption: 'back view' },
+        { air: 'up-3.png', caption: 'front view' },
+      ],
+      engine: 'ai-toolkit',
+      model: 'flux_dev',
+      params: {
+        engine: 'ai-toolkit',
+        ecosystem: 'flux1',
+        modelVariant: 'dev',
         steps: 2000,
         epochs: 10,
-        samplePrompt: '',
+        resolution: 1024,
+        lr: 0.0001,
+        textEncoderLr: null,
+        trainTextEncoder: false,
+        lrScheduler: 'cosine',
+        optimizerType: 'adamw8bit',
+        networkDim: 32,
+        networkAlpha: 16,
+        noiseOffset: null,
+        minSnrGamma: null,
+        flipAugmentation: false,
+        shuffleTokens: false,
+        keepTokens: 0,
       },
-    });
-    expect(body).toMatchObject({
-      kind: 'training',
-      datasetId: 'tds_0123456789abcdef0123456789abcdef',
-      engine: 'ai-toolkit',
-      model: 'sdxl',
       triggerWord: 'mytok',
       samplePrompts: ['mytok, portrait'],
     });
-    expect(body.params).toMatchObject({
-      engine: 'ai-toolkit',
-      ecosystem: 'sdxl',
-      steps: 2000,
-      epochs: 10,
-      resolution: 1024,
-      lr: 0.0001,
-      trainTextEncoder: false,
-      lrScheduler: 'cosine',
-      optimizerType: 'adamw8bit',
-      networkDim: 32,
-      networkAlpha: 16,
+  });
+
+  it('SDXL: the items body carries the upload airs + captions verbatim and no datasetId (0.77 contract)', () => {
+    const sdxl = TRAINING_PRESETS.find((p) => p.id === 'sdxl')!;
+    const body = buildTrainingKindBody({
+      items: [
+        { air: 'blobA.png', caption: 'one' },
+        { air: 'blobB.png', caption: 'two' },
+      ],
+      config: { ...config, preset: sdxl },
     });
-    expect(body).not.toHaveProperty('quoteId');
+    expect(body.items).toEqual([
+      { air: 'blobA.png', caption: 'one' },
+      { air: 'blobB.png', caption: 'two' },
+    ]);
+    expect(body).toMatchObject({ kind: 'training', model: 'sdxl', params: { ecosystem: 'sdxl', resolution: 1024 } });
+    expect(body).not.toHaveProperty('datasetId');
+  });
+
+  it('every preset is wired for the trainer with a catalog key, and only SDXL for the pass-through step', () => {
+    expect(TRAINING_PRESETS.map((p) => [p.id, p.trainingKind?.model, p.trainingKind?.arm.ecosystem])).toEqual([
+      ['sdxl', 'sdxl', 'sdxl'],
+      ['pony', 'pony', 'sdxl'],
+      ['illustrious', 'illustrious', 'sdxl'],
+      ['sd15', 'sd_1_5', 'sd1'],
+      ['flux', 'flux_dev', 'flux1'],
+      ['qwen', 'qwen_image', 'qwen'],
+      ['chroma', 'chroma', 'chroma'],
+    ]);
+    expect(TRAINING_PRESETS.filter(passThroughAvailable).map((p) => p.id)).toEqual(['sdxl']);
+  });
+
+  it('refuses to build an empty or over-cap items body instead of sending it', () => {
+    expect(() => buildTrainingKindBody({ items: [], config })).toThrow(/1 to 50/);
+    const many = Array.from({ length: 51 }, (_, i) => ({ air: `k${i}`, caption: '' }));
+    expect(() => buildTrainingKindBody({ items: many, config })).toThrow(/1 to 50/);
   });
 
   it('classifies a training quote only when the server quote is usable and matches cost', () => {
@@ -421,6 +486,61 @@ describe("dedicated kind: 'training' (the viewer's own images)", () => {
     expect(refused.message).toMatch(/nothing was charged/);
 
     expect(trainingKindRunFailure({ signInRequired: true }).kind).toBe('sign-in');
+  });
+
+  it('trainingDataNotUploaded (host code) asks for a fresh upload and says nothing was charged', () => {
+    const expected = {
+      kind: 'not-uploaded',
+      message:
+        'Civitai no longer has these uploads for this page (for example after a reload). No run was started and no Buzz was charged. Upload the images again, then price the run again.',
+    };
+    // The SDK's flag, and the bare host code (a RunTrainingError carries both).
+    expect(trainingKindRunFailure({ trainingDataNotUploaded: true, message: 'x' })).toEqual(expected);
+    expect(trainingKindRunFailure({ code: 'training data not uploaded here' })).toEqual(expected);
+    expect(
+      trainingKindRunFailure(new RunTrainingError('training data not uploaded here')),
+    ).toEqual(expected);
+    // ...but unconfirmed still wins: a run that MAY exist is never "re-upload and retry".
+    expect(
+      trainingKindRunFailure({ trainingDataNotUploaded: true, unconfirmed: true }).kind,
+    ).toBe('unconfirmed');
+  });
+});
+
+describe('buildTrainingBody — pass-through body pinned whole (invariant across the SDK bump)', () => {
+  it('SDXL still submits exactly the #541 pass-through body', () => {
+    const dataset = assembleTrainingItems([
+      { url: 'https://civitai.com/v2/consumer/blobs/k1', caption: 'one' },
+      { url: 'https://civitai.com/v2/consumer/blobs/k2', caption: 'two' },
+    ]);
+    const body = buildTrainingBody(dataset, {
+      preset: TRAINING_PRESETS.find((p) => p.id === 'sdxl')!,
+      triggerWord: 'mytok',
+      steps: 2000,
+      epochs: 10,
+      samplePrompt: '',
+    });
+    expect(body).toEqual({
+      kind: 'step',
+      $type: 'training',
+      maxBuzz: 1,
+      input: {
+        engine: 'ai-toolkit',
+        ecosystem: 'sdxl',
+        model: 'urn:air:sdxl:checkpoint:civitai:101055@128078',
+        steps: 2000,
+        epochs: 10,
+        triggerWord: 'mytok',
+        trainingData: {
+          type: 'blobs',
+          items: [
+            { air: 'k1', caption: 'one' },
+            { air: 'k2', caption: 'two' },
+          ],
+        },
+        samples: { prompts: ['mytok, portrait'] },
+      },
+    });
   });
 });
 

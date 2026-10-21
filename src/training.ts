@@ -24,10 +24,16 @@
 //    rounding so per-contributor credits always sum back to the gross amount.
 //  - Amounts are tracked credit, never paid/spendable Buzz (locked decision).
 
-import type {
-  BlockTrainingQuote,
-  BlockWorkflowSnapshot,
-  WorkflowBodyTraining,
+import {
+  BLOCK_TRAINING_CAPTION_MAX_CHARS,
+  BLOCK_TRAINING_DATASET_MAX_ITEMS,
+  BLOCK_TRAINING_MAX_BUZZ_PER_RUN,
+  type AiToolkitTrainingParams,
+  type BlockTrainingDataImage,
+  type BlockTrainingDatasetItem,
+  type BlockTrainingQuote,
+  type BlockWorkflowSnapshot,
+  type WorkflowBodyTraining,
 } from '@civitai/app-sdk/blocks';
 
 // ---------------------------------------------------------------------------
@@ -365,43 +371,119 @@ export function trackedTotals(
 // Training configuration + workflow body
 // ---------------------------------------------------------------------------
 
+/**
+ * How one base model runs on Civitai's trainer (`kind: 'training'`): the
+ * training-catalog key (`WorkflowBodyTraining.model` — a catalog key, never an
+ * AIR) plus the `params.ecosystem` / `params.modelVariant` pair the host checks
+ * against that catalog entry, and the training resolution.
+ */
+type ArmOf<T> = T extends unknown ? Pick<T, Extract<'ecosystem' | 'modelVariant', keyof T>> : never;
+export type TrainingKindEcosystem = ArmOf<AiToolkitTrainingParams>;
+
+export interface TrainingKindModel {
+  model: string;
+  arm: TrainingKindEcosystem;
+  resolution: number;
+}
+
 export interface TrainingPreset {
   id: string;
   label: string;
   ecosystem: string;
   /**
-   * Base checkpoint AIR (Training Studio default for the ecosystem), or null
-   * when this build has no verified AIR for the preset — the UI disables a
-   * null-AIR preset rather than guessing an identifier.
+   * Base checkpoint AIR for the pass-through `training` step (≤ the page's
+   * per-call budget), or null when this build has no verified AIR for the
+   * preset — the pass-through button is then disabled, never guessed.
    */
   modelAir: string | null;
   /** Indicative Training Studio default price — the ESTIMATE is the real price. */
   approxBuzz: number;
-  /** Platform status: true while the per-call budget clamps at 1000 Buzz. */
+  /** True while the preset's typical price fits the page's 1000-Buzz per-call budget. */
   withinCurrentCap: boolean;
-  /** Dedicated `kind: 'training'` catalog key/ecosystem, when wired. */
-  trainingKindModel?: string;
-  trainingKindEcosystem?: 'sdxl';
-  trainingKindResolution?: number;
+  /** Civitai's trainer (`kind: 'training'`, up to 5000 Buzz), when wired. */
+  trainingKind?: TrainingKindModel;
 }
 
 /**
- * v1 base-model presets (narrowest supported path first). Prices are Training
- * Studio defaults quoted on #541; they are display hints only — the estimate
- * is the price. Only the SDXL preset carries a verified AIR (the one the
- * platform's own #541 example submits); the others are listed so the UI can
- * show the roadmap honestly, disabled with their reason. Models ≥ ~1160 Buzz
- * (Flux, Qwen, Chroma, Krea2) additionally wait on the 5000-Buzz dedicated
- * training kind (civitai/civitai#5434, flag-off at time of writing).
+ * Base-model presets. Prices are Training Studio defaults quoted on #541; they
+ * are display hints only — the estimate is the price. Only SDXL carries a
+ * verified AIR for the pass-through step (the one the platform's own #541
+ * example submits). Every preset can run on Civitai's trainer
+ * (`kind: 'training'`), which is the only path for models priced above the
+ * per-call budget (Flux, Qwen, Chroma). The catalog keys mirror Civitai's
+ * training catalog; the host refuses an unknown or disabled key at the
+ * estimate, and that refusal is shown verbatim.
  */
 export const TRAINING_PRESETS: readonly TrainingPreset[] = [
-  { id: 'sdxl', label: 'SDXL', ecosystem: 'sdxl', modelAir: 'urn:air:sdxl:checkpoint:civitai:101055@128078', approxBuzz: 500, withinCurrentCap: true, trainingKindModel: 'sdxl', trainingKindEcosystem: 'sdxl', trainingKindResolution: 1024 },
-  { id: 'pony', label: 'Pony (~500 Buzz — base AIR not wired in v1)', ecosystem: 'sdxl', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
-  { id: 'illustrious', label: 'Illustrious (~500 Buzz — base AIR not wired in v1)', ecosystem: 'sdxl', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
-  { id: 'sd15', label: 'SD 1.5 (~500 Buzz — base AIR not wired in v1)', ecosystem: 'sd1', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
-  { id: 'anima', label: 'Anima (~725 Buzz — base AIR not wired in v1)', ecosystem: 'anima', modelAir: null, approxBuzz: 725, withinCurrentCap: true },
-  { id: 'flux', label: 'Flux (≥ ~1160 Buzz — needs the 5000-Buzz training kind, not yet live)', ecosystem: 'flux', modelAir: null, approxBuzz: 1160, withinCurrentCap: false },
+  {
+    id: 'sdxl',
+    label: 'SDXL',
+    ecosystem: 'sdxl',
+    modelAir: 'urn:air:sdxl:checkpoint:civitai:101055@128078',
+    approxBuzz: 500,
+    withinCurrentCap: true,
+    trainingKind: { model: 'sdxl', arm: { ecosystem: 'sdxl' }, resolution: 1024 },
+  },
+  {
+    id: 'pony',
+    label: 'Pony',
+    ecosystem: 'sdxl',
+    modelAir: null,
+    approxBuzz: 500,
+    withinCurrentCap: true,
+    trainingKind: { model: 'pony', arm: { ecosystem: 'sdxl' }, resolution: 1024 },
+  },
+  {
+    id: 'illustrious',
+    label: 'Illustrious',
+    ecosystem: 'sdxl',
+    modelAir: null,
+    approxBuzz: 500,
+    withinCurrentCap: true,
+    trainingKind: { model: 'illustrious', arm: { ecosystem: 'sdxl' }, resolution: 1024 },
+  },
+  {
+    id: 'sd15',
+    label: 'SD 1.5',
+    ecosystem: 'sd1',
+    modelAir: null,
+    approxBuzz: 500,
+    withinCurrentCap: true,
+    trainingKind: { model: 'sd_1_5', arm: { ecosystem: 'sd1' }, resolution: 512 },
+  },
+  {
+    id: 'flux',
+    label: 'Flux',
+    ecosystem: 'flux1',
+    modelAir: null,
+    approxBuzz: 1160,
+    withinCurrentCap: false,
+    trainingKind: { model: 'flux_dev', arm: { ecosystem: 'flux1', modelVariant: 'dev' }, resolution: 1024 },
+  },
+  {
+    id: 'qwen',
+    label: 'Qwen-Image',
+    ecosystem: 'qwen',
+    modelAir: null,
+    approxBuzz: 1160,
+    withinCurrentCap: false,
+    trainingKind: { model: 'qwen_image', arm: { ecosystem: 'qwen' }, resolution: 1024 },
+  },
+  {
+    id: 'chroma',
+    label: 'Chroma',
+    ecosystem: 'chroma',
+    modelAir: null,
+    approxBuzz: 1160,
+    withinCurrentCap: false,
+    trainingKind: { model: 'chroma', arm: { ecosystem: 'chroma' }, resolution: 1024 },
+  },
 ];
+
+/** True when the pass-through `training` step can run this preset. */
+export function passThroughAvailable(preset: TrainingPreset): boolean {
+  return preset.modelAir != null && preset.withinCurrentCap;
+}
 
 export const DEFAULT_TRAINING_PRESET: TrainingPreset = TRAINING_PRESETS[0]!;
 
@@ -460,136 +542,145 @@ export function buildTrainingBody(
 export type TrainingBody = ReturnType<typeof buildTrainingBody>;
 
 // ---------------------------------------------------------------------------
-// Dedicated `kind: 'training'` path — the viewer's own Civitai images
+// Civitai's trainer — `kind: 'training'` on images the trainer uploads
 // ---------------------------------------------------------------------------
+//
+// SDK 0.77 contract: the dataset is `items: [{ air, caption }]` (1–50, each
+// blob once), and every `air` must be a blob the HOST uploaded for this block
+// instance through `useImageUpload({ purpose: 'trainingData' })`. The host
+// refuses a quote naming any other blob (`training data not uploaded here`),
+// and forgets its uploads on a page reload. Community items live in shared
+// storage as images + captions, so the trainer re-uploads the frozen snapshot's
+// images and each upload is matched to one snapshot item, whose frozen caption
+// it carries.
 
-export const TRAINING_KIND_MAX_ITEMS = 50;
-export const TRAINING_KIND_CAPTION_MAX_CHARS = 1000;
-export const TRAINING_KIND_MAX_BUZZ = 5000;
-
-export interface TrainingKindCandidate {
-  itemId: string;
-  imageId: number;
-  caption: string;
-}
-
-export interface TrainingKindBlocker {
-  itemId: string;
-  contributorId: string;
-  reason: string;
-}
-
-export interface TrainingKindEligibility {
-  candidates: TrainingKindCandidate[];
-  blockers: TrainingKindBlocker[];
-  /** True only when EVERY included snapshot item can go through this path. */
-  ready: boolean;
-}
+export const TRAINING_KIND_MAX_ITEMS = BLOCK_TRAINING_DATASET_MAX_ITEMS;
+export const TRAINING_KIND_CAPTION_MAX_CHARS = BLOCK_TRAINING_CAPTION_MAX_CHARS;
+export const TRAINING_KIND_MAX_BUZZ = BLOCK_TRAINING_MAX_BUZZ_PER_RUN;
 
 /**
- * Decide whether a frozen snapshot can use Civitai's dedicated training kind.
- * That host path admits only the signed-in trainer's own images, so this app
- * deliberately does not silently train a subset of a collaborative snapshot:
- * every included item must be the trainer's, carry a Civitai image id, have a
- * caption inside the host bound, and fit the 50-image dataset bound. Anything
- * else is returned as a blocker for the UI to name.
+ * Why the snapshot's included set cannot go to Civitai's trainer at all, or
+ * null when it can (1…50 included items). The app never trains a silent subset.
  */
-export function trainingKindEligibility(
-  snapshot: DatasetSnapshot,
-  trainerId: string = snapshot.trainerId,
-): TrainingKindEligibility {
-  const candidates: TrainingKindCandidate[] = [];
-  const blockers: TrainingKindBlocker[] = [];
-  const seenImageIds = new Set<number>();
-  for (const item of includedItems(snapshot)) {
-    if (item.contributorId !== trainerId) {
-      blockers.push({
-        itemId: item.itemId,
-        contributorId: item.contributorId,
-        reason: 'it was contributed by someone else; the trainer\'s own-images path cannot submit it',
-      });
-      continue;
-    }
-    if (item.imageId == null || !Number.isInteger(item.imageId) || item.imageId <= 0) {
-      blockers.push({
-        itemId: item.itemId,
-        contributorId: item.contributorId,
-        reason: 'it has no Civitai image ID, so Civitai cannot verify that it is the trainer\'s own image',
-      });
-      continue;
-    }
-    if (item.caption.length > TRAINING_KIND_CAPTION_MAX_CHARS) {
-      blockers.push({
-        itemId: item.itemId,
-        contributorId: item.contributorId,
-        reason: `its caption is longer than ${TRAINING_KIND_CAPTION_MAX_CHARS} characters`,
-      });
-      continue;
-    }
-    if (seenImageIds.has(item.imageId)) {
-      blockers.push({
-        itemId: item.itemId,
-        contributorId: item.contributorId,
-        reason: `it duplicates Civitai image #${item.imageId} already in the training set`,
-      });
-      continue;
-    }
-    if (candidates.length >= TRAINING_KIND_MAX_ITEMS) {
-      blockers.push({
-        itemId: item.itemId,
-        contributorId: item.contributorId,
-        reason: `it is beyond the ${TRAINING_KIND_MAX_ITEMS}-image limit for one prepared training dataset`,
-      });
-      continue;
-    }
-    seenImageIds.add(item.imageId);
-    candidates.push({ itemId: item.itemId, imageId: item.imageId, caption: item.caption });
+export function trainingKindBlocker(includedCount: number): string | null {
+  if (includedCount <= 0) return 'No items are in the training set.';
+  if (includedCount > TRAINING_KIND_MAX_ITEMS) {
+    return `The training set has ${includedCount} images; Civitai's trainer takes at most ${TRAINING_KIND_MAX_ITEMS} per run. Exclude some before uploading.`;
   }
-  return { candidates, blockers, ready: includedItems(snapshot).length > 0 && blockers.length === 0 };
+  return null;
+}
+
+export interface TrainingKindPairing {
+  /** The dataset body, in upload order — empty whenever `problems` is non-empty. */
+  items: BlockTrainingDatasetItem[];
+  /** The snapshot item each upload was matched to, in upload order. */
+  itemIds: string[];
+  /** Everything that stops pricing, one sentence each. Empty = ready. */
+  problems: string[];
 }
 
 /**
- * Build the dedicated training body for a dataset Civitai prepared from the
- * trainer's own images. The estimate call sends this exact object WITHOUT a
- * quoteId; the run call sends `{ ...body, quoteId }` and changes nothing else.
+ * Pair the host's upload result with the frozen snapshot's included items.
+ * `assignment[i]` names the snapshot item upload `i` is (default: the same
+ * position, so uploading the numbered images in order needs no extra step).
+ * Every included item must be matched exactly once and every upload must carry
+ * a distinct blob key; the caption is the snapshot item's frozen caption.
+ */
+export function pairUploadsWithSnapshot(
+  uploads: readonly BlockTrainingDataImage[],
+  included: readonly Pick<SnapshotItem, 'itemId' | 'caption'>[],
+  assignment: readonly (string | undefined)[] = [],
+): TrainingKindPairing {
+  const problems: string[] = [];
+  const blocker = trainingKindBlocker(included.length);
+  if (blocker) problems.push(blocker);
+  if (uploads.length !== included.length) {
+    problems.push(
+      `You uploaded ${uploads.length} image${uploads.length === 1 ? '' : 's'}, but the training set has ${included.length}. Upload exactly the ${included.length} images listed.`,
+    );
+  }
+  const byId = new Map(included.map((item, index) => [item.itemId, { item, index }]));
+  const seenKeys = new Map<string, number>();
+  const seenItems = new Map<string, number>();
+  const itemIds: string[] = [];
+  const items: BlockTrainingDatasetItem[] = [];
+  uploads.forEach((upload, index) => {
+    const n = index + 1;
+    const air = typeof upload.air === 'string' ? upload.air.trim() : '';
+    if (!air) {
+      problems.push(`Upload #${n} came back without a blob key — upload again.`);
+    } else {
+      const key = air.toLowerCase(); // the host compares keys case-insensitively
+      const first = seenKeys.get(key);
+      if (first != null) problems.push(`Upload #${n} is the same file as upload #${first}.`);
+      else seenKeys.set(key, n);
+    }
+    const itemId = assignment[index] ?? included[index]?.itemId;
+    const match = itemId != null ? byId.get(itemId) : undefined;
+    if (!match) {
+      problems.push(`Upload #${n} is not matched to an image in the training set.`);
+      return;
+    }
+    const firstUpload = seenItems.get(match.item.itemId);
+    if (firstUpload != null) {
+      problems.push(`Training-set image #${match.index + 1} is matched to both upload #${firstUpload} and upload #${n}.`);
+    } else {
+      seenItems.set(match.item.itemId, n);
+    }
+    if (match.item.caption.length > TRAINING_KIND_CAPTION_MAX_CHARS) {
+      problems.push(
+        `Training-set image #${match.index + 1}'s caption is longer than ${TRAINING_KIND_CAPTION_MAX_CHARS} characters.`,
+      );
+    }
+    itemIds.push(match.item.itemId);
+    items.push({ air, caption: match.item.caption });
+  });
+  return problems.length > 0 ? { items: [], itemIds, problems } : { items, itemIds, problems };
+}
+
+/**
+ * Build the `kind: 'training'` body. The estimate sends this exact object
+ * WITHOUT a quoteId; the run sends `{ ...body, quoteId }` and changes nothing
+ * else (the server checks the run body against the quoted one).
  */
 export function buildTrainingKindBody(args: {
-  preparedDatasetId: string;
+  items: readonly BlockTrainingDatasetItem[];
   config: TrainingConfig;
 }): WorkflowBodyTraining {
-  const { preset } = args.config;
-  if (!preset.trainingKindModel || !preset.trainingKindEcosystem) {
-    throw new Error(`Training preset "${preset.id}" is not wired for Civitai's own-images training kind in this build.`);
+  const kind = args.config.preset.trainingKind;
+  if (!kind) {
+    throw new Error(`Training preset "${args.config.preset.id}" is not wired for Civitai's trainer in this build.`);
   }
-  if (!args.preparedDatasetId) {
-    throw new Error('Cannot build an own-images training body before Civitai prepares the dataset.');
+  if (args.items.length === 0 || args.items.length > TRAINING_KIND_MAX_ITEMS) {
+    throw new Error(`Civitai's trainer needs 1 to ${TRAINING_KIND_MAX_ITEMS} uploaded images (got ${args.items.length}).`);
   }
   const trigger = args.config.triggerWord.trim() || 'dataset';
   const sample = args.config.samplePrompt.trim() || `${trigger}, portrait`;
+  const params: AiToolkitTrainingParams = {
+    engine: 'ai-toolkit',
+    ...kind.arm,
+    steps: Math.max(1, Math.trunc(args.config.steps) || 1),
+    epochs: Math.max(1, Math.trunc(args.config.epochs) || 1),
+    resolution: kind.resolution,
+    lr: 0.0001,
+    textEncoderLr: null,
+    trainTextEncoder: false,
+    lrScheduler: 'cosine',
+    optimizerType: 'adamw8bit',
+    networkDim: 32,
+    networkAlpha: 16,
+    noiseOffset: null,
+    minSnrGamma: null,
+    flipAugmentation: false,
+    shuffleTokens: false,
+    keepTokens: 0,
+  };
   return {
     kind: 'training',
-    datasetId: args.preparedDatasetId,
+    items: args.items.map((item) => ({ air: item.air, caption: item.caption })),
     engine: 'ai-toolkit',
-    model: preset.trainingKindModel,
-    params: {
-      engine: 'ai-toolkit',
-      ecosystem: preset.trainingKindEcosystem,
-      steps: Math.max(1, Math.trunc(args.config.steps) || 1),
-      epochs: Math.max(1, Math.trunc(args.config.epochs) || 1),
-      resolution: preset.trainingKindResolution ?? 1024,
-      lr: 0.0001,
-      textEncoderLr: null,
-      trainTextEncoder: false,
-      lrScheduler: 'cosine',
-      optimizerType: 'adamw8bit',
-      networkDim: 32,
-      networkAlpha: 16,
-      noiseOffset: null,
-      minSnrGamma: null,
-      flipAugmentation: false,
-      shuffleTokens: false,
-      keepTokens: 0,
-    },
+    model: kind.model,
+    params,
     triggerWord: trigger,
     samplePrompts: [sample],
   };
@@ -633,12 +724,21 @@ export function classifyTrainingKindQuote(
   return { kind: 'quoted', quote: { ...quote, total: Math.round(quote.total) } };
 }
 
-export type TrainingKindRunFailureKind = 'declined' | 'unconfirmed' | 'refused' | 'sign-in' | 'error';
+export type TrainingKindRunFailureKind =
+  | 'declined'
+  | 'unconfirmed'
+  | 'not-uploaded'
+  | 'refused'
+  | 'sign-in'
+  | 'error';
 
 export interface TrainingKindRunFailure {
   kind: TrainingKindRunFailureKind;
   message: string;
 }
+
+/** The host's refusal code for a quote naming a blob it did not upload here. */
+export const TRAINING_DATA_NOT_UPLOADED_CODE = 'training data not uploaded here';
 
 /**
  * Translate a `useRunTraining()` failure into copy that is exact about whether
@@ -661,8 +761,15 @@ export function trainingKindRunFailure(error: unknown): TrainingKindRunFailure {
         'The training submission is unconfirmed — a run may exist and may have been charged. Check your Civitai trainings before trying again; this app will not retry automatically.',
     };
   }
+  if (record.trainingDataNotUploaded === true || record.code === TRAINING_DATA_NOT_UPLOADED_CODE) {
+    return {
+      kind: 'not-uploaded',
+      message:
+        "Civitai no longer has these uploads for this page (for example after a reload). No run was started and no Buzz was charged. Upload the images again, then price the run again.",
+    };
+  }
   if (record.signInRequired === true || record.code === 'sign in to train') {
-    return { kind: 'sign-in', message: 'Sign in to train, then price the own-images run again.' };
+    return { kind: 'sign-in', message: 'Sign in to train, then price the run again.' };
   }
   if (record.refused === true || record.code === 'refused') {
     return {
