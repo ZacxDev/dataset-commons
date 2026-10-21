@@ -1,7 +1,7 @@
 {
   "name": "dataset-commons",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "description": "Civitai App (page money path) — estimate -> consent -> submit -> poll -> real Buzz spend, wired to the published App SDK.",
   "license": "MIT",

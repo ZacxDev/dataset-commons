@@ -101,6 +101,14 @@ export interface MockMoneyHostOptions extends MockHostOptions {
 /** `uninstall()`, plus the SDK mock host's live `setScenario` for mid-test changes. */
 export type MockMoneyHostHandle = (() => void) & {
   setScenario: ReturnType<typeof createMockHost>['setScenario'];
+  /**
+   * While set, every WORKFLOW_STATUS reply is replaced by the reply the real
+   * host sends when its `blocks.pollWorkflow` call is refused (e.g. an expired
+   * block token): civitai `failureSnapshot(err)` —
+   * `{ workflowId: 'failed', status: 'failed', error: <message> }`. `null` restores
+   * the mock's own replies.
+   */
+  setHostPollError: (message: string | null) => void;
 };
 
 /**
@@ -119,6 +127,8 @@ export function installMockMoneyHost(options: MockMoneyHostOptions = {}): MockMo
   // Tracks whether the block's last submit named a pool — gates the disallowed
   // rewrite so only a picked-pool failure becomes the domain-clamp rejection.
   let pickedPool = false;
+  // See MockMoneyHostHandle.setHostPollError.
+  let hostPollError: string | null = null;
 
   // Inbound: rewrite a failed snapshot's error into the domain-clamp rejection,
   // and add `trainedEpochsFor` epochs to those ids' succeeded snapshots.
@@ -135,6 +145,10 @@ export function installMockMoneyHost(options: MockMoneyHostOptions = {}): MockMo
       | null
       | undefined;
     if (!data || (data.type !== 'WORKFLOW_STATUS' && data.type !== 'WORKFLOW_SUBMITTED')) return;
+    if (hostPollError !== null && data.type === 'WORKFLOW_STATUS' && data.payload) {
+      data.payload.snapshot = { workflowId: 'failed', status: 'failed', error: hostPollError };
+      return;
+    }
     const snap = data.payload?.snapshot;
     const epochs = snap?.workflowId != null ? trainedEpochsFor?.[snap.workflowId] : undefined;
     if (snap && epochs && snap.status === 'succeeded' && snap.trainedEpochs == null) {
@@ -182,5 +196,10 @@ export function installMockMoneyHost(options: MockMoneyHostOptions = {}): MockMo
     uninstallHost();
     window.removeEventListener('message', rewriteInbound);
   };
-  return Object.assign(uninstall, { setScenario: host.setScenario });
+  return Object.assign(uninstall, {
+    setScenario: host.setScenario,
+    setHostPollError: (message: string | null) => {
+      hostPollError = message;
+    },
+  });
 }

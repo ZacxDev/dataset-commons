@@ -1149,4 +1149,180 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.getByTestId('dc-steps')).toHaveValue(2000);
     expect(screen.getByTestId('dc-epochs')).toHaveValue(10);
   });
+  // --- 0.3.1: a host/token error while following a run is never the run failing.
+  // Live 2026-10-21: a pass-through run followed from a background tab outlived
+  // the page's 15-minute block token; the host answered the next poll with its
+  // failure-shape reply `{ workflowId: 'failed', status: 'failed', error: 'invalid
+  // block token' }` and the app showed the run as FAILED and stopped tracking it.
+
+  const TOKEN_ERROR = 'invalid block token';
+
+  function trackingHost(
+    extra: Parameters<typeof installMockMoneyHost>[0] = {},
+  ) {
+    const polls: string[] = [];
+    const ledgerEvents: LedgerEvent[] = [];
+    const links: TrainRunLink[] = [];
+    const host = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+      cost: 512,
+      buzzBudget: PAGE_BUZZ_BUDGET,
+      trainingQuoteTotal: 725,
+      // Still training until the test releases it.
+      pollsUntilDone: 1000,
+      buzzBalance: { blue: 5000, green: 0, yellow: 5000 },
+      generation: { trainedEpochs: 10 },
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+      onOutbound: (m) => {
+        if (m.type === 'POLL_WORKFLOW') polls.push((m.payload as { workflowId: string }).workflowId);
+      },
+      ...extra,
+    });
+    uninstall = host;
+    const props: Partial<TrainFlowProps> = {
+      initialItems: communityItems,
+      onLedgerEvent: (event) => {
+        ledgerEvents.push(event);
+      },
+      onRunLinked: (link) => {
+        links.push(link);
+      },
+    };
+    return { host, polls, ledgerEvents, links, props };
+  }
+
+  /** The token lapses mid-run; resolves once the app has re-polled after the error (≥ `n` error polls). */
+  async function tokenLapsesMidRun(
+    host: ReturnType<typeof installMockMoneyHost>,
+    polls: string[],
+    n = 2,
+  ) {
+    await waitFor(() => expect(polls.length).toBeGreaterThan(0), { timeout: 5000 });
+    expect(screen.getByTestId('dc-run-state')).toHaveTextContent(/training/i);
+    host.setHostPollError(TOKEN_ERROR);
+    const before = polls.length;
+    await waitFor(() => expect(polls.length - before).toBeGreaterThanOrEqual(n), { timeout: 10000 });
+  }
+
+  it('pass-through: a token error mid-run keeps the run tracked, then records its ledger and LoRA when it succeeds', async () => {
+    const user = userEvent.setup();
+    const { host, polls, ledgerEvents, links, props } = trackingHost();
+    await renderTrainFlow(props);
+    await uploadAndAttest(user);
+    await user.click(screen.getByTestId('dc-estimate'));
+    await user.click(await screen.findByTestId('dc-confirm-submit'));
+
+    await tokenLapsesMidRun(host, polls);
+    // Not a failed run: still training, with a non-terminal notice.
+    expect(screen.queryByTestId('dc-run-failed')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-run-state')).toHaveTextContent(/training/i);
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent('Lost contact with Civitai — still checking…');
+    expect(screen.getByTestId('dc-lost-contact-detail')).toHaveTextContent(TOKEN_ERROR);
+    expect(screen.getByTestId('dc-check-again')).toBeInTheDocument();
+
+    // The host can answer again and the run has finished.
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    await screen.findByTestId('dc-publish', {}, { timeout: 10000 });
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]).toMatchObject({ eventType: 'training', grossBuzz: 512 });
+    expect(ledgerEvents[0]!.sourceRef).toBe(polls[0]);
+    expect(links.length).toBeGreaterThan(0);
+    expect(links.every((l) => l.workflowId === polls[0])).toBe(true);
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-run-failed')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-ledger')).toBeInTheDocument();
+  }, 30000);
+
+  it("Civitai's trainer: a token error mid-watch keeps the run tracked, then records its ledger and LoRA when it succeeds", async () => {
+    const user = userEvent.setup();
+    const { host, polls, ledgerEvents, links, props } = trackingHost();
+    await renderTrainFlow(props);
+    await uploadAndPrice(user);
+    await user.click(await screen.findByTestId('dc-kind-run'));
+
+    await tokenLapsesMidRun(host, polls);
+    expect(screen.queryByTestId('dc-run-failed')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-run-state')).toHaveTextContent(/training/i);
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent('still checking…');
+
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    await screen.findByTestId('dc-publish', {}, { timeout: 10000 });
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]).toMatchObject({ eventType: 'training', grossBuzz: 725 });
+    expect(ledgerEvents[0]!.sourceRef).toBe(polls[0]);
+    expect(links.length).toBeGreaterThan(0);
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-run-failed')).not.toBeInTheDocument();
+  }, 30000);
+
+  it('a manual Check again that meets the token error leaves the run as it was', async () => {
+    const user = userEvent.setup();
+    const { host, polls, ledgerEvents, props } = trackingHost({ pollsUntilDone: 1, generation: { trainedEpochs: 0 } });
+    await renderTrainFlow(props);
+    await uploadAndAttest(user);
+    await user.click(screen.getByTestId('dc-estimate'));
+    await user.click(await screen.findByTestId('dc-confirm-submit'));
+    await screen.findByTestId('dc-moderation', {}, { timeout: 5000 });
+
+    host.setHostPollError(TOKEN_ERROR);
+    const before = polls.length;
+    await user.click(screen.getByTestId('dc-check-again'));
+    await waitFor(() => expect(polls.length).toBe(before + 1));
+    // Whichever the reply produced, it must not be a failed run.
+    await waitFor(() =>
+      expect(screen.queryByTestId('dc-lost-contact') ?? screen.queryByTestId('dc-run-failed')).not.toBeNull(),
+    );
+    expect(screen.queryByTestId('dc-run-failed')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent("couldn't be checked just now");
+    expect(screen.getByTestId('dc-moderation')).toBeInTheDocument();
+
+    host.setHostPollError(null);
+    host.setScenario({ generation: { trainedEpochs: 10 } });
+    await user.click(screen.getByTestId('dc-check-again'));
+    await screen.findByTestId('dc-publish', {}, { timeout: 5000 });
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+  });
+
+  it('coming back into view re-polls at once instead of waiting out the backoff', async () => {
+    const user = userEvent.setup();
+    const { host, polls, props } = trackingHost();
+    await renderTrainFlow(props);
+    await uploadAndAttest(user);
+    await user.click(screen.getByTestId('dc-estimate'));
+    await user.click(await screen.findByTestId('dc-confirm-submit'));
+
+    // Three unanswered polls (1s + 2s apart): the next re-poll is 4s away.
+    await tokenLapsesMidRun(host, polls, 3);
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    const before = polls.length;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await waitFor(() => expect(polls.length).toBe(before + 1), { timeout: 1000 });
+    await screen.findByTestId('dc-publish', {}, { timeout: 1500 });
+  }, 30000);
+
+  it("a run that really failed ends tracking, and Check again stays available", async () => {
+    const user = userEvent.setup();
+    const { polls, props } = trackingHost({
+      pollsUntilDone: 1,
+      generation: { trainedEpochs: 10, workflowOutcome: () => 'failed' },
+    });
+    await renderTrainFlow(props);
+    await uploadAndAttest(user);
+    await user.click(screen.getByTestId('dc-estimate'));
+    await user.click(await screen.findByTestId('dc-confirm-submit'));
+
+    expect(await screen.findByTestId('dc-run-failed', {}, { timeout: 5000 })).toHaveTextContent('mock: workflow failed');
+    expect(screen.getByTestId('dc-run-state')).toHaveTextContent('failed');
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-check-again')).toBeInTheDocument();
+    // [INVARIANT GUARD] the run's own failed status still ends the loop.
+    const settled = polls.length;
+    await new Promise((r) => setTimeout(r, 3000));
+    expect(polls.length).toBe(settled);
+  }, 15000);
 });

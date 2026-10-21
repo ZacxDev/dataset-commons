@@ -1093,6 +1093,40 @@ export function trainingStateForSnapshot(
   }
 }
 
+/**
+ * Whether a poll reply is the host saying it could not answer, rather than the
+ * workflow's own status.
+ *
+ * When the host's `blocks.pollWorkflow` call throws with a refusal code (e.g.
+ * UNAUTHORIZED "invalid block token" once the page's 15-minute block token has
+ * lapsed in a background tab), the host does not throw to the block: it replies
+ * with `failureSnapshot(err)` — `{ workflowId: 'failed', status: 'failed', error }`
+ * (civitai `src/components/AppBlocks/failureSnapshot.ts`). That reply has
+ * `status: 'failed'`, which reads exactly like a failed run, but it is NOT about
+ * the polled workflow: its `workflowId` is the host's sentinel, never the id that
+ * was polled. A real snapshot of the run, terminal or not, always carries the
+ * run's own id. So the discriminator is structural — a reply whose `workflowId`
+ * is not the polled id is not this run's verdict — and never the error text.
+ */
+export function isHostPollFailure(
+  snapshot: Pick<BlockWorkflowSnapshot, 'workflowId'>,
+  polledWorkflowId: string,
+): boolean {
+  return snapshot.workflowId !== polledWorkflowId;
+}
+
+/** Upper bound on the wait between re-polls while the host cannot answer. */
+export const LOST_CONTACT_MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Wait before the next re-poll after `failures` consecutive unanswered polls
+ * (1-based): 1s, 2s, 4s, … doubling, capped at {@link LOST_CONTACT_MAX_BACKOFF_MS}.
+ */
+export function lostContactBackoffMs(failures: number): number {
+  const n = Math.max(1, Math.floor(failures));
+  return Math.min(1000 * 2 ** Math.min(n - 1, 16), LOST_CONTACT_MAX_BACKOFF_MS);
+}
+
 /** The newest trained epoch number on a snapshot, or null when none are listed. */
 export function latestEpoch(snapshot: Pick<BlockWorkflowSnapshot, 'trainedEpochs'>): number | null {
   const epochs = snapshot.trainedEpochs;

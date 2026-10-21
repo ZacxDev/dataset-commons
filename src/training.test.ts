@@ -18,6 +18,8 @@ import {
   classifyTrainingKindQuote,
   contributorShares,
   creditLedgerEvent,
+  isHostPollFailure,
+  lostContactBackoffMs,
   dataSourceLabel,
   dataSourceOf,
   describeEstimateFailure,
@@ -869,5 +871,28 @@ describe('publish linkage', () => {
     expect(trainingFailureCopy('canceled')).toMatch(/No further Buzz/);
     expect(trainingFailureCopy('running')).toBeNull();
     expect(trainingFailureCopy('published')).toBeNull();
+  });
+});
+
+describe('host poll failure vs the run failing', () => {
+  // The exact reply civitai's host sends for a refused poll (failureSnapshot.ts).
+  const hostRefusal = { workflowId: 'failed', status: 'failed' as const, error: 'invalid block token' };
+
+  it("the host's failure-shape reply is not the polled run's verdict", () => {
+    expect(isHostPollFailure(hostRefusal, '8753561-20261021150732359-b7wf')).toBe(true);
+  });
+
+  it("a real snapshot of the run — failed included — is the run's verdict", () => {
+    const id = '8753561-20261021150732359-b7wf';
+    expect(isHostPollFailure({ workflowId: id }, id)).toBe(false);
+    // Same failed status and error text as the host's reply: only the id differs.
+    expect(isHostPollFailure({ ...hostRefusal, workflowId: id }, id)).toBe(false);
+  });
+
+  it('re-polls back off 1s, 2s, 4s … and never wait more than 60s', () => {
+    expect([1, 2, 3, 4, 5, 6].map(lostContactBackoffMs)).toEqual([1000, 2000, 4000, 8000, 16000, 32000]);
+    expect(lostContactBackoffMs(7)).toBe(60000);
+    expect(lostContactBackoffMs(500)).toBe(60000);
+    expect(lostContactBackoffMs(0)).toBe(1000);
   });
 });
