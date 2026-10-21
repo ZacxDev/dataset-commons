@@ -263,6 +263,34 @@ export function contributorShares(snapshot: DatasetSnapshot): Map<string, number
 
 export type LedgerEventType = 'training' | 'generation_in_app' | 'generation_onsite';
 
+/**
+ * Where a training run's images came from:
+ *  - 'snapshot': the pass-through step trained on the snapshot's own blob urls,
+ *    so the run provably used the snapshot's images.
+ *  - 'trainer-attested': Civitai's trainer (`kind: 'training'`) trained on files
+ *    the trainer uploaded; the app only sees `{ url, air }` and cannot prove they
+ *    are the snapshot's images, so the trainer's own attestation is all there is.
+ * Records written before this field existed carry none; every one of them came
+ * from the pass-through path, so a missing value reads as 'snapshot'.
+ */
+export type TrainingDataSource = 'snapshot' | 'trainer-attested';
+
+export function dataSourceOf(record: { dataSource?: TrainingDataSource | undefined }): TrainingDataSource {
+  return record.dataSource === 'trainer-attested' ? 'trainer-attested' : 'snapshot';
+}
+
+/** Parse a stored (unmoderated) value into a data source, or undefined when absent/unknown. */
+export function parseDataSource(value: unknown): TrainingDataSource | undefined {
+  return value === 'snapshot' || value === 'trainer-attested' ? value : undefined;
+}
+
+/** The label shown beside a trainer-attested run; null for a snapshot-sourced one. */
+export const TRAINER_ATTESTED_LABEL = 'Trainer-attested uploads';
+
+export function dataSourceLabel(record: { dataSource?: TrainingDataSource | undefined }): string | null {
+  return dataSourceOf(record) === 'trainer-attested' ? TRAINER_ATTESTED_LABEL : null;
+}
+
 /** One immutable earning event for one LoRA (spec §7.4). */
 export interface LedgerEvent {
   eventId: string;
@@ -273,6 +301,8 @@ export interface LedgerEvent {
   /** The platform source id (workflow id / generation id) — the dedupe key. */
   sourceRef: string;
   createdAt: string;
+  /** Where the LoRA's training images came from; absent on records older than the field (= 'snapshot'). */
+  dataSource?: TrainingDataSource;
 }
 
 /**
@@ -284,6 +314,7 @@ export function trainingFeeEvent(args: {
   snapshot: DatasetSnapshot;
   workflowId: string;
   grossBuzz: number;
+  dataSource: TrainingDataSource;
   loraId?: string;
   now?: string;
 }): LedgerEvent {
@@ -295,6 +326,7 @@ export function trainingFeeEvent(args: {
     grossBuzz: Math.max(0, Math.round(args.grossBuzz)),
     sourceRef: args.workflowId,
     createdAt: args.now ?? new Date().toISOString(),
+    dataSource: args.dataSource,
   };
 }
 
@@ -375,16 +407,121 @@ export function trackedTotals(
  * How one base model runs on Civitai's trainer (`kind: 'training'`): the
  * training-catalog key (`WorkflowBodyTraining.model` — a catalog key, never an
  * AIR) plus the `params.ecosystem` / `params.modelVariant` pair the host checks
- * against that catalog entry, and the training resolution.
+ * against that catalog entry.
  */
 type ArmOf<T> = T extends unknown ? Pick<T, Extract<'ecosystem' | 'modelVariant', keyof T>> : never;
 export type TrainingKindEcosystem = ArmOf<AiToolkitTrainingParams>;
 
-export interface TrainingKindModel {
-  model: string;
-  arm: TrainingKindEcosystem;
+/**
+ * Training Studio's default ai-toolkit run for one base model. The fields are
+ * Studio's own names (`unetLr` → `params.lr`, `optimizer` → lower-cased
+ * `params.optimizerType`, `textEncoderLr > 0` → `params.trainTextEncoder`).
+ */
+export interface TrainingKindDefaults {
+  steps: number;
+  epochs: number;
+  unetLr: number;
+  textEncoderLr: number;
+  networkDim: number;
+  networkAlpha: number;
   resolution: number;
+  batchSize: number;
+  noiseOffset: number;
+  lrScheduler: AiToolkitTrainingParams['lrScheduler'];
+  optimizer: 'Adafactor' | 'AdamW8Bit' | 'Automagic';
 }
+
+export interface TrainingKindModel {
+  /** The `trainingModelInfo` key the host resolves (`WorkflowBodyTraining.model`). */
+  model: string;
+  /** `trainingModelInfo[model].pretty`. */
+  pretty: string;
+  arm: TrainingKindEcosystem;
+  defaults: TrainingKindDefaults;
+}
+
+// ---------------------------------------------------------------------------
+// THE ONE PLACE the kind:'training' model list lives.
+//
+// Mirrors civitai/civitai @ dd6d276934 (the live release):
+//  - src/server/services/blocks/block-training-quote.service.ts
+//    (resolveBlockTrainingRun) accepts `body.model` only when it is an OWN key
+//    of `trainingModelInfo` (src/utils/training.ts), `!info.disabled`,
+//    `info.aiToolkit` is set, `info.type` is in `trainingBaseModelTypesImage`,
+//    `isInvalidAiToolkit(info.type, 'ai-toolkit')` is false, and
+//    `params.ecosystem` / `params.modelVariant` equal `info.aiToolkit`'s.
+//  - Before that, src/server/schema/blocks/workflow.schema.ts validates
+//    `params` against `aiToolkitTrainingParamsSchema`
+//    (src/server/schema/orchestrator/training.schema.ts), whose ecosystem union
+//    has no 'hidream-o1' — so `hidream_o1` passes every static filter above and
+//    is still refused at the wire. It is left out.
+//  - Video (hunyuan/wan/ltx*/minimaxh3), audio (yue2/acestep*), the disabled
+//    `wan_2_1_i2v_14b_720p` and `flux2_dev` (no `aiToolkit`) are refused.
+// Feature flags (`isAiToolkitEnabled`, per-model training flags) and the
+// service's blocked-model list are evaluated per viewer at estimate time; a
+// refused model's estimate error is shown to the viewer verbatim.
+//
+// `pretty`, `arm` come from `trainingModelInfo`. `defaults` are Training
+// Studio's own: apps/training-studio/src/lib/data/trainingModels.ts
+// `PARAM_DEFAULTS[key]` (Studio's vendored resolution of the trainer's
+// TrainingParams.tsx for engine ai-toolkit) and `versionStepDefault(key)` for
+// steps. The extra knobs follow Studio's buildTrainingRuns for a caption
+// dataset: shuffle off, keep 0, flip off, Min SNR gamma 5 only on sd1/sdxl.
+//
+// A change here is a deliberate edit: training.test.ts pins the key list.
+// ---------------------------------------------------------------------------
+
+const D = (
+  steps: number,
+  epochs: number,
+  unetLr: number,
+  textEncoderLr: number,
+  networkDim: number,
+  networkAlpha: number,
+  resolution: number,
+  batchSize: number,
+  noiseOffset: number,
+  lrScheduler: TrainingKindDefaults['lrScheduler'],
+  optimizer: TrainingKindDefaults['optimizer'],
+): TrainingKindDefaults => ({
+  steps,
+  epochs,
+  unetLr,
+  textEncoderLr,
+  networkDim,
+  networkAlpha,
+  resolution,
+  batchSize,
+  noiseOffset,
+  lrScheduler,
+  optimizer,
+});
+
+//                       steps  ep  unetLr  teLr   dim alpha  res  batch noise sched       optimizer
+export const TRAINING_KIND_CATALOG: readonly TrainingKindModel[] = [
+  { model: 'sd_1_5', pretty: 'SD 1.5', arm: { ecosystem: 'sd1' }, defaults: D(2000, 10, 5e-4, 5e-5, 32, 32, 512, 4, 0.1, 'cosine', 'Adafactor') },
+  { model: 'anime', pretty: 'Anime', arm: { ecosystem: 'sd1' }, defaults: D(2000, 10, 5e-4, 1e-4, 16, 32, 512, 4, 0.1, 'cosine', 'AdamW8Bit') },
+  { model: 'semi', pretty: 'Semi Real', arm: { ecosystem: 'sd1' }, defaults: D(2000, 10, 5e-4, 5e-5, 32, 32, 512, 4, 0.1, 'cosine', 'AdamW8Bit') },
+  { model: 'realistic', pretty: 'Realistic', arm: { ecosystem: 'sd1' }, defaults: D(2000, 10, 5e-4, 5e-5, 32, 32, 512, 2, 0.1, 'cosine', 'AdamW8Bit') },
+  { model: 'sdxl', pretty: 'SDXL', arm: { ecosystem: 'sdxl' }, defaults: D(2000, 10, 5e-4, 5e-5, 32, 32, 1024, 4, 0.1, 'cosine', 'Adafactor') },
+  { model: 'pony', pretty: 'Pony', arm: { ecosystem: 'sdxl' }, defaults: D(2000, 10, 5e-4, 5e-5, 32, 32, 1024, 4, 0.1, 'cosine', 'Adafactor') },
+  { model: 'illustrious', pretty: 'Illustrious', arm: { ecosystem: 'sdxl' }, defaults: D(2000, 10, 5e-4, 5e-5, 32, 32, 1024, 4, 0.1, 'cosine', 'Adafactor') },
+  { model: 'flux_dev', pretty: 'Flux', arm: { ecosystem: 'flux1', modelVariant: 'dev' }, defaults: D(2000, 5, 5e-4, 0, 32, 16, 512, 1, 0.1, 'cosine', 'AdamW8Bit') },
+  { model: 'chroma', pretty: 'Chroma', arm: { ecosystem: 'chroma' }, defaults: D(2000, 5, 5e-4, 0, 2, 16, 512, 1, 0.1, 'cosine', 'AdamW8Bit') },
+  { model: 'qwen_image', pretty: 'Qwen-Image', arm: { ecosystem: 'qwen' }, defaults: D(2000, 5, 5e-4, 0, 2, 16, 512, 1, 0.1, 'cosine', 'AdamW8Bit') },
+  { model: 'zimageturbo', pretty: 'ZImageTurbo', arm: { ecosystem: 'zimageturbo' }, defaults: D(2000, 10, 1e-4, 0, 32, 32, 1024, 2, 0, 'constant', 'AdamW8Bit') },
+  { model: 'zimagebase', pretty: 'ZImageBase', arm: { ecosystem: 'zimagebase' }, defaults: D(2000, 10, 1e-6, 0, 32, 32, 1024, 2, 0, 'cosine', 'Automagic') },
+  { model: 'ernie', pretty: 'Ernie', arm: { ecosystem: 'ernie' }, defaults: D(2000, 10, 5e-4, 5e-5, 32, 16, 512, 2, 0.1, 'cosine', 'AdamW8Bit') },
+  { model: 'anima', pretty: 'Anima Base v1.0', arm: { ecosystem: 'anima' }, defaults: D(1500, 5, 1e-4, 0, 32, 32, 1024, 1, 0, 'constant', 'AdamW8Bit') },
+  { model: 'boogu', pretty: 'Boogu Image 0.1 Base', arm: { ecosystem: 'boogu' }, defaults: D(3000, 5, 1e-4, 0, 32, 32, 1024, 1, 0, 'constant', 'AdamW8Bit') },
+  { model: 'krea2', pretty: 'Krea 2', arm: { ecosystem: 'krea2' }, defaults: D(2000, 10, 1e-4, 0, 32, 32, 1024, 1, 0, 'constant', 'AdamW8Bit') },
+  { model: 'mageflow', pretty: 'Mage-Flow 4B Base', arm: { ecosystem: 'mageflow' }, defaults: D(2000, 10, 1e-4, 0, 32, 32, 1024, 1, 0, 'constant', 'AdamW8Bit') },
+  { model: 'ideogram4', pretty: 'Ideogram 4.0', arm: { ecosystem: 'ideogram4' }, defaults: D(2000, 10, 1e-4, 0, 32, 32, 1024, 1, 0, 'constant', 'AdamW8Bit') },
+  { model: 'flux2klein_4b', pretty: 'Flux.2 Klein 4B Base', arm: { ecosystem: 'flux2klein', modelVariant: '4b' }, defaults: D(2000, 10, 1e-4, 0, 32, 32, 1024, 2, 0, 'constant', 'AdamW8Bit') },
+  { model: 'flux2klein_9b', pretty: 'Flux.2 Klein 9B Base', arm: { ecosystem: 'flux2klein', modelVariant: '9b' }, defaults: D(2000, 10, 1e-4, 0, 32, 32, 1024, 2, 0, 'constant', 'AdamW8Bit') },
+  { model: 'ming', pretty: 'Ming Image Design 0.1', arm: { ecosystem: 'ming' }, defaults: D(2000, 5, 1e-4, 0, 32, 32, 1024, 1, 0, 'constant', 'AdamW8Bit') },
+  { model: 'qwen21', pretty: 'Qwen 2.1', arm: { ecosystem: 'qwen21' }, defaults: D(2000, 5, 1e-4, 0, 32, 32, 1024, 1, 0, 'constant', 'AdamW8Bit') },
+];
 
 export interface TrainingPreset {
   id: string;
@@ -396,96 +533,96 @@ export interface TrainingPreset {
    * preset — the pass-through button is then disabled, never guessed.
    */
   modelAir: string | null;
-  /** Indicative Training Studio default price — the ESTIMATE is the real price. */
-  approxBuzz: number;
+  /** Indicative Training Studio price quoted on #541, or null when none was quoted. The ESTIMATE is the real price. */
+  approxBuzz: number | null;
   /** True while the preset's typical price fits the page's 1000-Buzz per-call budget. */
   withinCurrentCap: boolean;
-  /** Civitai's trainer (`kind: 'training'`, up to 5000 Buzz), when wired. */
-  trainingKind?: TrainingKindModel;
+  /** Civitai's trainer (`kind: 'training'`, up to 5000 Buzz). */
+  trainingKind: TrainingKindModel;
 }
 
 /**
- * Base-model presets. Prices are Training Studio defaults quoted on #541; they
- * are display hints only — the estimate is the price. Only SDXL carries a
- * verified AIR for the pass-through step (the one the platform's own #541
- * example submits). Every preset can run on Civitai's trainer
- * (`kind: 'training'`), which is the only path for models priced above the
- * per-call budget (Flux, Qwen, Chroma). The catalog keys mirror Civitai's
- * training catalog; the host refuses an unknown or disabled key at the
- * estimate, and that refusal is shown verbatim.
+ * The pass-through overlay for the presets this app offered before the
+ * catalog mirror: their ids (kept stable), the #541 price hints, and the one
+ * verified pass-through AIR (SDXL, the platform's own #541 example). Every
+ * other catalog model is Civitai's-trainer-only with no price hint.
  */
-export const TRAINING_PRESETS: readonly TrainingPreset[] = [
-  {
-    id: 'sdxl',
-    label: 'SDXL',
-    ecosystem: 'sdxl',
-    modelAir: 'urn:air:sdxl:checkpoint:civitai:101055@128078',
-    approxBuzz: 500,
-    withinCurrentCap: true,
-    trainingKind: { model: 'sdxl', arm: { ecosystem: 'sdxl' }, resolution: 1024 },
-  },
-  {
-    id: 'pony',
-    label: 'Pony',
-    ecosystem: 'sdxl',
-    modelAir: null,
-    approxBuzz: 500,
-    withinCurrentCap: true,
-    trainingKind: { model: 'pony', arm: { ecosystem: 'sdxl' }, resolution: 1024 },
-  },
-  {
-    id: 'illustrious',
-    label: 'Illustrious',
-    ecosystem: 'sdxl',
-    modelAir: null,
-    approxBuzz: 500,
-    withinCurrentCap: true,
-    trainingKind: { model: 'illustrious', arm: { ecosystem: 'sdxl' }, resolution: 1024 },
-  },
-  {
-    id: 'sd15',
-    label: 'SD 1.5',
-    ecosystem: 'sd1',
-    modelAir: null,
-    approxBuzz: 500,
-    withinCurrentCap: true,
-    trainingKind: { model: 'sd_1_5', arm: { ecosystem: 'sd1' }, resolution: 512 },
-  },
-  {
-    id: 'flux',
-    label: 'Flux',
-    ecosystem: 'flux1',
-    modelAir: null,
-    approxBuzz: 1160,
-    withinCurrentCap: false,
-    trainingKind: { model: 'flux_dev', arm: { ecosystem: 'flux1', modelVariant: 'dev' }, resolution: 1024 },
-  },
-  {
-    id: 'qwen',
-    label: 'Qwen-Image',
-    ecosystem: 'qwen',
-    modelAir: null,
-    approxBuzz: 1160,
-    withinCurrentCap: false,
-    trainingKind: { model: 'qwen_image', arm: { ecosystem: 'qwen' }, resolution: 1024 },
-  },
-  {
-    id: 'chroma',
-    label: 'Chroma',
-    ecosystem: 'chroma',
-    modelAir: null,
-    approxBuzz: 1160,
-    withinCurrentCap: false,
-    trainingKind: { model: 'chroma', arm: { ecosystem: 'chroma' }, resolution: 1024 },
-  },
-];
+const PASS_THROUGH_OVERLAY: Readonly<
+  Record<string, Pick<TrainingPreset, 'id' | 'modelAir' | 'approxBuzz' | 'withinCurrentCap'>>
+> = {
+  sdxl: { id: 'sdxl', modelAir: 'urn:air:sdxl:checkpoint:civitai:101055@128078', approxBuzz: 500, withinCurrentCap: true },
+  pony: { id: 'pony', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
+  illustrious: { id: 'illustrious', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
+  sd_1_5: { id: 'sd15', modelAir: null, approxBuzz: 500, withinCurrentCap: true },
+  flux_dev: { id: 'flux', modelAir: null, approxBuzz: 1160, withinCurrentCap: false },
+  qwen_image: { id: 'qwen', modelAir: null, approxBuzz: 1160, withinCurrentCap: false },
+  chroma: { id: 'chroma', modelAir: null, approxBuzz: 1160, withinCurrentCap: false },
+};
+
+/**
+ * Base-model presets: one per catalog model, in the catalog's order. Prices
+ * are display hints only — the estimate is the price.
+ */
+export const TRAINING_PRESETS: readonly TrainingPreset[] = TRAINING_KIND_CATALOG.map((entry) => {
+  const overlay = PASS_THROUGH_OVERLAY[entry.model];
+  return {
+    id: overlay?.id ?? entry.model,
+    label: entry.pretty,
+    ecosystem: entry.arm.ecosystem,
+    modelAir: overlay?.modelAir ?? null,
+    approxBuzz: overlay?.approxBuzz ?? null,
+    withinCurrentCap: overlay?.withinCurrentCap ?? false,
+    trainingKind: entry,
+  };
+});
 
 /** True when the pass-through `training` step can run this preset. */
 export function passThroughAvailable(preset: TrainingPreset): boolean {
   return preset.modelAir != null && preset.withinCurrentCap;
 }
 
-export const DEFAULT_TRAINING_PRESET: TrainingPreset = TRAINING_PRESETS[0]!;
+export const DEFAULT_TRAINING_PRESET: TrainingPreset = TRAINING_PRESETS.find((p) => p.id === 'sdxl')!;
+
+/** Min SNR gamma is sent only on the SD-family ecosystems (Studio's `extraParamCapabilities`). */
+const MIN_SNR_GAMMA_ECOSYSTEMS: ReadonlySet<string> = new Set(['sd1', 'sdxl']);
+const STUDIO_MIN_SNR_GAMMA = 5;
+
+/** Studio sends `optimizer.toLowerCase()` as `optimizerType`; spelled out so the type checks it. */
+const OPTIMIZER_TYPE: Readonly<Record<TrainingKindDefaults['optimizer'], AiToolkitTrainingParams['optimizerType']>> = {
+  Adafactor: 'adafactor',
+  AdamW8Bit: 'adamw8bit',
+  Automagic: 'automagic',
+};
+
+/**
+ * The ai-toolkit `params` for one catalog model at the trainer's chosen steps
+ * and epochs, everything else at Training Studio's defaults.
+ */
+export function trainingKindParams(kind: TrainingKindModel, steps: number, epochs: number): AiToolkitTrainingParams {
+  const d = kind.defaults;
+  return {
+    engine: 'ai-toolkit',
+    ...kind.arm,
+    steps: Math.max(1, Math.trunc(steps) || 1),
+    epochs: Math.max(1, Math.trunc(epochs) || 1),
+    batchSize: d.batchSize,
+    resolution: d.resolution,
+    lr: d.unetLr,
+    textEncoderLr: d.textEncoderLr,
+    trainTextEncoder: d.textEncoderLr > 0,
+    lrScheduler: d.lrScheduler,
+    optimizerType: OPTIMIZER_TYPE[d.optimizer],
+    networkDim: d.networkDim,
+    networkAlpha: d.networkAlpha,
+    noiseOffset: d.noiseOffset,
+    minSnrGamma: MIN_SNR_GAMMA_ECOSYSTEMS.has(kind.arm.ecosystem) ? STUDIO_MIN_SNR_GAMMA : null,
+    flipAugmentation: false,
+    shuffleTokens: false,
+    keepTokens: 0,
+    // The cast covers one arm only: `qwen21` / `ming` type `batchSize` as the
+    // literal 1, which their catalog defaults are (pinned in training.test.ts).
+  } as AiToolkitTrainingParams;
+}
 
 export interface TrainingConfig {
   preset: TrainingPreset;
@@ -656,25 +793,7 @@ export function buildTrainingKindBody(args: {
   }
   const trigger = args.config.triggerWord.trim() || 'dataset';
   const sample = args.config.samplePrompt.trim() || `${trigger}, portrait`;
-  const params: AiToolkitTrainingParams = {
-    engine: 'ai-toolkit',
-    ...kind.arm,
-    steps: Math.max(1, Math.trunc(args.config.steps) || 1),
-    epochs: Math.max(1, Math.trunc(args.config.epochs) || 1),
-    resolution: kind.resolution,
-    lr: 0.0001,
-    textEncoderLr: null,
-    trainTextEncoder: false,
-    lrScheduler: 'cosine',
-    optimizerType: 'adamw8bit',
-    networkDim: 32,
-    networkAlpha: 16,
-    noiseOffset: null,
-    minSnrGamma: null,
-    flipAugmentation: false,
-    shuffleTokens: false,
-    keepTokens: 0,
-  };
+  const params = trainingKindParams(kind, args.config.steps, args.config.epochs);
   return {
     kind: 'training',
     items: args.items.map((item) => ({ air: item.air, caption: item.caption })),

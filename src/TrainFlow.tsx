@@ -47,9 +47,11 @@ import {
   trainingKindBlocker,
   trainingKindRunFailure,
   trainingStateForSnapshot,
+  TRAINER_ATTESTED_LABEL,
   type DatasetItem,
   type DatasetSnapshot,
   type LedgerEvent,
+  type TrainingDataSource,
   type TrainingPreset,
   type TrainingRunState,
 } from './training.js';
@@ -96,10 +98,16 @@ const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
  */
 const OVER_BUDGET_TRAINING_STEP = /use kind:'training'/;
 
+/** The one place each run path names its data source (see TrainingDataSource). */
+const PASS_THROUGH_SOURCE: TrainingDataSource = 'snapshot';
+const CIVITAI_TRAINER_SOURCE: TrainingDataSource = 'trainer-attested';
+
 /** A training run the Community shell should record against a real dataset. */
 export interface TrainRunLink {
   workflowId: string;
   snapshot: DatasetSnapshot | null;
+  /** 'snapshot' for the pass-through step; 'trainer-attested' for Civitai's trainer on the trainer's uploads. */
+  dataSource: TrainingDataSource;
   publishedModel?: { modelId: number; modelVersionId: number; published: boolean };
   trainedEpochs?: readonly { epochNumber: number }[];
 }
@@ -187,6 +195,13 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   const [kindUploads, setKindUploads] = useState<BlockTrainingDataImage[] | null>(null);
   /** Snapshot item id per upload (upload order); defaults to the same position. */
   const [kindAssignment, setKindAssignment] = useState<string[]>([]);
+  /**
+   * The trainer's statement that the uploads ARE the snapshot's images, in the
+   * matched order. The app cannot check it (it only sees `{ url, air }`), so it
+   * is asked for explicitly, unchecked by default, and cleared by any new upload
+   * or re-match. Pricing stays off until it is given.
+   */
+  const [kindAttested, setKindAttested] = useState(false);
   const [kindQuote, setKindQuote] = useState<BlockTrainingQuote | null>(null);
   const [kindBody, setKindBody] = useState<WorkflowBodyTraining | null>(null);
   const [kindSnapshot, setKindSnapshot] = useState<DatasetSnapshot | null>(null);
@@ -194,6 +209,8 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   const [frozen, setFrozen] = useState<DatasetSnapshot | null>(null);
   const [workflowId, setWorkflowId] = useState<string | null>(null);
   const [runState, setRunState] = useState<TrainingRunState | null>(null);
+  /** Which path started the run on screen — decides the ledger/LoRA record's data source. */
+  const [runSource, setRunSource] = useState<TrainingDataSource>(PASS_THROUGH_SOURCE);
   const [runCost, setRunCost] = useState<number | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [epoch, setEpoch] = useState<number | null>(null);
@@ -266,6 +283,13 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     [items, manualExclusions, effectiveOwnerOverrides, viewer, datasetIdForTraining, props.trainerId],
   );
   const included = includedItems(preview);
+  const includedKey = included.map((i) => i.itemId).join('\u0000');
+
+  // The attestation names THESE uploads in THIS order against THIS training set:
+  // a new upload, a re-match, or a change in which items are in voids it.
+  useEffect(() => {
+    setKindAttested(false);
+  }, [kindUploads, kindAssignment, includedKey]);
   const shares = useMemo(() => contributorShares(preview), [preview]);
   const assembled = useMemo(
     () => assembleTrainingItems(included.map((i) => ({ url: i.imageUrl, caption: i.caption }))),
@@ -296,7 +320,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           : null;
 
   const applyTrainingSnapshot = useCallback(
-    (snap: BlockWorkflowSnapshot, snapshot: DatasetSnapshot | null) => {
+    (snap: BlockWorkflowSnapshot, snapshot: DatasetSnapshot | null, source: TrainingDataSource) => {
       setRunCost(snap.cost?.total ?? null);
       if (snap.error) setRunError(snap.error);
       const state = trainingStateForSnapshot(snap);
@@ -326,6 +350,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           propsRef.current.onRunLinked({
             workflowId: snap.workflowId,
             snapshot,
+            dataSource: source,
             ...(snap.publishedModel ? { publishedModel: snap.publishedModel } : {}),
             ...(snap.trainedEpochs ? { trainedEpochs: snap.trainedEpochs } : {}),
           }),
@@ -350,6 +375,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           snapshot,
           workflowId: snap.workflowId,
           grossBuzz: snap.cost.total,
+          dataSource: source,
         });
         setLedger((cur) => creditLedgerEvent(cur, event).events);
         if (propsRef.current.onLedgerEvent && persistedLedgerRef.current !== event.eventId) {
@@ -384,7 +410,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           return;
         }
         if (tok.cancelled) return;
-        applyTrainingSnapshot(snap, snapshot);
+        applyTrainingSnapshot(snap, snapshot, PASS_THROUGH_SOURCE);
         // Stop at terminal, at ready-to-publish (epochs listed), or once the
         // publish outcome is visible — the user drives the wizard from here.
         const state = trainingStateForSnapshot(snap);
@@ -407,18 +433,6 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     [applyTrainingSnapshot],
   );
 
-  /** One manual re-poll — for the moderation wait and the post-wizard return. */
-  const refreshRun = useCallback(async () => {
-    if (!workflowId) return;
-    try {
-      const snap = await pollRef.current(workflowId);
-      applyTrainingSnapshot(snap, frozen);
-      if (trainingStateForSnapshot(snap) === 'running') runPollLoop(workflowId, frozen);
-    } catch {
-      setNotice('Could not refresh the run just now — try again in a moment.');
-    }
-  }, [workflowId, frozen, applyTrainingSnapshot, runPollLoop]);
-
   const runKindWatch = useCallback(
     (id: string, snapshot: DatasetSnapshot) => {
       kindWatchAbortRef.current?.abort();
@@ -427,11 +441,11 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       void watchRef
         .current(id, {
           signal: controller.signal,
-          onUpdate: (snap) => applyTrainingSnapshot(snap, snapshot),
+          onUpdate: (snap) => applyTrainingSnapshot(snap, snapshot, CIVITAI_TRAINER_SOURCE),
         })
         .then((finalSnap) => {
           if (controller.signal.aborted) return;
-          applyTrainingSnapshot(finalSnap, snapshot);
+          applyTrainingSnapshot(finalSnap, snapshot, CIVITAI_TRAINER_SOURCE);
           setKindPhase('idle');
           setPhase('idle');
         })
@@ -444,6 +458,21 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     },
     [applyTrainingSnapshot],
   );
+
+  /** One manual re-poll — for the moderation wait and the post-wizard return. */
+  const refreshRun = useCallback(async () => {
+    if (!workflowId) return;
+    try {
+      const snap = await pollRef.current(workflowId);
+      applyTrainingSnapshot(snap, frozen, runSource);
+      if (trainingStateForSnapshot(snap) === 'running') {
+        if (runSource === CIVITAI_TRAINER_SOURCE && frozen) runKindWatch(workflowId, frozen);
+        else runPollLoop(workflowId, frozen);
+      }
+    } catch {
+      setNotice('Could not refresh the run just now — try again in a moment.');
+    }
+  }, [workflowId, frozen, runSource, applyTrainingSnapshot, runPollLoop, runKindWatch]);
 
   const clearKindQuote = useCallback(() => {
     kindRequestRef.current += 1;
@@ -480,6 +509,8 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   /** Step 2: freeze the snapshot, pair uploads with it, and get Civitai's quote. */
   const doKindEstimate = useCallback(async () => {
     if (!kindUploads || kindPhaseRef.current === 'running' || kindPhaseRef.current === 'unconfirmed') return;
+    // No attestation, no price: the app cannot tell the uploads are the snapshot's images.
+    if (!kindAttested) return;
     const request = ++kindRequestRef.current;
     setNotice(null);
     setRunError(null);
@@ -534,6 +565,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   }, [
     kindUploads,
     kindAssignment,
+    kindAttested,
     datasetIdForTraining,
     props.trainerId,
     viewer,
@@ -599,7 +631,8 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       const started = await runTraining({ ...kindBody, quoteId: kindQuote.quoteId });
       setWorkflowId(started.workflowId);
       setFrozen(kindSnapshot);
-      applyTrainingSnapshot(started, kindSnapshot);
+      setRunSource(CIVITAI_TRAINER_SOURCE);
+      applyTrainingSnapshot(started, kindSnapshot, CIVITAI_TRAINER_SOURCE);
       const state = trainingStateForSnapshot(started);
       setKindPhase('idle');
       if (
@@ -782,7 +815,8 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     try {
       const snap = await submit(body);
       setWorkflowId(snap.workflowId);
-      applyTrainingSnapshot(snap, frozen);
+      setRunSource(PASS_THROUGH_SOURCE);
+      applyTrainingSnapshot(snap, frozen, PASS_THROUGH_SOURCE);
       if (snap.status === 'pending' || snap.status === 'processing') {
         setPhase('running');
         runPollLoop(snap.workflowId, frozen);
@@ -978,12 +1012,19 @@ export function TrainFlow(props: TrainFlowProps = {}) {
               data-testid="dc-preset"
               onChange={(e) => {
                 const next = TRAINING_PRESETS.find((p) => p.id === e.target.value);
-                if (next) setPreset(next);
+                if (next) {
+                  // Each base model starts from Training Studio's own step/epoch defaults.
+                  setPreset(next);
+                  setSteps(next.trainingKind.defaults.steps);
+                  setEpochs(next.trainingKind.defaults.epochs);
+                }
               }}
             >
               {TRAINING_PRESETS.map((p) => (
-                <option key={p.id} value={p.id} disabled={!passThroughAvailable(p) && !p.trainingKind}>
-                  {p.label} · ~{p.approxBuzz} Buzz{passThroughAvailable(p) ? '' : " · Civitai's trainer only"}
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                  {p.approxBuzz != null ? ` · ~${p.approxBuzz} Buzz` : ''}
+                  {passThroughAvailable(p) ? '' : " · Civitai's trainer only"}
                 </option>
               ))}
             </select>
@@ -1080,7 +1121,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
                 variant="light"
                 size="sm"
                 loading={kindPhase === 'uploading'}
-                disabled={busy || phase === 'quoted' || !preset.trainingKind}
+                disabled={busy || phase === 'quoted'}
                 onClick={() => void onKindUploadClick()}
                 data-testid="dc-kind-upload"
               >
@@ -1125,12 +1166,26 @@ export function TrainFlow(props: TrainFlowProps = {}) {
                 </Alert>
               )}
               {kindPhase !== 'quoted' && kindPhase !== 'running' && (
+                <label style={checkLabelStyle}>
+                  <input
+                    type="checkbox"
+                    checked={kindAttested}
+                    disabled={busy}
+                    data-testid="dc-kind-attest"
+                    onChange={(e) => setKindAttested(e.target.checked)}
+                  />
+                  I confirm these uploads are the training set's images listed above, each matched to the
+                  right number. This app can't check the files; the run and the contributors' credit are
+                  recorded as trainer-attested.
+                </label>
+              )}
+              {kindPhase !== 'quoted' && kindPhase !== 'running' && (
                 <span>
                   <Button
                     variant="light"
                     size="sm"
                     loading={kindPhase === 'pricing'}
-                    disabled={busy || phase === 'quoted' || !preset.trainingKind || (kindPairing?.problems.length ?? 1) > 0}
+                    disabled={busy || phase === 'quoted' || !kindAttested || (kindPairing?.problems.length ?? 1) > 0}
                     onClick={onKindEstimateClick}
                     data-testid="dc-kind-estimate"
                   >
@@ -1322,7 +1377,17 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
           {ledger.length > 0 && credits.length > 0 && (
             <div style={ledgerStyle} data-testid="dc-ledger">
-              <span style={fieldLabelStyle}>Tracked credit from this run</span>
+              <span style={fieldLabelStyle}>
+                Tracked credit from this run
+                {runSource === CIVITAI_TRAINER_SOURCE && (
+                  <>
+                    {' '}
+                    <Badge color="gray" variant="light" data-testid="dc-ledger-source">
+                      {TRAINER_ATTESTED_LABEL}
+                    </Badge>
+                  </>
+                )}
+              </span>
               {credits.map((c) => (
                 <div key={c.contributorId} style={ledgerRowStyle} data-testid={`dc-credit-${c.contributorId}`}>
                   <span>{frozen?.items.find((i) => i.contributorId === c.contributorId)?.contributorName ?? c.contributorId}</span>

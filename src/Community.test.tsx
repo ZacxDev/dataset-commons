@@ -231,7 +231,9 @@ describe('Community screens (voting option b)', () => {
       createdAt: '2026-10-04T01:00:00.000Z',
       updatedAt: '2026-10-04T01:00:00.000Z',
     };
-    const event = trainingFeeEvent({ snapshot, workflowId: 'wf1', grossBuzz: 700, loraId: 'lora_wf1' });
+    // Records written before the data-source field existed carry none (all were pass-through).
+    const { dataSource: _source, ...event } = trainingFeeEvent({ snapshot, workflowId: 'wf1', grossBuzz: 700, loraId: 'lora_wf1', dataSource: 'snapshot' });
+    void _source;
     uninstall = installMockMoneyHost({
       viewer: { id: 11, username: 'alice', status: 'active' },
       consentGranted: true,
@@ -255,11 +257,77 @@ describe('Community screens (voting option b)', () => {
     expect(screen.getByTestId('dc-lora-onsite')).toHaveTextContent(/aren't reported to apps yet/i);
     expect(screen.getByTestId('dc-lora-events')).toHaveTextContent('700');
 
+    // An old (field-less) record renders exactly as before: no attested label anywhere.
+    expect(screen.queryByTestId('dc-lora-source')).not.toBeInTheDocument();
+
     await user.click(screen.getByTestId('dc-open-ledger'));
     expect(await screen.findByTestId('dc-ledger-total', {}, { timeout: 5000 })).toHaveTextContent('583');
     expect(screen.getByTestId('dc-ledger-total')).toHaveTextContent(/no Buzz has moved to you/i);
     expect(screen.getByTestId('dc-ledger-row')).toHaveTextContent('583');
+    expect(screen.queryByTestId('dc-ledger-row-source')).not.toBeInTheDocument();
     expect(screen.getByTestId('dc-my-snapshots')).toHaveTextContent('83.3% share');
+  });
+
+  it('a trainer-attested LoRA is labelled in the dataset list, the LoRA detail and the ledger', async () => {
+    const user = userEvent.setup();
+    const dataset: DatasetRecord = {
+      datasetId: 'ds1',
+      ownerId: 7,
+      ownerName: 'owner',
+      name: 'Ink Portraits',
+      description: 'desc',
+      targetNote: 'Flux',
+      createdAt: '2026-10-01T00:00:00.000Z',
+      updatedAt: '2026-10-01T00:00:00.000Z',
+    };
+    const snapshot = freezeSnapshot(
+      'ds1',
+      'trainer',
+      [
+        { itemId: 'a', contributorId: 'user:11', contributorName: 'alice', imageUrl: 'https://civitai.com/images/1', caption: 'front', netVotes: 3 },
+        { itemId: 'b', contributorId: 'user:12', contributorName: 'bob', imageUrl: 'https://civitai.com/images/2', caption: 'profile', netVotes: 1 },
+      ],
+      { snapshotId: 'snapK', now: '2026-10-04T00:00:00.000Z' },
+    );
+    const lora: LoraRecord = {
+      loraId: 'lora_wfK',
+      datasetId: 'ds1',
+      snapshotId: 'snapK',
+      trainerId: 7,
+      trainerName: 'owner',
+      name: 'Ink Flux LoRA',
+      workflowId: 'wfK',
+      published: false,
+      dataSource: 'trainer-attested',
+      createdAt: '2026-10-04T01:00:00.000Z',
+      updatedAt: '2026-10-04T01:00:00.000Z',
+    };
+    const event = trainingFeeEvent({ snapshot, workflowId: 'wfK', grossBuzz: 725, loraId: 'lora_wfK', dataSource: 'trainer-attested' });
+    uninstall = installMockMoneyHost({
+      viewer: { id: 11, username: 'alice', status: 'active' },
+      consentGranted: true,
+      declaredScopes: [...ALL_APP_SCOPES],
+      shared: {
+        seed: [
+          { value: datasetSharedValue(dataset), authorUserId: 7 },
+          { value: snapshotSharedValue(snapshot, dataset.name), authorUserId: 7 },
+          { value: loraSharedValue(lora), authorUserId: 7 },
+          { value: ledgerSharedValue(event), authorUserId: 7 },
+        ],
+      },
+    });
+    await openCommunity(user);
+    await user.click(await screen.findByTestId('dc-open-dataset-ds1'));
+    expect(await screen.findByTestId('dc-dataset-lora-source-lora_wfK', {}, { timeout: 5000 })).toHaveTextContent(
+      'Trainer-attested uploads',
+    );
+    await user.click(screen.getByTestId('dc-open-lora-lora_wfK'));
+    expect(await screen.findByTestId('dc-lora-source', {}, { timeout: 5000 })).toHaveTextContent('Trainer-attested uploads');
+
+    await user.click(screen.getByTestId('dc-open-ledger'));
+    // 725 split 3:1 -> alice 544.
+    expect(await screen.findByTestId('dc-ledger-row', {}, { timeout: 5000 })).toHaveTextContent('544');
+    expect(screen.getByTestId('dc-ledger-row-source')).toHaveTextContent('Trainer-attested uploads');
   });
 
   it(
@@ -300,6 +368,41 @@ describe('Community screens (voting option b)', () => {
       await user.click(await screen.findByTestId('dc-lora-confirm-submit', {}, { timeout: 5000 }));
       expect(await screen.findByTestId('dc-lora-image', {}, { timeout: 10000 })).toBeInTheDocument();
       expect(screen.getByTestId('dc-lora-events')).toHaveTextContent(/In-app generation/);
+    },
+    30000,
+  );
+
+  it(
+    "a Civitai-trainer run from a real dataset persists a trainer-attested LoRA record",
+    async () => {
+      const user = userEvent.setup();
+      uninstall = installMockMoneyHost({
+        viewer: { id: 2, username: 'dev', status: 'active' },
+        consentGranted: true,
+        trainingQuoteTotal: 725,
+        pollsUntilDone: 1,
+        buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
+        declaredScopes: [...ALL_APP_SCOPES],
+        shared: { seed: demoSharedSeed() },
+        generation: { trainedEpochs: 10 },
+        cannedTrainingDataUpload: [
+          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up1.png', air: 'up1.png' },
+          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up2.png', air: 'up2.png' },
+        ],
+      });
+      await openCommunity(user);
+      await user.click(await screen.findByTestId('dc-open-dataset-dataset-archive-ink'));
+      await user.click(await screen.findByTestId('dc-open-train'));
+      await user.click(await screen.findByTestId('dc-kind-upload', {}, { timeout: 5000 }));
+      await user.click(await screen.findByTestId('dc-kind-attest'));
+      await user.click(screen.getByTestId('dc-kind-estimate'));
+      await user.click(await screen.findByTestId('dc-kind-run', {}, { timeout: 5000 }));
+      expect(await screen.findByTestId('dc-publish', {}, { timeout: 10000 })).toBeInTheDocument();
+
+      await user.click(screen.getByTestId('dc-back-dataset'));
+      const loraRow = await screen.findByTestId('dc-dataset-loras', {}, { timeout: 10000 });
+      expect(loraRow).toHaveTextContent('Archive Ink Portraits LoRA');
+      expect(loraRow).toHaveTextContent('Trainer-attested uploads');
     },
     30000,
   );

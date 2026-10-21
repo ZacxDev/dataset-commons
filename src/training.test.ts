@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_TRAINING_PRESET,
   MAX_TRAINING_ITEMS,
+  TRAINING_KIND_CATALOG,
   TRAINING_PRESETS,
   assembleTrainingItems,
   blobKeyFromUrl,
@@ -15,6 +16,8 @@ import {
   classifyTrainingKindQuote,
   contributorShares,
   creditLedgerEvent,
+  dataSourceLabel,
+  dataSourceOf,
   describeEstimateFailure,
   deriveContributorCredits,
   freezeSnapshot,
@@ -25,10 +28,12 @@ import {
   trainingFailureCopy,
   trainingFeeEvent,
   pairUploadsWithSnapshot,
+  parseDataSource,
   passThroughAvailable,
   TRAINING_KIND_CAPTION_MAX_CHARS,
   TRAINING_KIND_MAX_ITEMS,
   trainingKindBlocker,
+  trainingKindParams,
   trainingKindRunFailure,
   trainingStateForSnapshot,
   type DatasetItem,
@@ -200,7 +205,7 @@ describe('ledger events', () => {
   const snap = freezeSnapshot('ds1', 'trainer', [item({ itemId: 'a', netVotes: 4 })], { snapshotId: 's1' });
 
   it('trainingFeeEvent keys the event to the workflow id (dedupe source)', () => {
-    const ev = trainingFeeEvent({ snapshot: snap, workflowId: 'wf_1', grossBuzz: 512.4, now: '2026-10-06T00:00:00.000Z' });
+    const ev = trainingFeeEvent({ snapshot: snap, workflowId: 'wf_1', grossBuzz: 512.4, dataSource: 'snapshot', now: '2026-10-06T00:00:00.000Z' });
     expect(ev).toMatchObject({
       eventType: 'training',
       sourceRef: 'wf_1',
@@ -211,7 +216,7 @@ describe('ledger events', () => {
   });
 
   it('creditLedgerEvent credits the same sourceRef once only (no double-credit)', () => {
-    const ev = trainingFeeEvent({ snapshot: snap, workflowId: 'wf_1', grossBuzz: 500 });
+    const ev = trainingFeeEvent({ snapshot: snap, workflowId: 'wf_1', grossBuzz: 500, dataSource: 'snapshot' });
     const first = creditLedgerEvent([], ev);
     expect(first.credited).toBe(true);
     const second = creditLedgerEvent(first.events, ev);
@@ -228,15 +233,43 @@ describe('ledger events', () => {
       item({ itemId: 'B', contributorId: 'Y', netVotes: 1 }),
     ], { snapshotId: 's2' });
     const events = [
-      trainingFeeEvent({ snapshot: multi, workflowId: 'wf_1', grossBuzz: 400 }),
-      { ...trainingFeeEvent({ snapshot: multi, workflowId: 'wf_2', grossBuzz: 400 }), eventType: 'generation_in_app' as const, eventId: 'e2' },
+      trainingFeeEvent({ snapshot: multi, workflowId: 'wf_1', grossBuzz: 400, dataSource: 'snapshot' }),
+      { ...trainingFeeEvent({ snapshot: multi, workflowId: 'wf_2', grossBuzz: 400, dataSource: 'snapshot' }), eventType: 'generation_in_app' as const, eventId: 'e2' },
     ];
     const totals = trackedTotals(events, new Map([['s2', multi]]));
     expect(totals.get('X')).toBe(600);
     expect(totals.get('Y')).toBe(200);
     // Events whose snapshot is unknown are skipped, never guessed.
-    const orphan = trainingFeeEvent({ snapshot: multi, workflowId: 'wf_9', grossBuzz: 100 });
+    const orphan = trainingFeeEvent({ snapshot: multi, workflowId: 'wf_9', grossBuzz: 100, dataSource: 'snapshot' });
     expect(trackedTotals([orphan], new Map()).size).toBe(0);
+  });
+});
+
+describe('training data source (trainer attestation)', () => {
+  const snap = freezeSnapshot('ds1', 'trainer', [item({ itemId: 'a', netVotes: 4 })], { snapshotId: 's1' });
+
+  it('trainingFeeEvent records the source it is given', () => {
+    expect(trainingFeeEvent({ snapshot: snap, workflowId: 'wf_k', grossBuzz: 725, dataSource: 'trainer-attested' }).dataSource).toBe(
+      'trainer-attested',
+    );
+    expect(trainingFeeEvent({ snapshot: snap, workflowId: 'wf_p', grossBuzz: 512, dataSource: 'snapshot' }).dataSource).toBe('snapshot');
+  });
+
+  it('a record without the field (written before it existed) reads as snapshot, with no label', () => {
+    expect(dataSourceOf({})).toBe('snapshot');
+    expect(dataSourceLabel({})).toBeNull();
+    expect(dataSourceOf({ dataSource: 'snapshot' })).toBe('snapshot');
+    expect(dataSourceLabel({ dataSource: 'snapshot' })).toBeNull();
+    expect(dataSourceOf({ dataSource: 'trainer-attested' })).toBe('trainer-attested');
+    expect(dataSourceLabel({ dataSource: 'trainer-attested' })).toBe('Trainer-attested uploads');
+  });
+
+  it('parseDataSource keeps only the two known values from unmoderated storage', () => {
+    expect(parseDataSource('snapshot')).toBe('snapshot');
+    expect(parseDataSource('trainer-attested')).toBe('trainer-attested');
+    expect(parseDataSource(undefined)).toBeUndefined();
+    expect(parseDataSource('verified')).toBeUndefined();
+    expect(parseDataSource(1)).toBeUndefined();
   });
 });
 
@@ -392,21 +425,24 @@ describe("Civitai's trainer (kind: 'training', SDK 0.77 items body)", () => {
       ],
       engine: 'ai-toolkit',
       model: 'flux_dev',
+      // Training Studio's flux_dev defaults (PARAM_DEFAULTS at civitai@dd6d276934);
+      // steps/epochs are the trainer's own choice from the config.
       params: {
         engine: 'ai-toolkit',
         ecosystem: 'flux1',
         modelVariant: 'dev',
         steps: 2000,
         epochs: 10,
-        resolution: 1024,
-        lr: 0.0001,
-        textEncoderLr: null,
+        batchSize: 1,
+        resolution: 512,
+        lr: 0.0005,
+        textEncoderLr: 0,
         trainTextEncoder: false,
         lrScheduler: 'cosine',
         optimizerType: 'adamw8bit',
         networkDim: 32,
         networkAlpha: 16,
-        noiseOffset: null,
+        noiseOffset: 0.1,
         minSnrGamma: null,
         flipAugmentation: false,
         shuffleTokens: false,
@@ -434,17 +470,94 @@ describe("Civitai's trainer (kind: 'training', SDK 0.77 items body)", () => {
     expect(body).not.toHaveProperty('datasetId');
   });
 
-  it('every preset is wired for the trainer with a catalog key, and only SDXL for the pass-through step', () => {
-    expect(TRAINING_PRESETS.map((p) => [p.id, p.trainingKind?.model, p.trainingKind?.arm.ecosystem])).toEqual([
-      ['sdxl', 'sdxl', 'sdxl'],
-      ['pony', 'pony', 'sdxl'],
-      ['illustrious', 'illustrious', 'sdxl'],
-      ['sd15', 'sd_1_5', 'sd1'],
-      ['flux', 'flux_dev', 'flux1'],
-      ['qwen', 'qwen_image', 'qwen'],
-      ['chroma', 'chroma', 'chroma'],
+  it('the kind:training catalog is exactly the civitai@dd6d276934 accepted set (a drift is a deliberate edit)', () => {
+    // Every own key of trainingModelInfo that is enabled, has an aiToolkit
+    // config, trains an IMAGE type, and whose ecosystem the wire schema accepts
+    // (hidream_o1 is excluded by that last gate) — in source order.
+    expect(TRAINING_KIND_CATALOG.map((m) => [m.model, m.arm.ecosystem, m.arm.modelVariant ?? null, m.pretty])).toEqual([
+      ['sd_1_5', 'sd1', null, 'SD 1.5'],
+      ['anime', 'sd1', null, 'Anime'],
+      ['semi', 'sd1', null, 'Semi Real'],
+      ['realistic', 'sd1', null, 'Realistic'],
+      ['sdxl', 'sdxl', null, 'SDXL'],
+      ['pony', 'sdxl', null, 'Pony'],
+      ['illustrious', 'sdxl', null, 'Illustrious'],
+      ['flux_dev', 'flux1', 'dev', 'Flux'],
+      ['chroma', 'chroma', null, 'Chroma'],
+      ['qwen_image', 'qwen', null, 'Qwen-Image'],
+      ['zimageturbo', 'zimageturbo', null, 'ZImageTurbo'],
+      ['zimagebase', 'zimagebase', null, 'ZImageBase'],
+      ['ernie', 'ernie', null, 'Ernie'],
+      ['anima', 'anima', null, 'Anima Base v1.0'],
+      ['boogu', 'boogu', null, 'Boogu Image 0.1 Base'],
+      ['krea2', 'krea2', null, 'Krea 2'],
+      ['mageflow', 'mageflow', null, 'Mage-Flow 4B Base'],
+      ['ideogram4', 'ideogram4', null, 'Ideogram 4.0'],
+      ['flux2klein_4b', 'flux2klein', '4b', 'Flux.2 Klein 4B Base'],
+      ['flux2klein_9b', 'flux2klein', '9b', 'Flux.2 Klein 9B Base'],
+      ['ming', 'ming', null, 'Ming Image Design 0.1'],
+      ['qwen21', 'qwen21', null, 'Qwen 2.1'],
     ]);
+    // Video, audio, disabled, no-aiToolkit and schema-refused keys stay out.
+    const keys = new Set(TRAINING_KIND_CATALOG.map((m) => m.model));
+    for (const refused of ['hidream_o1', 'flux2_dev', 'wan_2_1_i2v_14b_720p', 'wan_2_2_t2v_a14b', 'ltx2', 'minimaxh3', 'yue2', 'acestep_15']) {
+      expect(keys.has(refused)).toBe(false);
+    }
+  });
+
+  it('every preset is one catalog model; the old preset ids are kept, and only SDXL runs the pass-through step', () => {
+    expect(TRAINING_PRESETS.map((p) => p.trainingKind.model)).toEqual(TRAINING_KIND_CATALOG.map((m) => m.model));
+    const byModel = Object.fromEntries(TRAINING_PRESETS.map((p) => [p.trainingKind.model, p.id]));
+    expect(byModel).toMatchObject({
+      sdxl: 'sdxl',
+      pony: 'pony',
+      illustrious: 'illustrious',
+      sd_1_5: 'sd15',
+      flux_dev: 'flux',
+      qwen_image: 'qwen',
+      chroma: 'chroma',
+      anima: 'anima',
+    });
+    expect(new Set(TRAINING_PRESETS.map((p) => p.id)).size).toBe(TRAINING_PRESETS.length);
     expect(TRAINING_PRESETS.filter(passThroughAvailable).map((p) => p.id)).toEqual(['sdxl']);
+    expect(DEFAULT_TRAINING_PRESET.id).toBe('sdxl');
+    // Price hints exist only where #541 quoted one; the new models carry none.
+    expect(TRAINING_PRESETS.filter((p) => p.approxBuzz != null).map((p) => p.id)).toEqual([
+      'sd15', 'sdxl', 'pony', 'illustrious', 'flux', 'chroma', 'qwen',
+    ]);
+  });
+
+  it("each model's params are Training Studio's defaults (spot values pinned per family)", () => {
+    const params = (model: string) =>
+      trainingKindParams(TRAINING_KIND_CATALOG.find((m) => m.model === model)!, 7, 3);
+    expect(params('sdxl')).toMatchObject({
+      ecosystem: 'sdxl', steps: 7, epochs: 3, batchSize: 4, resolution: 1024, lr: 0.0005, textEncoderLr: 0.00005,
+      trainTextEncoder: true, optimizerType: 'adafactor', lrScheduler: 'cosine', networkDim: 32, networkAlpha: 32,
+      noiseOffset: 0.1, minSnrGamma: 5,
+    });
+    expect(params('anime')).toMatchObject({ networkDim: 16, textEncoderLr: 0.0001, optimizerType: 'adamw8bit', minSnrGamma: 5 });
+    expect(params('realistic')).toMatchObject({ batchSize: 2, resolution: 512 });
+    expect(params('zimagebase')).toMatchObject({ lr: 0.000001, optimizerType: 'automagic', lrScheduler: 'cosine', batchSize: 2 });
+    expect(params('anima')).toMatchObject({ resolution: 1024, lr: 0.0001, lrScheduler: 'constant', noiseOffset: 0, minSnrGamma: null });
+    expect(params('flux2klein_9b')).toMatchObject({ ecosystem: 'flux2klein', modelVariant: '9b', batchSize: 2 });
+    expect(params('chroma')).toMatchObject({ networkDim: 2, networkAlpha: 16, trainTextEncoder: false });
+    // Studio's step/epoch defaults (versionStepDefault + PARAM_DEFAULTS.epochs).
+    const stepEpoch = Object.fromEntries(
+      TRAINING_KIND_CATALOG.map((m) => [m.model, [m.defaults.steps, m.defaults.epochs]]),
+    );
+    expect(stepEpoch).toMatchObject({ sdxl: [2000, 10], flux_dev: [2000, 5], anima: [1500, 5], boogu: [3000, 5], ming: [2000, 5], krea2: [2000, 10] });
+  });
+
+  it('invariant: every model satisfies the host rules the SDK type cannot express', () => {
+    for (const m of TRAINING_KIND_CATALOG) {
+      const p = trainingKindParams(m, 2000, 10);
+      // lr must be below 0.1 unless the optimizer is prodigy (none here).
+      expect(p.lr, m.model).toBeLessThan(0.1);
+      expect(['prodigy', 'prodigy8bit']).not.toContain(p.optimizerType);
+      // qwen21 / ming pin batchSize to exactly 1.
+      if (m.arm.ecosystem === 'qwen21' || m.arm.ecosystem === 'ming') expect(p.batchSize, m.model).toBe(1);
+      expect(p.trainTextEncoder).toBe((p.textEncoderLr ?? 0) > 0);
+    }
   });
 
   it('refuses to build an empty or over-cap items body instead of sending it', () => {

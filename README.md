@@ -86,8 +86,10 @@ estimate is the price: no usable quote, no run.
    (`page.buzzBudgetPerGen: 1000`). It only works when the snapshot's items are
    Civitai consumer-blob urls. A quote above the budget is refused by the host
    (`… use kind:'training'`) and the app points the trainer at path 2.
-2. **Civitai's trainer — `kind: 'training'`** (every preset, including Flux,
-   Qwen-Image and Chroma; up to 5,000 Buzz a run). The host trains only on blobs
+2. **Civitai's trainer — `kind: 'training'`** (every base model the host accepts
+   for apps — the 22 image models listed in `TRAINING_KIND_CATALOG` in
+   `src/training.ts`, mirrored from civitai@dd6d276934, each with Training
+   Studio's default parameters; up to 5,000 Buzz a run). The host trains only on blobs
    it uploaded for this block instance, so the **trainer re-uploads the
    snapshot's images**:
    1. The training set is listed as numbered images (each with a **Save** button,
@@ -98,10 +100,15 @@ estimate is the price: no usable quote, no run.
    3. Each upload is matched to one numbered snapshot image — by position by
       default, changeable per row — and carries that image's frozen caption. The
       app refuses to price a count mismatch, a double match or a repeated file.
-   4. **Price** sends `{ kind: 'training', items: [{ air, caption }], model,
+   4. The app only receives `{ url, air }`, so it cannot prove the uploads are the
+      snapshot's images. The trainer must tick an attestation (unchecked by
+      default, cleared by any new upload or re-match) before pricing, and the run
+      is recorded in the ledger and on the LoRA as **trainer-attested**; the
+      pass-through path's runs are recorded as `snapshot`.
+   5. **Price** sends `{ kind: 'training', items: [{ air, caption }], model,
       params, triggerWord, samplePrompts }` to `estimate()`; the reply's
       `trainingQuote` is the price.
-   5. **Open Civitai confirmation** persists the snapshot, then calls
+   6. **Open Civitai confirmation** persists the snapshot, then calls
       `useRunTraining().runTraining({ ...body, quoteId })`. Civitai's dialog shows
       the server's price and is the charge; the run is then followed with
       `watch()`.

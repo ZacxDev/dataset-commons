@@ -113,5 +113,10 @@ your own script under one of them, yours is what runs.
   (`usePrepareTrainingDataset` is gone). The host refuses any blob it did not
   upload for this block instance, and forgets them on reload.
 - Never auto-retry after `submission-unconfirmed`: a retry is a new charged run.
+- The `kind: 'training'` model list is `TRAINING_KIND_CATALOG` in
+  `src/training.ts`, a hand mirror of civitai@dd6d276934; a test pins the keys.
+- Civitai's-trainer runs are `dataSource: 'trainer-attested'` (the trainer's
+  word that the uploads are the snapshot's images); a missing field reads as
+  `'snapshot'`.
 - The rules live in `src/training.ts` (pure, unit-tested); `src/TrainFlow.tsx`
   only drives hooks. See README "Training a LoRA".
