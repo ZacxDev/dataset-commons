@@ -22,6 +22,19 @@ async function openTrain(user: ReturnType<typeof userEvent.setup>) {
   return screen.findByTestId('dc-train');
 }
 
+/** One `purpose: 'trainingData'` upload result, as the host returns it. */
+const trainingUpload = (n: number) => ({
+  url: `https://blobs.mock.invalid/v2/consumer/blobs/up${n}.png`,
+  air: `up${n}.png`,
+});
+
+/** The shared step both paths need first: upload the training set, then attest the match. */
+async function uploadAndAttest(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByTestId('dc-train-upload'));
+  await screen.findByTestId('dc-train-pairs');
+  await user.click(screen.getByTestId('dc-train-attest'));
+}
+
 /** Contributed by OTHER people — the trainer re-uploads them for Civitai's trainer. */
 const communityItems: DatasetItem[] = [
   {
@@ -131,6 +144,7 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       cost: 512,
       // The page's per-call budget (manifest buzzBudgetPerGen). Since SDK 0.67 the mock
       // refuses an over-budget training $type estimate as the real host does.
@@ -146,6 +160,7 @@ describe('TrainFlow (Option A′)', () => {
     });
     await openTrain(user);
 
+    await uploadAndAttest(user);
     await user.click(screen.getByTestId('dc-estimate'));
 
     // The confirm card shows the REAL quote (cost 512 > maxBuzz sentinel 1).
@@ -163,8 +178,16 @@ describe('TrainFlow (Option A′)', () => {
     expect(body.kind).toBe('step');
     expect(body.$type).toBe('training');
     expect(body.maxBuzz).toBe(1);
-    const input = body.input as { trainingData: { items: unknown[] }; triggerWord?: string };
-    expect(input.trainingData.items).toHaveLength(2);
+    const input = body.input as { trainingData: { type: string; items: unknown[] }; triggerWord?: string };
+    // It trains on the host's `trainingData` upload keys, each with its snapshot
+    // item's frozen caption — never on the items' stored image urls.
+    expect(input.trainingData).toEqual({
+      type: 'blobs',
+      items: [
+        { air: 'up1.png', caption: 'ink portrait, front view' },
+        { air: 'up2.png', caption: 'ink portrait, profile view' },
+      ],
+    });
     expect(input.triggerWord).toBe('archivetok');
 
     // Trainer-fee ledger: 512 split 5:1 -> alice 427, bob 85 (largest remainder).
@@ -179,6 +202,7 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       cost: 512,
       // The page's per-call budget (manifest buzzBudgetPerGen). Since SDK 0.67 the mock
       // refuses an over-budget training $type estimate as the real host does.
@@ -191,6 +215,7 @@ describe('TrainFlow (Option A′)', () => {
       },
     });
     await openTrain(user);
+    await uploadAndAttest(user);
     await user.click(screen.getByTestId('dc-estimate'));
     await screen.findByTestId('dc-confirm-submit');
     await user.click(screen.getByTestId('dc-confirm-submit'));
@@ -206,6 +231,7 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       cost: 512,
       // The page's per-call budget (manifest buzzBudgetPerGen). Since SDK 0.67 the mock
       // refuses an over-budget training $type estimate as the real host does.
@@ -215,6 +241,7 @@ describe('TrainFlow (Option A′)', () => {
       generation: { trainedEpochs: 0 },
     });
     await openTrain(user);
+    await uploadAndAttest(user);
     await user.click(screen.getByTestId('dc-estimate'));
     await screen.findByTestId('dc-confirm-submit');
     await user.click(screen.getByTestId('dc-confirm-submit'));
@@ -230,10 +257,12 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       cost: 1, // the mock "quotes" exactly the maxBuzz sentinel -> no real quote
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
     });
     await openTrain(user);
+    await uploadAndAttest(user);
     await user.click(screen.getByTestId('dc-estimate'));
 
     expect(await screen.findByTestId('dc-unquoted')).toHaveTextContent(/no price quote/i);
@@ -246,10 +275,12 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       cost: 0, // below the 1-Buzz sentinel -> no usable cost came back
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
     });
     await openTrain(user);
+    await uploadAndAttest(user);
     await user.click(screen.getByTestId('dc-estimate'));
 
     expect(await screen.findByTestId('dc-unquoted')).toHaveTextContent(/no usable price/i);
@@ -263,11 +294,13 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       cost: 512,
       buzzBudget: 200, // below the quote: the host refuses a training $type as a confirmed step
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
     });
     await openTrain(user);
+    await uploadAndAttest(user);
     await user.click(screen.getByTestId('dc-estimate'));
 
     expect(await screen.findByTestId('dc-unquoted-detail')).toHaveTextContent(
@@ -281,6 +314,7 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       cost: 512,
       // The page's per-call budget (manifest buzzBudgetPerGen). Since SDK 0.67 the mock
       // refuses an over-budget training $type estimate as the real host does.
@@ -288,6 +322,7 @@ describe('TrainFlow (Option A′)', () => {
       buzzBalance: { blue: 10, green: 0, yellow: 0 },
     });
     await openTrain(user);
+    await uploadAndAttest(user);
     await user.click(screen.getByTestId('dc-estimate'));
 
     expect(await screen.findByTestId('dc-insufficient')).toBeInTheDocument();
@@ -321,10 +356,6 @@ describe('TrainFlow (Option A′)', () => {
   // --- Civitai's trainer (kind: 'training', SDK 0.77): the trainer uploads the
   // frozen snapshot's images through the host modal; captions carry over. ---
 
-  const upload = (n: number) => ({
-    url: `https://blobs.mock.invalid/v2/consumer/blobs/up${n}.png`,
-    air: `up${n}.png`,
-  });
   type Outbound = { type: string; payload?: unknown };
   const trainingBodies = (outbound: Outbound[], type: string) =>
     outbound
@@ -334,9 +365,9 @@ describe('TrainFlow (Option A′)', () => {
       .map((m) => (m.payload as { body: Record<string, unknown> }).body);
 
   async function uploadAndPrice(user: ReturnType<typeof userEvent.setup>) {
-    await user.click(screen.getByTestId('dc-kind-upload'));
-    await screen.findByTestId('dc-kind-pairs');
-    await user.click(screen.getByTestId('dc-kind-attest'));
+    await user.click(screen.getByTestId('dc-train-upload'));
+    await screen.findByTestId('dc-train-pairs');
+    await user.click(screen.getByTestId('dc-train-attest'));
     await user.click(screen.getByTestId('dc-kind-estimate'));
   }
 
@@ -351,7 +382,7 @@ describe('TrainFlow (Option A′)', () => {
       pollsUntilDone: 1,
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
       generation: { trainedEpochs: 10 },
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({
@@ -362,9 +393,9 @@ describe('TrainFlow (Option A′)', () => {
     });
 
     // Contributors are other people — this path no longer needs own images.
-    expect(screen.getByTestId('dc-kind-training')).toHaveTextContent('2 images to upload');
-    expect(screen.getByTestId('dc-kind-list')).toHaveTextContent('#1front');
-    expect(screen.getByTestId('dc-kind-upload')).toHaveTextContent('Upload these 2 images');
+    expect(screen.getByTestId('dc-train-uploads')).toHaveTextContent('2 images to upload');
+    expect(screen.getByTestId('dc-train-list')).toHaveTextContent('#1front');
+    expect(screen.getByTestId('dc-train-upload')).toHaveTextContent('Upload these 2 images');
 
     await uploadAndPrice(user);
     expect(await screen.findByTestId('dc-kind-quote')).toHaveTextContent('725');
@@ -405,19 +436,19 @@ describe('TrainFlow (Option A′)', () => {
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
       trainingQuoteTotal: 725,
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({ initialItems: communityItems });
-    await user.click(screen.getByTestId('dc-kind-upload'));
-    await user.selectOptions(await screen.findByTestId('dc-kind-match-0'), 'b');
-    expect(screen.getByTestId('dc-kind-problems')).toHaveTextContent(
+    await user.click(screen.getByTestId('dc-train-upload'));
+    await user.selectOptions(await screen.findByTestId('dc-train-match-0'), 'b');
+    expect(screen.getByTestId('dc-train-problems')).toHaveTextContent(
       'Training-set image #2 is matched to both upload #1 and upload #2.',
     );
     expect(screen.getByTestId('dc-kind-estimate')).toBeDisabled();
-    await user.selectOptions(screen.getByTestId('dc-kind-match-1'), 'a');
-    expect(screen.queryByTestId('dc-kind-problems')).not.toBeInTheDocument();
-    await user.click(screen.getByTestId('dc-kind-attest'));
+    await user.selectOptions(screen.getByTestId('dc-train-match-1'), 'a');
+    expect(screen.queryByTestId('dc-train-problems')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('dc-train-attest'));
     await user.click(screen.getByTestId('dc-kind-estimate'));
     await screen.findByTestId('dc-kind-quote');
 
@@ -433,18 +464,18 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
-      cannedTrainingDataUpload: [upload(1), upload(2), upload(3)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2), trainingUpload(3)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({ initialItems: communityItems });
-    await user.click(screen.getByTestId('dc-kind-upload'));
+    await user.click(screen.getByTestId('dc-train-upload'));
 
-    expect(await screen.findByTestId('dc-kind-problems')).toHaveTextContent(
+    expect(await screen.findByTestId('dc-train-problems')).toHaveTextContent(
       'You uploaded 3 images, but the training set has 2.',
     );
     expect(screen.getByTestId('dc-kind-estimate')).toBeDisabled();
     expect(trainingBodies(outbound, 'ESTIMATE_WORKFLOW')).toHaveLength(0);
-    expect(screen.getByTestId('dc-kind-upload')).toHaveTextContent('Upload again');
+    expect(screen.getByTestId('dc-train-upload')).toHaveTextContent('Upload again');
   });
 
   it('a cancelled upload changes nothing', async () => {
@@ -455,9 +486,9 @@ describe('TrainFlow (Option A′)', () => {
       cannedTrainingDataUpload: null,
     });
     await renderTrainFlow({ initialItems: communityItems });
-    await user.click(screen.getByTestId('dc-kind-upload'));
-    await waitFor(() => expect(screen.getByTestId('dc-kind-upload')).toBeEnabled());
-    expect(screen.queryByTestId('dc-kind-pairs')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('dc-train-upload'));
+    await waitFor(() => expect(screen.getByTestId('dc-train-upload')).toBeEnabled());
+    expect(screen.queryByTestId('dc-train-pairs')).not.toBeInTheDocument();
     expect(screen.queryByTestId('dc-kind-error')).not.toBeInTheDocument();
   });
 
@@ -470,7 +501,7 @@ describe('TrainFlow (Option A′)', () => {
       trainingQuoteTotal: 725,
       trainingDataNotUploadedHere: true,
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({ initialItems: communityItems });
@@ -480,9 +511,9 @@ describe('TrainFlow (Option A′)', () => {
     expect(await screen.findByTestId('dc-kind-error')).toHaveTextContent(
       'Civitai no longer has these uploads for this page (for example after a reload). No run was started and no Buzz was charged. Upload the images again, then price the run again.',
     );
-    expect(screen.queryByTestId('dc-kind-pairs')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-train-pairs')).not.toBeInTheDocument();
     expect(screen.queryByTestId('dc-kind-run')).not.toBeInTheDocument();
-    expect(screen.getByTestId('dc-kind-upload')).toHaveTextContent('Upload these 2 images');
+    expect(screen.getByTestId('dc-train-upload')).toHaveTextContent('Upload these 2 images');
     expect(screen.queryByTestId('dc-run')).not.toBeInTheDocument();
     expect(trainingBodies(outbound, 'RUN_TRAINING')).toHaveLength(1);
   });
@@ -494,7 +525,7 @@ describe('TrainFlow (Option A′)', () => {
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
       trainingQuoteTotal: 5001,
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({ initialItems: communityItems });
@@ -514,7 +545,7 @@ describe('TrainFlow (Option A′)', () => {
       consentGranted: true,
       trainingQuoteTotal: 725,
       buzzBalance: { blue: 10, green: 0, yellow: 0 },
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
     });
     await renderTrainFlow({ initialItems: communityItems });
     await uploadAndPrice(user);
@@ -531,7 +562,7 @@ describe('TrainFlow (Option A′)', () => {
       consentGranted: true,
       trainingQuoteTotal: 725,
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({
@@ -556,7 +587,7 @@ describe('TrainFlow (Option A′)', () => {
       trainingQuoteTotal: 725,
       runTrainingError: 'declined',
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({ initialItems: communityItems });
@@ -577,7 +608,7 @@ describe('TrainFlow (Option A′)', () => {
       trainingQuoteTotal: 725,
       runTrainingError: 'submission-unconfirmed',
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({ initialItems: communityItems });
@@ -588,7 +619,7 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.getByTestId('dc-kind-unconfirmed')).toHaveTextContent(/will not retry automatically/);
     expect(screen.queryByTestId('dc-kind-run')).not.toBeInTheDocument();
     expect(screen.queryByTestId('dc-kind-estimate')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('dc-kind-upload')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-train-upload')).not.toBeInTheDocument();
     expect(trainingBodies(outbound, 'RUN_TRAINING')).toHaveLength(1);
   });
 
@@ -600,7 +631,7 @@ describe('TrainFlow (Option A′)', () => {
       trainingQuoteTotal: 725,
       runTrainingCapRefusal: 'daily Buzz cap reached for this viewer',
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
     });
     await renderTrainFlow({ initialItems: communityItems });
     await uploadAndPrice(user);
@@ -625,8 +656,8 @@ describe('TrainFlow (Option A′)', () => {
         netVotes: 1,
       })),
     });
-    expect(screen.getByTestId('dc-kind-blocked')).toHaveTextContent(/at most 50/);
-    expect(screen.queryByTestId('dc-kind-upload')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-train-blocked')).toHaveTextContent(/at most 50/);
+    expect(screen.queryByTestId('dc-train-upload')).not.toBeInTheDocument();
   });
 
   it('a Civitai-trainer-only base model disables the pass-through price button with the reason', async () => {
@@ -641,7 +672,7 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.getByTestId('dc-train-disabled-reason')).toHaveTextContent(
       "Flux trains only on Civitai's trainer below",
     );
-    expect(screen.getByTestId('dc-kind-upload')).toBeEnabled();
+    expect(screen.getByTestId('dc-train-upload')).toBeEnabled();
   });
 
   // --- Trainer attestation (kind: 'training' only): the app sees `{ url, air }`
@@ -654,16 +685,16 @@ describe('TrainFlow (Option A′)', () => {
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
       trainingQuoteTotal: 725,
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
       onOutbound: (message) => outbound.push(message as Outbound),
     });
     await renderTrainFlow({ initialItems: communityItems });
-    await user.click(screen.getByTestId('dc-kind-upload'));
-    await screen.findByTestId('dc-kind-pairs');
+    await user.click(screen.getByTestId('dc-train-upload'));
+    await screen.findByTestId('dc-train-pairs');
 
-    const attest = screen.getByTestId('dc-kind-attest');
+    const attest = screen.getByTestId('dc-train-attest');
     expect(attest).not.toBeChecked();
-    expect(screen.queryByTestId('dc-kind-problems')).not.toBeInTheDocument(); // the pairing itself is fine
+    expect(screen.queryByTestId('dc-train-problems')).not.toBeInTheDocument(); // the pairing itself is fine
     expect(screen.getByTestId('dc-kind-estimate')).toBeDisabled();
     await user.click(screen.getByTestId('dc-kind-estimate'));
     expect(trainingBodies(outbound, 'ESTIMATE_WORKFLOW')).toHaveLength(0);
@@ -680,23 +711,23 @@ describe('TrainFlow (Option A′)', () => {
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
     });
     await renderTrainFlow({ initialItems: communityItems });
-    await user.click(screen.getByTestId('dc-kind-upload'));
-    await screen.findByTestId('dc-kind-pairs');
+    await user.click(screen.getByTestId('dc-train-upload'));
+    await screen.findByTestId('dc-train-pairs');
 
-    await user.click(screen.getByTestId('dc-kind-attest'));
-    expect(screen.getByTestId('dc-kind-attest')).toBeChecked();
-    await user.selectOptions(screen.getByTestId('dc-kind-match-0'), 'b');
-    expect(screen.getByTestId('dc-kind-attest')).not.toBeChecked();
+    await user.click(screen.getByTestId('dc-train-attest'));
+    expect(screen.getByTestId('dc-train-attest')).toBeChecked();
+    await user.selectOptions(screen.getByTestId('dc-train-match-0'), 'b');
+    expect(screen.getByTestId('dc-train-attest')).not.toBeChecked();
 
-    await user.selectOptions(screen.getByTestId('dc-kind-match-0'), 'a');
-    await user.click(screen.getByTestId('dc-kind-attest'));
-    expect(screen.getByTestId('dc-kind-attest')).toBeChecked();
+    await user.selectOptions(screen.getByTestId('dc-train-match-0'), 'a');
+    await user.click(screen.getByTestId('dc-train-attest'));
+    expect(screen.getByTestId('dc-train-attest')).toBeChecked();
     expect(screen.getByTestId('dc-kind-estimate')).toBeEnabled();
-    await user.click(screen.getByTestId('dc-kind-upload')); // "Upload again"
-    await waitFor(() => expect(screen.getByTestId('dc-kind-attest')).not.toBeChecked());
+    await user.click(screen.getByTestId('dc-train-upload')); // "Upload again"
+    await waitFor(() => expect(screen.getByTestId('dc-train-attest')).not.toBeChecked());
     expect(screen.getByTestId('dc-kind-estimate')).toBeDisabled();
   });
 
@@ -711,7 +742,7 @@ describe('TrainFlow (Option A′)', () => {
       pollsUntilDone: 1,
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
       generation: { trainedEpochs: 10 },
-      cannedTrainingDataUpload: [upload(1), upload(2)],
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
     });
     await renderTrainFlow({
       initialItems: communityItems,
@@ -733,10 +764,11 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.getByTestId('dc-ledger-source')).toHaveTextContent('Trainer-attested uploads');
   });
 
-  it('a pass-through run is recorded with the snapshot source and shows no attested label', async () => {
+  it('a pass-through run on a real app dataset (stored image urls, not blobs) trains on the uploads and is recorded trainer-attested', async () => {
     const user = userEvent.setup();
     const ledgerEvents: LedgerEvent[] = [];
     const links: TrainRunLink[] = [];
+    const submitted: Array<Record<string, unknown>> = [];
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       consentGranted: true,
@@ -745,28 +777,205 @@ describe('TrainFlow (Option A′)', () => {
       pollsUntilDone: 1,
       buzzBalance: { blue: 1000, green: 0, yellow: 1000 },
       generation: { trainedEpochs: 10 },
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+      onOutbound: (m) => {
+        if (m.type === 'SUBMIT_WORKFLOW') submitted.push((m.payload as { body: Record<string, unknown> }).body);
+      },
     });
-    render(
-      <TrainFlow
-        hideThemeToggle
-        onLedgerEvent={(event) => {
-          ledgerEvents.push(event);
-        }}
-        onRunLinked={(link) => {
-          links.push(link);
-        }}
-      />,
-    );
-    await user.click(await screen.findByTestId('dc-estimate'));
+    await renderTrainFlow({
+      initialItems: communityItems,
+      onLedgerEvent: (event) => {
+        ledgerEvents.push(event);
+      },
+      onRunLinked: (link) => {
+        links.push(link);
+      },
+    });
+    await uploadAndAttest(user);
+    expect(screen.getByTestId('dc-estimate')).toBeEnabled();
+    await user.click(screen.getByTestId('dc-estimate'));
     await user.click(await screen.findByTestId('dc-confirm-submit'));
     await screen.findByTestId('dc-publish', {}, { timeout: 5000 });
 
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0]).toMatchObject({
+      kind: 'step',
+      $type: 'training',
+      input: {
+        trainingData: {
+          type: 'blobs',
+          items: [
+            { air: 'up1.png', caption: 'front' },
+            { air: 'up2.png', caption: 'profile' },
+          ],
+        },
+      },
+    });
     await waitFor(() => expect(ledgerEvents).toHaveLength(1));
-    expect(ledgerEvents[0]).toMatchObject({ eventType: 'training', grossBuzz: 512, dataSource: 'snapshot' });
+    expect(ledgerEvents[0]).toMatchObject({ eventType: 'training', grossBuzz: 512, dataSource: 'trainer-attested' });
     expect(links.length).toBeGreaterThan(0);
-    expect(links.every((l) => l.dataSource === 'snapshot')).toBe(true);
+    expect(links.every((l) => l.dataSource === 'trainer-attested')).toBe(true);
+    expect(screen.getByTestId('dc-ledger-source')).toHaveTextContent('Trainer-attested uploads');
+  });
+
+  it('the pass-through price button waits for the upload and the attestation — no estimate is sent before', async () => {
+    const user = userEvent.setup();
+    const outbound: Outbound[] = [];
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+      cost: 512,
+      buzzBudget: PAGE_BUZZ_BUDGET,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+      onOutbound: (message) => outbound.push(message as Outbound),
+    });
+    await renderTrainFlow({ initialItems: communityItems });
+    const estimates = () => outbound.filter((m) => m.type === 'ESTIMATE_WORKFLOW');
+
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+    expect(screen.getByTestId('dc-train-disabled-reason')).toHaveTextContent(/Upload the training set's images above first/);
+    await user.click(screen.getByTestId('dc-train-upload'));
+    await screen.findByTestId('dc-train-pairs');
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+    expect(screen.getByTestId('dc-train-disabled-reason')).toHaveTextContent(/Confirm above that the uploads/);
+    await user.click(screen.getByTestId('dc-estimate'));
+    expect(estimates()).toHaveLength(0);
+
+    await user.click(screen.getByTestId('dc-train-attest'));
+    expect(screen.getByTestId('dc-estimate')).toBeEnabled();
+    await user.click(screen.getByTestId('dc-estimate'));
+    expect(await screen.findByTestId('dc-quote')).toHaveTextContent('512');
+    expect(estimates()).toHaveLength(1);
+  });
+
+  it('changing which items are in the training set clears the attestation', async () => {
+    // [INVARIANT GUARD] — the includedKey reset already existed before this change;
+    // this pins it now that both paths depend on the one attestation.
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+    });
+    await renderTrainFlow({ initialItems: [...communityItems, { ...communityItems[0]!, itemId: 'c', caption: 'back', netVotes: 2 }] });
+    await user.click(screen.getByTestId('dc-train-upload'));
+    await screen.findByTestId('dc-train-pairs');
+    await user.click(screen.getByTestId('dc-train-attest'));
+    expect(screen.getByTestId('dc-train-attest')).toBeChecked();
+
+    // Excluding one item changes the included set (3 -> 2); the uploads and matches stay as they were.
+    await user.click(screen.getByTestId('dc-exclude-c'));
+    await waitFor(() => expect(screen.getByTestId('dc-train-attest')).not.toBeChecked());
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+    expect(screen.getByTestId('dc-kind-estimate')).toBeDisabled();
+  });
+
+  // --- A run's ledger and LoRA records use the snapshot THAT run was submitted
+  // with, never whatever the form is pricing now. ---
+
+  async function passThroughRunInModeration(
+    user: ReturnType<typeof userEvent.setup>,
+    extra: Partial<TrainFlowProps> = {},
+  ) {
+    const ledgerEvents: LedgerEvent[] = [];
+    const links: TrainRunLink[] = [];
+    const confirmed: string[] = [];
+    const host = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+      cost: 512,
+      buzzBudget: PAGE_BUZZ_BUDGET,
+      trainingQuoteTotal: 725,
+      pollsUntilDone: 1,
+      buzzBalance: { blue: 5000, green: 0, yellow: 5000 },
+      generation: { trainedEpochs: 0 },
+      cannedTrainingDataUpload: [trainingUpload(1), trainingUpload(2)],
+    });
+    uninstall = host;
+    await renderTrainFlow({
+      initialItems: communityItems,
+      onSnapshotConfirmed: (snapshot) => {
+        confirmed.push(snapshot.snapshotId);
+      },
+      onLedgerEvent: (event) => {
+        ledgerEvents.push(event);
+      },
+      onRunLinked: (link) => {
+        links.push(link);
+      },
+      ...extra,
+    });
+    await uploadAndAttest(user);
+    await user.click(screen.getByTestId('dc-estimate'));
+    await user.click(await screen.findByTestId('dc-confirm-submit'));
+    await screen.findByTestId('dc-moderation', {}, { timeout: 5000 });
+    expect(confirmed).toHaveLength(1);
+    return { host, ledgerEvents, links, runSnapshotId: confirmed[0]! };
+  }
+
+  it("Check again after pricing a Civitai-trainer run still credits the first run's own snapshot", async () => {
+    const user = userEvent.setup();
+    const { host, ledgerEvents, links, runSnapshotId } = await passThroughRunInModeration(user);
+
+    // Price a Civitai-trainer run on the same uploads: a NEW, unpersisted snapshot.
+    await user.click(screen.getByTestId('dc-kind-estimate'));
+    expect(await screen.findByTestId('dc-kind-quote')).toHaveTextContent('725');
+
+    // Moderation releases the first run's epochs; the trainer checks again.
+    host.setScenario({ generation: { trainedEpochs: 10 } });
+    await user.click(screen.getByTestId('dc-check-again'));
+    await screen.findByTestId('dc-publish', {}, { timeout: 5000 });
+
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]!.snapshotId).toBe(runSnapshotId);
+    expect(links.length).toBeGreaterThan(0);
+    expect(links.every((l) => l.snapshot?.snapshotId === runSnapshotId)).toBe(true);
+    // 512 split 3:1 by the first run's frozen votes -> alice 384, bob 128.
+    expect(screen.getByTestId('dc-credit-alice')).toHaveTextContent('384');
+    expect(screen.getByTestId('dc-credit-bob')).toHaveTextContent('128');
+  });
+
+  it('Check again after a config edit still records the run against its own snapshot', async () => {
+    const user = userEvent.setup();
+    const { host, ledgerEvents, runSnapshotId } = await passThroughRunInModeration(user);
+
+    // A standing Civitai-trainer quote, then an edit that invalidates it: clearing
+    // a quote must not clear (or redirect) the started run's snapshot.
+    await user.click(screen.getByTestId('dc-kind-estimate'));
+    await screen.findByTestId('dc-kind-quote');
+    await user.clear(screen.getByTestId('dc-trigger'));
+    await user.type(screen.getByTestId('dc-trigger'), 'othertok');
+
+    host.setScenario({ generation: { trainedEpochs: 10 } });
+    await user.click(screen.getByTestId('dc-check-again'));
+    await screen.findByTestId('dc-publish', {}, { timeout: 5000 });
+
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]!.snapshotId).toBe(runSnapshotId);
     expect(screen.getByTestId('dc-ledger')).toBeInTheDocument();
-    expect(screen.queryByTestId('dc-ledger-source')).not.toBeInTheDocument();
+  });
+
+  it("steps and epochs are bounded like Training Studio's (1–10000 steps, 1–20 epochs)", async () => {
+    const user = userEvent.setup();
+    uninstall = installMockMoneyHost({
+      viewer: { id: 2, username: 'dev', status: 'active' },
+      consentGranted: true,
+    });
+    await renderTrainFlow({ initialItems: communityItems });
+    const stepsInput = screen.getByTestId('dc-steps');
+    const epochsInput = screen.getByTestId('dc-epochs');
+    expect(stepsInput).toHaveAttribute('min', '1');
+    expect(stepsInput).toHaveAttribute('max', '10000');
+    expect(epochsInput).toHaveAttribute('min', '1');
+    expect(epochsInput).toHaveAttribute('max', '20');
+
+    await user.clear(stepsInput);
+    await user.type(stepsInput, '25000');
+    await user.clear(epochsInput); // blurs steps
+    await user.type(epochsInput, '37');
+    await user.click(screen.getByTestId('dc-trigger')); // blurs epochs
+    expect(stepsInput).toHaveValue(10000);
+    expect(epochsInput).toHaveValue(20);
   });
 
   it("choosing a base model loads Training Studio's step and epoch defaults for it", async () => {

@@ -88,16 +88,22 @@ export interface MockMoneyHostOptions extends MockHostOptions {
   rejectAccount?: boolean;
 }
 
+/** `uninstall()`, plus the SDK mock host's live `setScenario` for mid-test changes. */
+export type MockMoneyHostHandle = (() => void) & {
+  setScenario: ReturnType<typeof createMockHost>['setScenario'];
+};
+
 /**
  * Install the SDK mock host for the App's money path, plus the two behaviours the
  * 0.18 mock host doesn't natively model (balance-read error + domain-clamp
- * rejection). Returns an `uninstall()`.
+ * rejection). Returns an `uninstall()` that also carries the host's
+ * `setScenario` (e.g. to release trained epochs after a run was submitted).
  *
  * Test-only — mirrors the `createMockHost(...).install()` shape the suites use.
  * For the happy 3-pool balance + `spentAccountType` funder note, pass the SDK's
  * native `buzzBalance` / `viewer` options straight through (no shim needed).
  */
-export function installMockMoneyHost(options: MockMoneyHostOptions = {}): () => void {
+export function installMockMoneyHost(options: MockMoneyHostOptions = {}): MockMoneyHostHandle {
   const { balanceError, rejectAccount, onOutbound, ...hostOptions } = options;
 
   // Tracks whether the block's last submit named a pool — gates the disallowed
@@ -152,8 +158,9 @@ export function installMockMoneyHost(options: MockMoneyHostOptions = {}): () => 
   });
   const uninstallHost = host.install();
 
-  return () => {
+  const uninstall = () => {
     uninstallHost();
     window.removeEventListener('message', rewriteDisallowed);
   };
+  return Object.assign(uninstall, { setScenario: host.setScenario });
 }

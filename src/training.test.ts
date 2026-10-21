@@ -3,15 +3,16 @@ import { describe, expect, it } from 'vitest';
 
 import {
   DEFAULT_TRAINING_PRESET,
-  MAX_TRAINING_ITEMS,
+  TRAINING_EPOCHS_BOUNDS,
   TRAINING_KIND_CATALOG,
   TRAINING_PRESETS,
-  assembleTrainingItems,
-  blobKeyFromUrl,
+  TRAINING_STEPS_BOUNDS,
   buildPublishWizardPath,
   buildTrainingBody,
   buildTrainingKindBody,
   canAffordQuote,
+  clampTrainingEpochs,
+  clampTrainingSteps,
   classifyTrainingEstimate,
   classifyTrainingKindQuote,
   contributorShares,
@@ -46,56 +47,6 @@ const item = (over: Partial<DatasetItem>): DatasetItem => ({
   caption: 'a caption',
   netVotes: 3,
   ...over,
-});
-
-describe('blobKeyFromUrl', () => {
-  it('extracts the blob key from a consumer-blob url (the #541 recipe)', () => {
-    expect(blobKeyFromUrl('https://civitai.com/v2/consumer/blobs/abc123?token=zzz')).toBe('abc123');
-    expect(blobKeyFromUrl('https://civitai.com/v2/consumer/blobs/abc123')).toBe('abc123');
-  });
-
-  it('returns null for non-blob urls and empty input', () => {
-    expect(blobKeyFromUrl('https://image.civitai.com/x/1.jpeg')).toBeNull();
-    expect(blobKeyFromUrl('')).toBeNull();
-    expect(blobKeyFromUrl(null)).toBeNull();
-    expect(blobKeyFromUrl(undefined)).toBeNull();
-    expect(blobKeyFromUrl('https://civitai.com/v2/consumer/blobs/?x=1')).toBeNull();
-  });
-});
-
-describe('assembleTrainingItems', () => {
-  const blob = (key: string) => `https://civitai.com/v2/consumer/blobs/${key}`;
-
-  it('blob-keys, dedupes (first caption wins), and reports skips', () => {
-    const out = assembleTrainingItems([
-      { url: blob('k1'), caption: 'first' },
-      { url: blob('k1'), caption: 'second' },
-      { url: 'https://example.com/not-a-blob.jpg', caption: 'nope' },
-      { url: blob('k2'), caption: 'two' },
-    ]);
-    expect(out.items).toEqual([
-      { air: 'k1', caption: 'first' },
-      { air: 'k2', caption: 'two' },
-    ]);
-    expect(out.skipped).toHaveLength(2);
-    expect(out.skipped[0]).toMatch(/duplicate/);
-    expect(out.skipped[1]).toMatch(/not a Civitai blob url/);
-  });
-
-  it('caps the dataset at MAX_TRAINING_ITEMS and says so', () => {
-    const uploads = Array.from({ length: MAX_TRAINING_ITEMS + 5 }, (_, i) => ({
-      url: blob(`k${i}`),
-      caption: `c${i}`,
-    }));
-    const out = assembleTrainingItems(uploads);
-    expect(out.items).toHaveLength(MAX_TRAINING_ITEMS);
-    expect(out.skipped).toHaveLength(5);
-    expect(out.skipped[0]).toMatch(/cap/);
-  });
-
-  it('an empty upload list assembles to an empty dataset (body builder refuses it later)', () => {
-    expect(assembleTrainingItems([])).toEqual({ items: [], skipped: [] });
-  });
 });
 
 describe('freezeSnapshot (spec §7.2/§7.3)', () => {
@@ -274,10 +225,11 @@ describe('training data source (trainer attestation)', () => {
 });
 
 describe('buildTrainingBody (the #541 pass-through shape)', () => {
-  const dataset = assembleTrainingItems([
-    { url: 'https://civitai.com/v2/consumer/blobs/k1', caption: 'one' },
-    { url: 'https://civitai.com/v2/consumer/blobs/k2', caption: 'two' },
-  ]);
+  // The `{ air, caption }` pairs a `trainingData` upload + pairUploadsWithSnapshot produce.
+  const dataset = [
+    { air: 'k1', caption: 'one' },
+    { air: 'k2', caption: 'two' },
+  ];
 
   it('builds kind:step / $type:training with maxBuzz 1 and a blobs dataset', () => {
     const body = buildTrainingBody(dataset, {
@@ -323,7 +275,7 @@ describe('buildTrainingBody (the #541 pass-through shape)', () => {
 
   it('refuses an empty dataset and an unwired preset AIR instead of guessing', () => {
     expect(() =>
-      buildTrainingBody({ items: [], skipped: [] }, {
+      buildTrainingBody([], {
         preset: DEFAULT_TRAINING_PRESET,
         triggerWord: '',
         steps: 1,
@@ -335,6 +287,41 @@ describe('buildTrainingBody (the #541 pass-through shape)', () => {
     expect(() =>
       buildTrainingBody(dataset, { preset: unwired, triggerWord: '', steps: 1, epochs: 1, samplePrompt: '' }),
     ).toThrow(/no verified base-model AIR/);
+  });
+});
+
+describe("steps / epochs bounds (Training Studio's AI_TOOLKIT_EPOCHS and TARGET_STEPS)", () => {
+  const items = [{ air: 'k1', caption: 'one' }];
+  const sdxl = TRAINING_PRESETS.find((p) => p.id === 'sdxl')!;
+  const config = (steps: number, epochs: number) => ({ preset: sdxl, triggerWord: 'tok', steps, epochs, samplePrompt: '' });
+
+  it('pins the bounds to the civitai@dd6d276934 literals', () => {
+    expect(TRAINING_EPOCHS_BOUNDS).toEqual({ min: 1, max: 20 });
+    expect(TRAINING_STEPS_BOUNDS).toEqual({ min: 1, max: 10000 });
+  });
+
+  it('clamps both ends, keeps in-range values, and floors junk to the minimum', () => {
+    expect(clampTrainingEpochs(37)).toBe(20);
+    expect(clampTrainingEpochs(21)).toBe(20);
+    expect(clampTrainingEpochs(13)).toBe(13);
+    expect(clampTrainingEpochs(0)).toBe(1);
+    expect(clampTrainingEpochs(-5)).toBe(1);
+    expect(clampTrainingEpochs(Number.NaN)).toBe(1);
+    expect(clampTrainingSteps(25000)).toBe(10000);
+    expect(clampTrainingSteps(10001)).toBe(10000);
+    expect(clampTrainingSteps(7321)).toBe(7321);
+    expect(clampTrainingSteps(0)).toBe(1);
+  });
+
+  it('both run paths send the clamped values, and in-range values unchanged', () => {
+    const pass = buildTrainingBody(items, config(25000, 37));
+    expect([pass.input.steps, pass.input.epochs]).toEqual([10000, 20]);
+    const kind = buildTrainingKindBody({ items, config: config(25000, 37) });
+    expect([kind.params.steps, kind.params.epochs]).toEqual([10000, 20]);
+    const passMid = buildTrainingBody(items, config(7321, 13));
+    expect([passMid.input.steps, passMid.input.epochs]).toEqual([7321, 13]);
+    const kindMid = buildTrainingKindBody({ items, config: config(7321, 13) });
+    expect([kindMid.params.steps, kindMid.params.epochs]).toEqual([7321, 13]);
   });
 });
 
@@ -560,6 +547,16 @@ describe("Civitai's trainer (kind: 'training', SDK 0.77 items body)", () => {
     }
   });
 
+  it("an empty trigger word is sent as '' (Training Studio's value), never a made-up word", () => {
+    const sdxl = TRAINING_PRESETS.find((p) => p.id === 'sdxl')!;
+    const body = buildTrainingKindBody({
+      items: [{ air: 'k1', caption: 'one' }],
+      config: { ...config, preset: sdxl, triggerWord: '   ' },
+    });
+    expect(body.triggerWord).toBe('');
+    expect(body.samplePrompts).toEqual(['portrait']);
+  });
+
   it('refuses to build an empty or over-cap items body instead of sending it', () => {
     expect(() => buildTrainingKindBody({ items: [], config })).toThrow(/1 to 50/);
     const many = Array.from({ length: 51 }, (_, i) => ({ air: `k${i}`, caption: '' }));
@@ -622,10 +619,10 @@ describe("Civitai's trainer (kind: 'training', SDK 0.77 items body)", () => {
 
 describe('buildTrainingBody — pass-through body pinned whole (invariant across the SDK bump)', () => {
   it('SDXL still submits exactly the #541 pass-through body', () => {
-    const dataset = assembleTrainingItems([
-      { url: 'https://civitai.com/v2/consumer/blobs/k1', caption: 'one' },
-      { url: 'https://civitai.com/v2/consumer/blobs/k2', caption: 'two' },
-    ]);
+    const dataset = [
+      { air: 'k1', caption: 'one' },
+      { air: 'k2', caption: 'two' },
+    ];
     const body = buildTrainingBody(dataset, {
       preset: TRAINING_PRESETS.find((p) => p.id === 'sdxl')!,
       triggerWord: 'mytok',

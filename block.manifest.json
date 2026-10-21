@@ -23,7 +23,7 @@
     "title": "Open Datasets"
   },
   "scopeJustifications": {
-    "ai:write:budgeted": "Runs image generations on the user's behalf, spending from the per-generation Buzz budget the page grants.",
+    "ai:write:budgeted": "Runs image generations on the user's behalf, spending from the per-generation Buzz budget the page grants, and runs LoRA training on the user's chosen dataset snapshot, spending the user's own Buzz at the price quoted before the run (confirmed in this app, or in Civitai's own training dialog for runs above the page budget).",
     "apps:storage:read": "Reads the viewer's own settings and contribution index for this app so their ledger view and theme preference reload with them.",
     "apps:storage:shared:read": "Reads the community datasets, items, votes, snapshots, LoRA records, and tracked-credit ledger every viewer of this app shares.",
     "apps:storage:shared:write": "Lets a viewer contribute datasets and items, cast changeable up/down votes, and record training snapshots, LoRA links, and tracked-credit events that other viewers of this app can see.",

@@ -4,7 +4,9 @@
 // This is the platform-supported training path documented on
 // civitai/civitai-app-starters#541 (status comment 2026-10-06):
 //
-//   estimate (quote gate) -> consent -> submit `{ kind:'step', $type:'training' }`
+//   upload the snapshot's images (`purpose: 'trainingData'`) -> attest
+//   -> estimate (quote gate) -> consent -> submit `{ kind:'step', $type:'training' }`
+//   (or `kind:'training'` via useRunTraining)
 //   -> poll -> snapshot.trainedEpochs (after dataset moderation approval)
 //   -> navigate viewer to Civitai's model wizard
 //      `models/train/from-orchestrator?workflowId=<id>&epoch=<n>` (scope:'site')
@@ -46,82 +48,17 @@ export interface DatasetItem {
   contributorId: string;
   /** Display name for the contributor (identity stays `contributorId`). */
   contributorName?: string;
-  /** Civitai-hosted image url (from `useImageUpload`), or a reference url. */
+  /**
+   * The contribution's image url as stored (a Civitai image / edge url). It is
+   * for display and saving only: neither training path can train on it, so the
+   * trainer re-uploads the training set (see pairUploadsWithSnapshot).
+   */
   imageUrl: string;
-  /** Civitai image id when the contribution carries one (own-images training). */
+  /** Civitai image id when the contribution carries one. */
   imageId?: number;
   caption: string;
   /** Live net votes (up − down) at the moment the snapshot is frozen. */
   netVotes: number;
-}
-
-/** An uploaded image awaiting its caption / dataset metadata. */
-export interface UploadedImage {
-  url: string;
-  caption: string;
-}
-
-/**
- * Extract the blob KEY from a Civitai consumer-blob url — the `air` the
- * training step wants. Mirrors the #541 status comment exactly:
- *   key = url.split('/v2/consumer/blobs/')[1].split('?')[0]
- * Returns null for any url that is not a consumer-blob url, so a caller can
- * refuse it instead of sending the orchestrator a full signed url.
- */
-export function blobKeyFromUrl(url: string | null | undefined): string | null {
-  if (!url) return null;
-  const marker = '/v2/consumer/blobs/';
-  const idx = url.indexOf(marker);
-  if (idx < 0) return null;
-  const rest = url.slice(idx + marker.length);
-  const key = rest.split('?')[0]?.split('#')[0] ?? '';
-  return key.length > 0 ? key : null;
-}
-
-/** The training-step dataset item: a blob key (`air`) + its caption. */
-export interface TrainingDataItem {
-  air: string;
-  caption: string;
-}
-
-export interface AssembledDataset {
-  items: TrainingDataItem[];
-  /** Human-readable reasons an upload was dropped (dup / no blob key / over cap). */
-  skipped: string[];
-}
-
-/** Server-side dataset cap named on #541 (≤ 1000 items). */
-export const MAX_TRAINING_ITEMS = 1000;
-
-/**
- * Assemble the training dataset from uploaded images: blob-key each url,
- * dedupe by key (first caption wins), and cap at MAX_TRAINING_ITEMS.
- * Anything unusable is reported in `skipped`, never silently dropped.
- */
-export function assembleTrainingItems(
-  uploads: readonly UploadedImage[],
-): AssembledDataset {
-  const seen = new Set<string>();
-  const items: TrainingDataItem[] = [];
-  const skipped: string[] = [];
-  for (const up of uploads) {
-    const key = blobKeyFromUrl(up.url);
-    if (!key) {
-      skipped.push(`not a Civitai blob url: ${up.url}`);
-      continue;
-    }
-    if (seen.has(key)) {
-      skipped.push(`duplicate blob: ${key}`);
-      continue;
-    }
-    if (items.length >= MAX_TRAINING_ITEMS) {
-      skipped.push(`over the ${MAX_TRAINING_ITEMS}-item dataset cap: ${key}`);
-      continue;
-    }
-    seen.add(key);
-    items.push({ air: key, caption: up.caption ?? '' });
-  }
-  return { items, skipped };
 }
 
 // ---------------------------------------------------------------------------
@@ -265,13 +202,16 @@ export type LedgerEventType = 'training' | 'generation_in_app' | 'generation_ons
 
 /**
  * Where a training run's images came from:
- *  - 'snapshot': the pass-through step trained on the snapshot's own blob urls,
- *    so the run provably used the snapshot's images.
- *  - 'trainer-attested': Civitai's trainer (`kind: 'training'`) trained on files
- *    the trainer uploaded; the app only sees `{ url, air }` and cannot prove they
- *    are the snapshot's images, so the trainer's own attestation is all there is.
+ *  - 'trainer-attested': the run trained on files the trainer uploaded through
+ *    `useImageUpload({ purpose: 'trainingData' })`; the app only sees
+ *    `{ url, air }` and cannot prove they are the snapshot's images, so the
+ *    trainer's own attestation is all there is. EVERY run this app starts now —
+ *    pass-through step and Civitai's trainer alike — is recorded this way.
+ *  - 'snapshot': a LEGACY value only. Earlier versions ran the pass-through step
+ *    directly on the snapshot items' own blob urls and recorded it. Nothing
+ *    writes it any more; it is still read so those records render as before.
  * Records written before this field existed carry none; every one of them came
- * from the pass-through path, so a missing value reads as 'snapshot'.
+ * from that old pass-through path, so a missing value reads as 'snapshot'.
  */
 export type TrainingDataSource = 'snapshot' | 'trainer-attested';
 
@@ -595,16 +535,54 @@ const OPTIMIZER_TYPE: Readonly<Record<TrainingKindDefaults['optimizer'], AiToolk
 };
 
 /**
+ * The step / epoch bounds Training Studio and the site trainer apply, mirrored
+ * from civitai/civitai @ dd6d276934:
+ *  - epochs: `AI_TOOLKIT_EPOCHS = { default: 10, min: 1, max: 20 }` in
+ *    src/utils/training.ts (the site trainer's TrainingSubmitAdvancedSettings
+ *    input bounds), restated in apps/training-studio/src/lib/data/trainingModels.ts.
+ *  - steps: `TARGET_STEPS = { min: 1, max: 10000 }` in
+ *    apps/training-studio/src/lib/data/trainingModels.ts (Studio's ReviewStep
+ *    clamps to it; train-core.ts refuses a run above it).
+ * Both run paths clamp through clampTrainingSteps / clampTrainingEpochs, so a
+ * value the form let through can never reach a body unbounded.
+ */
+export const TRAINING_EPOCHS_BOUNDS = { min: 1, max: 20 } as const;
+export const TRAINING_STEPS_BOUNDS = { min: 1, max: 10000 } as const;
+
+function clampToBounds(value: number, bounds: { readonly min: number; readonly max: number }): number {
+  const n = Math.trunc(value) || bounds.min;
+  return Math.min(bounds.max, Math.max(bounds.min, n));
+}
+
+export function clampTrainingSteps(steps: number): number {
+  return clampToBounds(steps, TRAINING_STEPS_BOUNDS);
+}
+
+export function clampTrainingEpochs(epochs: number): number {
+  return clampToBounds(epochs, TRAINING_EPOCHS_BOUNDS);
+}
+
+/**
+ * The one sample prompt both run paths send: the trainer's own, else the
+ * trigger word plus "portrait", else just "portrait" (no trigger is sent as an
+ * empty trigger, as Training Studio does).
+ */
+function samplePromptFor(config: Pick<TrainingConfig, 'samplePrompt'>, trigger: string): string {
+  return config.samplePrompt.trim() || (trigger ? `${trigger}, portrait` : 'portrait');
+}
+
+/**
  * The ai-toolkit `params` for one catalog model at the trainer's chosen steps
- * and epochs, everything else at Training Studio's defaults.
+ * and epochs (clamped to Studio's bounds), everything else at Training Studio's
+ * defaults.
  */
 export function trainingKindParams(kind: TrainingKindModel, steps: number, epochs: number): AiToolkitTrainingParams {
   const d = kind.defaults;
   return {
     engine: 'ai-toolkit',
     ...kind.arm,
-    steps: Math.max(1, Math.trunc(steps) || 1),
-    epochs: Math.max(1, Math.trunc(epochs) || 1),
+    steps: clampTrainingSteps(steps),
+    epochs: clampTrainingEpochs(epochs),
     batchSize: d.batchSize,
     resolution: d.resolution,
     lr: d.unetLr,
@@ -645,15 +623,23 @@ export const DEFAULT_TRAINING_CONFIG: Omit<TrainingConfig, 'preset'> = {
  * the real quote (checked against the page's 1000-Buzz per-call budget), and an
  * unquoted run is stopped after 1 second instead of wandering. The quote gate
  * (classifyTrainingEstimate) must pass before this body is submitted.
+ *
+ * `items` are the SAME `{ air, caption }` pairs Civitai's trainer takes: the
+ * blob keys `useImageUpload({ purpose: 'trainingData' })` returned, each with
+ * its snapshot item's frozen caption (pairUploadsWithSnapshot). The host
+ * forwards a pass-through `input` to the orchestrator unmodified
+ * (civitai@dd6d276934 `blockPassThroughStepBodySchema`), and its own
+ * `kind:'training'` path builds the identical `trainingData: { type: 'blobs',
+ * items: [{ air, caption }] }` from those keys.
  */
 export function buildTrainingBody(
-  dataset: AssembledDataset,
+  items: readonly BlockTrainingDatasetItem[],
   config: TrainingConfig,
 ) {
   if (!config.preset.modelAir) {
     throw new Error(`Training preset "${config.preset.id}" has no verified base-model AIR wired in this build.`);
   }
-  if (dataset.items.length === 0) {
+  if (items.length === 0) {
     throw new Error('Cannot build a training body with an empty dataset.');
   }
   const trigger = config.triggerWord.trim();
@@ -665,12 +651,15 @@ export function buildTrainingBody(
       engine: 'ai-toolkit',
       ecosystem: config.preset.ecosystem,
       model: config.preset.modelAir,
-      steps: Math.max(1, Math.trunc(config.steps) || 1),
-      epochs: Math.max(1, Math.trunc(config.epochs) || 1),
+      steps: clampTrainingSteps(config.steps),
+      epochs: clampTrainingEpochs(config.epochs),
       ...(trigger ? { triggerWord: trigger } : {}),
-      trainingData: { type: 'blobs', items: dataset.items },
+      trainingData: {
+        type: 'blobs',
+        items: items.map((item) => ({ air: item.air, caption: item.caption })),
+      },
       samples: {
-        prompts: [config.samplePrompt.trim() || (trigger ? `${trigger}, portrait` : 'portrait')],
+        prompts: [samplePromptFor(config, trigger)],
       },
     },
   } as const;
@@ -679,30 +668,35 @@ export function buildTrainingBody(
 export type TrainingBody = ReturnType<typeof buildTrainingBody>;
 
 // ---------------------------------------------------------------------------
-// Civitai's trainer — `kind: 'training'` on images the trainer uploads
+// The training upload — shared by BOTH run paths — and Civitai's trainer
 // ---------------------------------------------------------------------------
 //
-// SDK 0.77 contract: the dataset is `items: [{ air, caption }]` (1–50, each
-// blob once), and every `air` must be a blob the HOST uploaded for this block
-// instance through `useImageUpload({ purpose: 'trainingData' })`. The host
-// refuses a quote naming any other blob (`training data not uploaded here`),
-// and forgets its uploads on a page reload. Community items live in shared
-// storage as images + captions, so the trainer re-uploads the frozen snapshot's
-// images and each upload is matched to one snapshot item, whose frozen caption
-// it carries.
+// Community items live in shared storage as display images (Civitai edge urls
+// from `useImageUpload()`) + captions; no training step can read those. So the
+// trainer re-uploads the frozen snapshot's images through
+// `useImageUpload({ purpose: 'trainingData' })` (≤ 50 per upload, the host
+// modal's cap), and each upload is matched to one snapshot item, whose frozen
+// caption it carries. The resulting `{ air, caption }` items feed whichever
+// path the preset uses:
+//  - the pass-through `training` step (buildTrainingBody), and
+//  - SDK 0.77 `kind: 'training'` (buildTrainingKindBody): 1–50 items, each blob
+//    once, every `air` a blob the HOST uploaded for this block instance — it
+//    refuses a quote naming any other (`training data not uploaded here`) and
+//    forgets its uploads on a page reload.
 
 export const TRAINING_KIND_MAX_ITEMS = BLOCK_TRAINING_DATASET_MAX_ITEMS;
 export const TRAINING_KIND_CAPTION_MAX_CHARS = BLOCK_TRAINING_CAPTION_MAX_CHARS;
 export const TRAINING_KIND_MAX_BUZZ = BLOCK_TRAINING_MAX_BUZZ_PER_RUN;
 
 /**
- * Why the snapshot's included set cannot go to Civitai's trainer at all, or
- * null when it can (1…50 included items). The app never trains a silent subset.
+ * Why the snapshot's included set cannot be uploaded for training at all, or
+ * null when it can (1…50 included items). Applies to both run paths, since both
+ * train on the one upload. The app never trains a silent subset.
  */
 export function trainingKindBlocker(includedCount: number): string | null {
   if (includedCount <= 0) return 'No items are in the training set.';
   if (includedCount > TRAINING_KIND_MAX_ITEMS) {
-    return `The training set has ${includedCount} images; Civitai's trainer takes at most ${TRAINING_KIND_MAX_ITEMS} per run. Exclude some before uploading.`;
+    return `The training set has ${includedCount} images; a training upload takes at most ${TRAINING_KIND_MAX_ITEMS} per run. Exclude some before uploading.`;
   }
   return null;
 }
@@ -791,8 +785,9 @@ export function buildTrainingKindBody(args: {
   if (args.items.length === 0 || args.items.length > TRAINING_KIND_MAX_ITEMS) {
     throw new Error(`Civitai's trainer needs 1 to ${TRAINING_KIND_MAX_ITEMS} uploaded images (got ${args.items.length}).`);
   }
-  const trigger = args.config.triggerWord.trim() || 'dataset';
-  const sample = args.config.samplePrompt.trim() || `${trigger}, portrait`;
+  // An empty trigger is sent as '' — Training Studio's own value for "no
+  // trigger word" (apps/training-studio buildTrainingRuns `trigger: t`).
+  const trigger = args.config.triggerWord.trim();
   const params = trainingKindParams(kind, args.config.steps, args.config.epochs);
   return {
     kind: 'training',
@@ -801,7 +796,7 @@ export function buildTrainingKindBody(args: {
     model: kind.model,
     params,
     triggerWord: trigger,
-    samplePrompts: [sample],
+    samplePrompts: [samplePromptFor(args.config, trigger)],
   };
 }
 

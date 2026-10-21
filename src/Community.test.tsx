@@ -346,12 +346,19 @@ describe('Community screens (voting option b)', () => {
           trainedEpochs: 10,
           trainingPublishedModel: { modelId: 42, modelVersionId: 84, published: true },
         },
+        // The quick path trains on the trainer's `trainingData` upload, like Civitai's trainer.
+        cannedTrainingDataUpload: [
+          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up1.png', air: 'up1.png' },
+          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up2.png', air: 'up2.png' },
+        ],
       });
       await openCommunity(user);
       await user.click(await screen.findByTestId('dc-open-dataset-dataset-archive-ink'));
       await user.click(await screen.findByTestId('dc-open-train'));
 
       expect(await screen.findByTestId('dc-train', {}, { timeout: 5000 })).toBeInTheDocument();
+      await user.click(await screen.findByTestId('dc-train-upload', {}, { timeout: 5000 }));
+      await user.click(await screen.findByTestId('dc-train-attest'));
       await user.click(screen.getByTestId('dc-estimate'));
       await user.click(await screen.findByTestId('dc-confirm-submit', {}, { timeout: 5000 }));
       expect(await screen.findByTestId('dc-published', {}, { timeout: 10000 })).toHaveTextContent('Model version 84');
@@ -393,8 +400,8 @@ describe('Community screens (voting option b)', () => {
       await openCommunity(user);
       await user.click(await screen.findByTestId('dc-open-dataset-dataset-archive-ink'));
       await user.click(await screen.findByTestId('dc-open-train'));
-      await user.click(await screen.findByTestId('dc-kind-upload', {}, { timeout: 5000 }));
-      await user.click(await screen.findByTestId('dc-kind-attest'));
+      await user.click(await screen.findByTestId('dc-train-upload', {}, { timeout: 5000 }));
+      await user.click(await screen.findByTestId('dc-train-attest'));
       await user.click(screen.getByTestId('dc-kind-estimate'));
       await user.click(await screen.findByTestId('dc-kind-run', {}, { timeout: 5000 }));
       expect(await screen.findByTestId('dc-publish', {}, { timeout: 10000 })).toBeInTheDocument();
