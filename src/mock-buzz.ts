@@ -21,8 +21,10 @@
 //      host's failure snapshots carry a generic error, not the clamp text — so we
 //      rewrite a failed snapshot's error in place when a pool was picked.
 //
-// Plus one training knob: `trainedEpochsFor` gives trained epochs to a workflow
-// the mock did not submit itself (a run found after an unconfirmed submit).
+// Plus two training knobs: `trainedEpochsFor` gives trained epochs to a workflow
+// the mock did not submit itself (a run found after an unconfirmed submit), and
+// `acceptWithSentinelId` makes an accepted submit come back under a host sentinel
+// id (the real host's `'whatif'`), which the SDK mock never produces.
 //
 // In PRODUCTION the real civitai host answers all of this natively, so none of
 // this ships.
@@ -96,6 +98,16 @@ export interface MockMoneyHostOptions extends MockHostOptions {
    * other id has none; this adds `count` epochs to those ids' succeeded replies.
    */
   trainedEpochsFor?: Readonly<Record<string, number>>;
+  /**
+   * Replace the `workflowId` of every NON-failed snapshot an accepted submit
+   * resolves with (pass-through `WORKFLOW_SUBMITTED` and Civitai-trainer
+   * `TRAINING_RESULT`) by this host sentinel — the real host's
+   * `snapshotFromWorkflow` stamps `'whatif'` when the orchestrator returned no id.
+   * The SDK mock always assigns a real id, so this is the only way to reach that
+   * reply. (`''` cannot be simulated: the SDK's inbound validator drops a snapshot
+   * with an empty `workflowId`, so the request never resolves.)
+   */
+  acceptWithSentinelId?: string;
 }
 
 /** `uninstall()`, plus the SDK mock host's live `setScenario` for mid-test changes. */
@@ -122,7 +134,7 @@ export type MockMoneyHostHandle = (() => void) & {
  * native `buzzBalance` / `viewer` options straight through (no shim needed).
  */
 export function installMockMoneyHost(options: MockMoneyHostOptions = {}): MockMoneyHostHandle {
-  const { balanceError, rejectAccount, trainedEpochsFor, onOutbound, ...hostOptions } = options;
+  const { balanceError, rejectAccount, trainedEpochsFor, acceptWithSentinelId, onOutbound, ...hostOptions } = options;
 
   // Tracks whether the block's last submit named a pool — gates the disallowed
   // rewrite so only a picked-pool failure becomes the domain-clamp rejection.
@@ -144,7 +156,17 @@ export function installMockMoneyHost(options: MockMoneyHostOptions = {}): MockMo
         }
       | null
       | undefined;
-    if (!data || (data.type !== 'WORKFLOW_STATUS' && data.type !== 'WORKFLOW_SUBMITTED')) return;
+    if (!data) return;
+    if (
+      acceptWithSentinelId != null &&
+      (data.type === 'WORKFLOW_SUBMITTED' || data.type === 'TRAINING_RESULT') &&
+      data.payload?.snapshot &&
+      data.payload.snapshot.status !== 'failed'
+    ) {
+      data.payload.snapshot.workflowId = acceptWithSentinelId;
+      return;
+    }
+    if (data.type !== 'WORKFLOW_STATUS' && data.type !== 'WORKFLOW_SUBMITTED') return;
     if (hostPollError !== null && data.type === 'WORKFLOW_STATUS' && data.payload) {
       data.payload.snapshot = { workflowId: 'failed', status: 'failed', error: hostPollError };
       return;

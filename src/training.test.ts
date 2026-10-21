@@ -919,12 +919,14 @@ describe('host poll failure vs the run failing', () => {
 
 describe('lost-contact streak', () => {
   const T0 = 1_700_000_123_457; // not a round number, so `since` cannot be a constant
+  const VISIBLE = true;
+  const HIDDEN = false;
 
   it('backs off by consecutive failures and measures the streak from its first failure', () => {
     let s = NO_LOST_CONTACT;
     const delays: number[] = [];
     for (const at of [0, 1000, 3000, 7000]) {
-      const r = recordLostContact(s, T0 + at);
+      const r = recordLostContact(s, T0 + at, VISIBLE);
       s = r.streak;
       delays.push(r.delayMs);
       expect(r.giveUp).toBe(false);
@@ -933,21 +935,48 @@ describe('lost-contact streak', () => {
     expect(s).toEqual({ failures: 4, since: T0, visibleRetry: false });
   });
 
-  it('gives up at 5 minutes since the first failure, not by attempt count', () => {
-    const first = recordLostContact(NO_LOST_CONTACT, T0).streak;
-    expect(recordLostContact(first, T0 + 5 * 60_000 - 1).giveUp).toBe(false);
-    expect(recordLostContact(first, T0 + 5 * 60_000).giveUp).toBe(true);
+  it('gives up at 5 visible minutes since the first failure, not by attempt count', () => {
+    const first = recordLostContact(NO_LOST_CONTACT, T0, VISIBLE).streak;
+    expect(recordLostContact(first, T0 + 5 * 60_000 - 1, VISIBLE).giveUp).toBe(false);
+    expect(recordLostContact(first, T0 + 5 * 60_000, VISIBLE).giveUp).toBe(true);
     // Many failures inside 5 minutes never give up.
-    expect(recordLostContact({ failures: 400, since: T0, visibleRetry: false }, T0 + 60_000).giveUp).toBe(false);
+    expect(recordLostContact({ failures: 400, since: T0, visibleRetry: false }, T0 + 60_000, VISIBLE).giveUp).toBe(false);
   });
 
-  it('coming into view restarts the backoff and retries after 1.5s once, keeping the streak start', () => {
+  it('hidden time never counts: no give-up while hidden, however long, and no clock running', () => {
+    // A visible streak already 4 minutes old, then the tab is hidden for 20 minutes.
+    let s = recordLostContact(NO_LOST_CONTACT, T0, VISIBLE).streak;
+    s = recordLostContact(s, T0 + 4 * 60_000, VISIBLE).streak;
+    for (let at = 5 * 60_000; at <= 24 * 60_000; at += 60_000) {
+      const r = recordLostContact(s, T0 + at, HIDDEN);
+      expect(r.giveUp).toBe(false);
+      s = r.streak;
+    }
+    expect(s.since).toBeNull();
+    // A visible failure after that (no visibility event seen) starts a fresh clock.
+    const back = recordLostContact(s, T0 + 25 * 60_000, VISIBLE);
+    expect(back.giveUp).toBe(false);
+    expect(back.streak.since).toBe(T0 + 25 * 60_000);
+    expect(recordLostContact(back.streak, T0 + 30 * 60_000 - 1, VISIBLE).giveUp).toBe(false);
+    expect(recordLostContact(back.streak, T0 + 30 * 60_000, VISIBLE).giveUp).toBe(true);
+  });
+
+  it('coming into view restarts the backoff, retries after 1.5s once, and restarts the give-up clock', () => {
     const deep = { failures: 9, since: T0, visibleRetry: false };
-    const visible = lostContactOnVisible(deep);
-    expect(visible).toEqual({ failures: 0, since: T0, visibleRetry: true });
-    const r1 = recordLostContact(visible, T0 + 130_000);
+    const backAt = T0 + 130_000;
+    const visible = lostContactOnVisible(deep, backAt);
+    expect(visible).toEqual({ failures: 0, since: backAt, visibleRetry: true });
+    const r1 = recordLostContact(visible, backAt + 50, VISIBLE);
     expect(r1.delayMs).toBe(1500);
-    expect(r1.streak).toEqual({ failures: 1, since: T0, visibleRetry: false });
-    expect(recordLostContact(r1.streak, T0 + 131_500).delayMs).toBe(2000);
+    expect(r1.giveUp).toBe(false);
+    expect(r1.streak).toEqual({ failures: 1, since: backAt, visibleRetry: false });
+    expect(recordLostContact(r1.streak, backAt + 1550, VISIBLE).delayMs).toBe(2000);
+    // 5 minutes from the FIRST failure is not the limit any more; 5 from coming back is.
+    expect(recordLostContact(r1.streak, T0 + 5 * 60_000, VISIBLE).giveUp).toBe(false);
+    expect(recordLostContact(r1.streak, backAt + 5 * 60_000, VISIBLE).giveUp).toBe(true);
+    // A streak that was entirely hidden (since null) also gets a clock from the return.
+    expect(lostContactOnVisible({ failures: 30, since: null, visibleRetry: false }, backAt).since).toBe(backAt);
+    // No streak: no clock starts.
+    expect(lostContactOnVisible(NO_LOST_CONTACT, backAt)).toEqual({ failures: 0, since: null, visibleRetry: true });
   });
 });

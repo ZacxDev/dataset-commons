@@ -1139,11 +1139,17 @@ export function isHostSentinelWorkflowId(workflowId: string): boolean {
 export const LOST_CONTACT_MAX_BACKOFF_MS = 60_000;
 
 /**
- * How long the host may go without answering — measured from the first failure of
- * the current streak, not by attempts — before the page stops checking on its own.
- * A host failure reply cannot say whether it is temporary (an expired token) or
- * permanent (consent revoked, App Blocks switched off, a moderation refusal), so
- * past this the page stops and leaves the trainer a Check again.
+ * How long the host may go without answering WHILE THE PAGE IS IN VIEW before the
+ * page stops checking on its own — measured as visible time since the streak's
+ * first visible failure (or since the tab last came back into view), not by
+ * attempts. A host failure reply cannot say whether it is temporary (an expired
+ * token) or permanent (consent revoked, App Blocks switched off, a moderation
+ * refusal), so past this the page stops and leaves the trainer a Check again.
+ *
+ * Hidden time never counts: the host pauses its block-token refresh while the tab
+ * is hidden and re-mints on the next visibility change, so every poll from a
+ * hidden tab after the token lapses fails no matter what. Counting that time
+ * would give up on a token blip the moment the trainer comes back.
  */
 export const LOST_CONTACT_GIVE_UP_MS = 5 * 60_000;
 
@@ -1158,7 +1164,11 @@ export const VISIBLE_RETRY_MS = 1500;
 export interface LostContactStreak {
   /** Consecutive unanswered polls (drives the backoff). */
   failures: number;
-  /** `Date.now()` at the streak's first failure; null when there is no streak. */
+  /**
+   * `Date.now()` at which the give-up clock started: the streak's first failure
+   * while the page was in view, or the moment it last came back into view. Null
+   * while no visible time has accrued (no streak, or every failure so far hidden).
+   */
   since: number | null;
   /** The next failure retries after {@link VISIBLE_RETRY_MS} instead of the backoff. */
   visibleRetry: boolean;
@@ -1168,16 +1178,22 @@ export const NO_LOST_CONTACT: LostContactStreak = { failures: 0, since: null, vi
 
 /**
  * Record one unanswered poll at `now`: the updated streak, and either the wait
- * before the next re-poll or `giveUp` once the streak has lasted
- * {@link LOST_CONTACT_GIVE_UP_MS}.
+ * before the next re-poll or `giveUp`. `visible` is whether the page is in view
+ * now (`!document.hidden`). A hidden failure never gives up and starts no clock;
+ * a visible one starts the clock if it is not running and gives up once it has
+ * run for {@link LOST_CONTACT_GIVE_UP_MS}.
  */
 export function recordLostContact(
   streak: LostContactStreak,
   now: number,
+  visible: boolean,
 ): { streak: LostContactStreak; giveUp: boolean; delayMs: number } {
   const failures = streak.failures + 1;
-  const since = streak.since ?? now;
   const delayMs = streak.visibleRetry ? VISIBLE_RETRY_MS : lostContactBackoffMs(failures);
+  if (!visible) {
+    return { streak: { failures, since: null, visibleRetry: false }, giveUp: false, delayMs };
+  }
+  const since = streak.since ?? now;
   return {
     streak: { failures, since, visibleRetry: false },
     giveUp: now - since >= LOST_CONTACT_GIVE_UP_MS,
@@ -1186,12 +1202,16 @@ export function recordLostContact(
 }
 
 /**
- * The tab came back into view: restart the backoff (the host is about to hold a
- * fresh token) and retry quickly once if the immediate poll still fails. The
- * streak's start is kept — coming back into view is not an answer from the host.
+ * The tab came back into view at `now`: restart the backoff (the host is about to
+ * hold a fresh token), retry quickly once if the immediate poll still fails, and
+ * restart the give-up clock at `now` — a returning trainer always gets the
+ * immediate poll, the {@link VISIBLE_RETRY_MS} retry, and then up to
+ * {@link LOST_CONTACT_GIVE_UP_MS} of visible time before the page gives up. With
+ * no streak running, no clock starts.
  */
-export function lostContactOnVisible(streak: LostContactStreak): LostContactStreak {
-  return { failures: 0, since: streak.since, visibleRetry: true };
+export function lostContactOnVisible(streak: LostContactStreak, now: number): LostContactStreak {
+  const streakRunning = streak.failures > 0 || streak.since != null;
+  return { failures: 0, since: streakRunning ? now : null, visibleRetry: true };
 }
 
 /**

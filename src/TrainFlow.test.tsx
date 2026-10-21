@@ -89,12 +89,36 @@ function renderTrainFlow(props: TrainFlowProps = {}) {
   return screen.findByTestId('dc-train');
 }
 
+// Page visibility for the lost-contact tests: jsdom's document is always visible,
+// so `hidden` / `visibilityState` are overridden on the document instance (the
+// prototype getters stay untouched) and removed again after each test.
+let pageHiddenNow = false;
+function setPageHidden(hidden: boolean) {
+  pageHiddenNow = hidden;
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => pageHiddenNow });
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => (pageHiddenNow ? 'hidden' : 'visible'),
+  });
+}
+/** Switch the tab out of / back into view, firing the event the page listens for. */
+function switchTab(hidden: boolean) {
+  setPageHidden(hidden);
+  document.dispatchEvent(new Event('visibilitychange'));
+}
+function restoreVisibility() {
+  pageHiddenNow = false;
+  delete (document as { hidden?: boolean }).hidden;
+  delete (document as { visibilityState?: string }).visibilityState;
+}
+
 describe('TrainFlow (Option A′)', () => {
   let uninstall: (() => void) | undefined;
   afterEach(() => {
     uninstall?.();
     uninstall = undefined;
     vi.useRealTimers();
+    restoreVisibility();
   });
 
   it('snapshot review: net-positive items in with frozen weights, shares shown', async () => {
@@ -1312,8 +1336,11 @@ describe('TrainFlow (Option A′)', () => {
     return t;
   }
 
-  async function startKindRun(user: ReturnType<typeof userEvent.setup>) {
-    const t = trackingHost();
+  async function startKindRun(
+    user: ReturnType<typeof userEvent.setup>,
+    extra: Parameters<typeof installMockMoneyHost>[0] = {},
+  ) {
+    const t = trackingHost(extra);
     await renderTrainFlow(t.props);
     await uploadAndPrice(user);
     await user.click(await screen.findByTestId('dc-kind-run'));
@@ -1528,5 +1555,154 @@ describe('TrainFlow (Option A′)', () => {
     const settled = polls.length;
     await new Promise((r) => setTimeout(r, 3000));
     expect(polls.length).toBe(settled);
+  }, 15000);
+
+  // --- 0.3.1 audit round 2: only VISIBLE lost-contact time counts toward the
+  // 5-minute give-up. The host pauses its block-token refresh while the tab is
+  // hidden, so a hidden tab's polls all fail until it is shown again.
+
+  it('pass-through: 20 minutes of failures in a hidden tab never give up, and coming back recovers on its own', async () => {
+    const user = useFakeClock();
+    const { host, polls, ledgerEvents } = await startPassThroughRun(user);
+    switchTab(true);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(20 * 60_000);
+
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent('still checking…');
+    expect(screen.getByTestId('dc-lost-contact')).not.toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+    expect(screen.queryByTestId('dc-run-failed')).not.toBeInTheDocument();
+
+    // Back in view; the host re-mints about a second later and the run has finished.
+    const before = polls.length;
+    switchTab(false);
+    await advance(200);
+    expect(polls.length).toBe(before + 1); // the immediate poll (still the stale token)
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    await advance(3000); // the 1.5s retry lands with the fresh token
+    expect(screen.getByTestId('dc-publish')).toBeInTheDocument();
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]!.sourceRef).toBe(polls[0]);
+    expect(screen.queryByTestId('dc-lost-contact')).not.toBeInTheDocument();
+  }, 30000);
+
+  it("Civitai's trainer: 20 minutes of failures in a hidden tab never give up, and coming back recovers on its own", async () => {
+    const user = useFakeClock();
+    const { host, ledgerEvents } = await startKindRun(user);
+    switchTab(true);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(20 * 60_000);
+
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent('still checking…');
+    expect(screen.getByTestId('dc-lost-contact')).not.toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-kind-estimate')).toBeDisabled();
+
+    switchTab(false);
+    await advance(200);
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    await advance(5000);
+    expect(screen.getByTestId('dc-publish')).toBeInTheDocument();
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]).toMatchObject({ eventType: 'training', grossBuzz: 725 });
+  }, 30000);
+
+  it('after a long hidden stretch, the give-up clock restarts on return: 5 VISIBLE minutes, not immediately', async () => {
+    const user = useFakeClock();
+    const { host, polls } = await startPassThroughRun(user);
+    switchTab(true);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(20 * 60_000);
+
+    // Back in view, but the host keeps refusing (a permanent refusal).
+    const before = polls.length;
+    switchTab(false);
+    await advance(2000);
+    // The immediate poll AND the 1.5s retry both ran — no instant give-up.
+    expect(polls.length).toBeGreaterThanOrEqual(before + 2);
+    expect(screen.getByTestId('dc-lost-contact')).not.toHaveTextContent(STOPPED);
+    await advance(4 * 60_000 - 2000); // 4 visible minutes in
+    expect(screen.getByTestId('dc-lost-contact')).not.toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+
+    await advance(2 * 60_000); // past 5 visible minutes
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-estimate')).toBeEnabled();
+    expect(screen.getByTestId('dc-check-again')).toBeInTheDocument();
+  }, 30000);
+
+  it('a page that stopped checking resumes tracking once when the tab comes back into view', async () => {
+    const user = useFakeClock();
+    const { host, polls, ledgerEvents } = await startPassThroughRun(user);
+    host.setHostPollError(TOKEN_ERROR);
+    await advance(6 * 60_000); // visible the whole time: gives up
+    expect(screen.getByTestId('dc-lost-contact')).toHaveTextContent(STOPPED);
+
+    switchTab(true);
+    await advance(60_000);
+    const stopped = polls.length;
+    // Back in view (twice in a row): exactly ONE tracker resumes — one immediate poll.
+    switchTab(false);
+    document.dispatchEvent(new Event('visibilitychange'));
+    await advance(200);
+    expect(polls.length).toBe(stopped + 1);
+    expect(screen.getByTestId('dc-lost-contact')).not.toHaveTextContent(STOPPED);
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+
+    // The fresh token lands; the resumed tracking finds the finished run.
+    host.setScenario({ pollsUntilDone: 1 });
+    host.setHostPollError(null);
+    await advance(3000);
+    expect(screen.getByTestId('dc-publish')).toBeInTheDocument();
+    await waitFor(() => expect(ledgerEvents).toHaveLength(1));
+    expect(ledgerEvents[0]!.sourceRef).toBe(polls[0]);
+  }, 30000);
+
+  // --- A submit accepted under a host sentinel id ('whatif'): a run may exist and
+  // be charged, but nothing behind the sentinel can be followed.
+
+  it("pass-through: a submit accepted as 'whatif' is unconfirmed — pricing locked on both paths, the snapshot named, nothing polled", async () => {
+    const user = userEvent.setup();
+    const confirmed: DatasetSnapshot[] = [];
+    const { polls, props } = trackingHost({ acceptWithSentinelId: 'whatif' });
+    await renderTrainFlow({ ...props, onSnapshotConfirmed: (s) => void confirmed.push(s) });
+    await uploadAndAttest(user);
+    await user.click(screen.getByTestId('dc-estimate'));
+    await user.click(await screen.findByTestId('dc-confirm-submit'));
+
+    const alert = await screen.findByTestId('dc-kind-unconfirmed');
+    expect(alert).toHaveTextContent(/Buzz may have been spent/);
+    expect(confirmed).toHaveLength(1);
+    expect(screen.getByTestId('dc-kind-unconfirmed-snapshot')).toHaveTextContent(`Snapshot ${confirmed[0]!.snapshotId}`);
+    expect(screen.queryByTestId('dc-check-again')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-run')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+    expect(screen.queryByTestId('dc-kind-estimate')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dc-train-upload')).not.toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(polls).toEqual([]);
+
+    // Only the acknowledgement re-opens pricing.
+    await user.click(screen.getByTestId('dc-kind-ack'));
+    expect(screen.queryByTestId('dc-kind-unconfirmed')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-estimate')).toBeEnabled();
+    expect(polls).toEqual([]);
+  }, 15000);
+
+  it("Civitai's trainer: a run accepted as 'whatif' is unconfirmed and never tracked", async () => {
+    const user = userEvent.setup();
+    const { polls, props } = trackingHost({ acceptWithSentinelId: 'whatif' });
+    await renderTrainFlow(props);
+    await uploadAndPrice(user);
+    await user.click(await screen.findByTestId('dc-kind-run'));
+
+    expect(await screen.findByTestId('dc-kind-unconfirmed')).toHaveTextContent(/Buzz may have been spent/);
+    expect(screen.getByTestId('dc-kind-unconfirmed-snapshot')).toHaveTextContent(/Snapshot /);
+    expect(screen.queryByTestId('dc-check-again')).not.toBeInTheDocument();
+    expect(screen.getByTestId('dc-estimate')).toBeDisabled();
+    expect(screen.queryByTestId('dc-kind-run')).not.toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(polls).toEqual([]);
   }, 15000);
 });

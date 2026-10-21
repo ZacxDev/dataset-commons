@@ -103,7 +103,11 @@ type TrainPhase =
   | 'submitting'
   | 'running';
 
-/** Civitai's trainer (`kind: 'training'`): price -> Civitai dialog. */
+/**
+ * Civitai's trainer (`kind: 'training'`): price -> Civitai dialog. `'unconfirmed'`
+ * is shared by both paths: a submit that MAY have started a charged run this page
+ * cannot follow (either path) pauses pricing on both until the trainer acknowledges.
+ */
 type KindPhase = 'idle' | 'pricing' | 'quoted' | 'running' | 'unconfirmed';
 
 /**
@@ -118,6 +122,11 @@ interface ActiveRun {
 }
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
+
+/** Whether the page is out of view now (a hidden tab's lost-contact time never counts). */
+function pageHidden(): boolean {
+  return typeof document !== 'undefined' && document.hidden;
+}
 
 /** Bounded so a host that never answers cannot hold up Civitai's dialog. */
 const APP_QUEUE_READ_TIMEOUT_MS = 4000;
@@ -289,10 +298,14 @@ export function TrainFlow(props: TrainFlowProps = {}) {
    */
   const [contactLost, setContactLost] = useState<string | null>(null);
   /**
-   * The host has not answered for LOST_CONTACT_GIVE_UP_MS: automatic checking has
-   * stopped (pricing unlocks), the run stays tracked, and Check again resumes it.
+   * The host has not answered for LOST_CONTACT_GIVE_UP_MS of time the page was in
+   * view (hidden time never counts): automatic checking has stopped (pricing
+   * unlocks), the run stays tracked, and Check again — or the tab coming back into
+   * view — resumes it.
    */
   const [contactStopped, setContactStopped] = useState(false);
+  const contactStoppedRef = useRef(false);
+  contactStoppedRef.current = contactStopped;
   /** The current unanswered-poll streak, shared by both run paths. */
   const streakRef = useRef<LostContactStreak>(NO_LOST_CONTACT);
   const mountedRef = useRef(true);
@@ -339,16 +352,23 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   // block token lapse. The host re-mints it on this same event, asynchronously,
   // so this poll can still carry the lapsed token: the backoff restarts and, if
   // it fails, the next poll is VISIBLE_RETRY_MS away (via the same single wake
-  // timer every re-poll uses), not a full lost-contact backoff.
+  // timer every re-poll uses), not a full lost-contact backoff. The give-up clock
+  // restarts here too (lostContactOnVisible), so the trainer gets up to
+  // LOST_CONTACT_GIVE_UP_MS of visible time before the page gives up. If the page
+  // had already stopped checking (contactStopped), tracking resumes once, the same
+  // way.
   useEffect(() => {
     if (typeof document === 'undefined') return;
     const onVisible = () => {
       if (document.visibilityState !== 'visible') return;
       const wake = wakeRef.current;
-      if (!wake) return;
+      if (!wake) {
+        resumeOnVisibleRef.current();
+        return;
+      }
       clearTimeout(wake.timer);
       wakeRef.current = null;
-      streakRef.current = lostContactOnVisible(streakRef.current);
+      streakRef.current = lostContactOnVisible(streakRef.current, Date.now());
       wake.run();
     };
     document.addEventListener('visibilitychange', onVisible);
@@ -378,12 +398,14 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   /**
    * The host could not answer a poll of the tracked run (either path). The run is
    * NOT over: re-poll via `retry` after the bounded backoff — until the streak has
-   * lasted LOST_CONTACT_GIVE_UP_MS, then stop checking on its own, unlock the page
-   * and leave the run tracked for Check again.
+   * lasted LOST_CONTACT_GIVE_UP_MS of VISIBLE time, then stop checking on its own,
+   * unlock the page and leave the run tracked for Check again. While the tab is
+   * hidden it never gives up (see recordLostContact): the host does not refresh
+   * its token there, so those failures say nothing about whether it ever will.
    */
   const onLostContact = useCallback(
     (detail: string, retry: () => void) => {
-      const next = recordLostContact(streakRef.current, Date.now());
+      const next = recordLostContact(streakRef.current, Date.now(), !pageHidden());
       streakRef.current = next.streak;
       setContactLost(detail);
       if (next.giveUp) {
@@ -648,6 +670,33 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   );
 
   /**
+   * Restart automatic tracking of `run` after it stopped (contactStopped), with a
+   * fresh lost-contact streak. `onVisible`: the tab just came back into view, so a
+   * first failure retries after VISIBLE_RETRY_MS (the host is re-minting its token)
+   * and the give-up clock starts now.
+   */
+  const resumeTracking = useCallback(
+    (run: ActiveRun, onVisible: boolean) => {
+      resetContact();
+      if (onVisible) streakRef.current = lostContactOnVisible(NO_LOST_CONTACT, Date.now());
+      setPhase('running');
+      if (run.path === 'civitai-trainer') runKindWatch(run.workflowId, run.snapshot);
+      else runPollLoop(run.workflowId, run.snapshot);
+    },
+    [resetContact, runKindWatch, runPollLoop],
+  );
+
+  /** The tab came back into view with no re-poll pending: resume a stopped run, once. */
+  const resumeOnVisibleRef = useRef<() => void>(() => {});
+  resumeOnVisibleRef.current = () => {
+    if (!contactStoppedRef.current || !activeRun || !mountedRef.current) return;
+    // Mark it resumed now, so a second visibility event before the re-render
+    // cannot start a second tracker.
+    contactStoppedRef.current = false;
+    resumeTracking(activeRun, true);
+  };
+
+  /**
    * One manual re-poll — for the moderation wait and the post-wizard return.
    * Records against the snapshot the run was SUBMITTED with (activeRun), so a
    * quote priced since, or an edit that cleared it, cannot redirect the credit.
@@ -658,10 +707,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     const run = activeRun;
     if (!run) return;
     if (contactStopped) {
-      resetContact();
-      setPhase('running');
-      if (run.path === 'civitai-trainer') runKindWatch(run.workflowId, run.snapshot);
-      else runPollLoop(run.workflowId, run.snapshot);
+      resumeTracking(run, false);
       return;
     }
     let snap: BlockWorkflowSnapshot;
@@ -686,7 +732,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       if (run.path === 'civitai-trainer') runKindWatch(run.workflowId, run.snapshot);
       else runPollLoop(run.workflowId, run.snapshot);
     }
-  }, [activeRun, contactStopped, applyTrainingSnapshot, runPollLoop, runKindWatch, resetContact]);
+  }, [activeRun, contactStopped, applyTrainingSnapshot, runPollLoop, runKindWatch, resetContact, resumeTracking]);
 
   const clearKindQuote = useCallback(() => {
     kindRequestRef.current += 1;
@@ -1111,18 +1157,28 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     try {
       const snap = await submit(passBody);
       if (isHostSentinelWorkflowId(snap.workflowId)) {
-        // Not a run: nothing behind a host sentinel id can be polled, so it never
-        // becomes the active run (no Check again, no polling of 'failed').
+        // Nothing behind a host sentinel id can be polled, so it never becomes the
+        // active run (no Check again, no polling of the sentinel).
         setActiveRun(null);
         setPhase('idle');
         if (snap.status === 'failed') {
           // A spend-cap / budget refusal: show its reason and the price it refused.
           applyTrainingSnapshot(snap, snapshot);
         } else {
+          // Accepted without a run id this page can follow (e.g. 'whatif'): a run
+          // MAY exist and be charged. Handled exactly like an unconfirmed
+          // Civitai-trainer run — pricing paused on both paths until the trainer
+          // says they checked, the snapshot named, no lookup (there is no queue
+          // baseline from before this submit).
           setRunState(null);
-          setNotice(
-            "Civitai accepted the run but returned no run id this page can follow, so it isn't tracked here. Check your Civitai trainings before training again — Buzz may have been spent.",
+          runBaselineRef.current = null;
+          clearKindQuote();
+          setKindSnapshot(snapshot);
+          setKindError(
+            "Civitai answered without a run id this page can follow, so it can't tell whether the training started. Check your Civitai trainings before training again — Buzz may have been spent.",
           );
+          setFindResult(null);
+          setKindPhase('unconfirmed');
         }
         return;
       }
@@ -1139,7 +1195,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
       setRunState('failed');
       setRunError(err instanceof Error ? err.message : 'Submit failed.');
     }
-  }, [passSnapshot, passBody, quote, phase, afford, submit, applyTrainingSnapshot, runPollLoop, resetContact]);
+  }, [passSnapshot, passBody, quote, phase, afford, submit, applyTrainingSnapshot, runPollLoop, resetContact, clearKindQuote]);
 
   const onPublishClick = useCallback(() => {
     if (!activeRun || epoch == null) return;
