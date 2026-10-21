@@ -16,9 +16,11 @@
 import {
   creditLedgerEvent,
   deriveContributorCredits,
+  parseDataSource,
   type DatasetItem,
   type DatasetSnapshot,
   type LedgerEvent,
+  type TrainingDataSource,
 } from './training.js';
 
 export type VoteValue = -1 | 0 | 1;
@@ -97,6 +99,8 @@ export interface LoraRecord {
   modelId?: number;
   modelVersionId?: number;
   published: boolean;
+  /** Where the training images came from; absent on records older than the field (= 'snapshot'). */
+  dataSource?: TrainingDataSource;
   createdAt: string;
   updatedAt: string;
 }
@@ -256,6 +260,7 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
       if (!loraId) continue;
       const modelId = num(data.modelId);
       const modelVersionId = num(data.modelVersionId);
+      const dataSource = parseDataSource(data.dataSource);
       loras.push({
         storageKey: entry.key,
         loraId,
@@ -268,13 +273,16 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
         ...(modelId != null ? { modelId: Math.trunc(modelId) } : {}),
         ...(modelVersionId != null ? { modelVersionId: Math.trunc(modelVersionId) } : {}),
         published: data.published === true,
+        ...(dataSource ? { dataSource } : {}),
         createdAt: iso(data.createdAt) || iso(entry.createdAt),
         updatedAt: iso(data.updatedAt) || at,
       });
     } else if (kind === 'ledger') {
       const ev = asRecord(data.event);
       if (!ev || typeof ev.eventId !== 'string' || typeof ev.sourceRef !== 'string') continue;
-      const event = ev as unknown as LedgerEvent;
+      const { dataSource: rawSource, ...rest } = ev;
+      const dataSource = parseDataSource(rawSource);
+      const event = { ...rest, ...(dataSource ? { dataSource } : {}) } as unknown as LedgerEvent;
       if (
         event.eventType !== 'training' &&
         event.eventType !== 'generation_in_app' &&
@@ -576,7 +584,7 @@ export function buildViewerLedger(
 }
 
 export function generationLedgerEvent(args: {
-  lora: Pick<LoraRecord, 'loraId' | 'snapshotId'>;
+  lora: Pick<LoraRecord, 'loraId' | 'snapshotId' | 'dataSource'>;
   workflowId: string;
   grossBuzz: number;
   now?: string;
@@ -589,6 +597,8 @@ export function generationLedgerEvent(args: {
     grossBuzz: Math.max(0, Math.round(args.grossBuzz)),
     sourceRef: args.workflowId,
     createdAt: args.now ?? new Date().toISOString(),
+    // The LoRA's images are as attested as its training run was.
+    ...(args.lora.dataSource ? { dataSource: args.lora.dataSource } : {}),
   };
 }
 

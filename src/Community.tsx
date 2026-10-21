@@ -64,7 +64,7 @@ import {
 } from './community-storage.js';
 import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
 import { DEFAULT_CHECKPOINT, loraOption } from './models.js';
-import type { DatasetSnapshot, LedgerEvent } from './training.js';
+import { dataSourceLabel, type DatasetSnapshot, type LedgerEvent } from './training.js';
 import { TrainFlow, type TrainRunLink } from './TrainFlow.js';
 
 /**
@@ -93,6 +93,11 @@ const EVENT_LABEL: Record<LedgerEvent['eventType'], string> = {
   generation_in_app: 'In-app generation',
   generation_onsite: 'Onsite generation',
 };
+
+/** A ledger row reads as trainer-attested when its event says so, or its LoRA does. */
+function ledgerRowSourceLabel(event: LedgerEvent, lora?: LoraRecord): string | null {
+  return dataSourceLabel(event) ?? (lora ? dataSourceLabel(lora) : null);
+}
 
 function formatDate(iso: string): string {
   const d = new Date(iso);
@@ -503,6 +508,8 @@ export function Community() {
       const next: LoraRecord = {
         ...record,
         snapshotId: snapshot.snapshotId,
+        // One workflow is one run on one path, so the link's source is the record's.
+        dataSource: link.dataSource,
         ...(link.publishedModel
           ? {
               modelId: link.publishedModel.modelId,
@@ -1118,6 +1125,9 @@ function DatasetDetail(props: {
               <span>
                 {lora.name} · {lora.published ? 'published' : 'not published yet'} · snapshot{' '}
                 {lora.snapshot?.items.filter((i) => i.included).length ?? 0} items
+                {dataSourceLabel(lora) && (
+                  <span data-testid={`dc-dataset-lora-source-${lora.loraId}`}> · {dataSourceLabel(lora)}</span>
+                )}
               </span>
               <Button size="sm" variant="light" onClick={() => props.onOpenLora(lora.loraId)} data-testid={`dc-open-lora-${lora.loraId}`}>
                 Open LoRA
@@ -1347,6 +1357,13 @@ function LoraDetail(props: {
         {lora.published ? 'published' : 'not published yet'}
         {lora.modelVersionId != null ? ` · model version ${lora.modelVersionId}` : ''}
       </span>
+      {dataSourceLabel(lora) && (
+        <Alert color="warning" title={dataSourceLabel(lora)!} data-testid="dc-lora-source">
+          Trained on Civitai's trainer from images the trainer uploaded and attested were this snapshot's,
+          in the matched order. This app could not check the files, so the snapshot contributors' credit
+          below rests on that attestation.
+        </Alert>
+      )}
 
       {lora.modelId != null && (
         <span>
@@ -1580,6 +1597,9 @@ function LedgerView(props: {
                   <span>
                     {formatDate(row.event.createdAt)} · {row.lora?.name ?? row.event.loraId} ·{' '}
                     {EVENT_LABEL[row.event.eventType]}
+                    {ledgerRowSourceLabel(row.event, row.lora) && (
+                      <span data-testid="dc-ledger-row-source"> · {ledgerRowSourceLabel(row.event, row.lora)}</span>
+                    )}
                   </span>
                   <span style={monoStyle}>
                     gross {formatCost(row.event.grossBuzz)} · mine {formatCost(row.credit)} Buzz tracked

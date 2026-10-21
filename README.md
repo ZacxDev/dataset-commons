@@ -75,6 +75,75 @@ balance is read in-block via `useBuzzBalance()` (host-mediated, no scope) — an
 insufficient-Buzz `failed` snapshot is still handled as a backstop. The budget
 comes from `page.buzzBudgetPerGen` in the manifest.
 
+### Training a LoRA (two paths, SDK 0.77)
+
+The Train screen freezes a vote-weighted **snapshot** of the dataset (the
+contributors' tracked-credit split), then trains one of two ways. In both, the
+estimate is the price: no usable quote, no run.
+
+**Both paths train on one upload.** Contributions are stored as display images
+(`useImageUpload()`, which returns a Civitai image url, not a training blob), so
+no training step can read them directly. The **trainer re-uploads the snapshot's
+images** once, and that upload feeds whichever path the base model uses:
+
+1. The training set is listed as numbered images (each with a **Save** button,
+   `useSaveImage()`), at most 50 (the host upload modal's cap).
+2. **Upload these N images** opens Civitai's own upload modal
+   (`useImageUpload({ purpose: 'trainingData' })`), which returns
+   `[{ url, air }]`.
+3. Each upload is matched to one numbered snapshot image — by position by
+   default, changeable per row — and carries that image's frozen caption. The
+   app refuses to price a count mismatch, a double match or a repeated file.
+4. The app only receives `{ url, air }`, so it cannot prove the uploads are the
+   snapshot's images. The trainer must tick an attestation (unchecked by
+   default, cleared by any new upload, re-match or change in which items are in
+   the training set) before either path prices, and **every run is recorded in
+   the ledger and on the LoRA as trainer-attested**. Records written by earlier
+   versions (which trained the pass-through step on stored blob urls) carry
+   `snapshot` or no source, and render as before.
+
+Then, with the same `{ air, caption }` items:
+
+1. **Quick path — pass-through `training` step** (SDXL only; `useBuzzWorkflow()`
+   `estimate` → `submit` → `poll`). The run must fit the page's per-call budget
+   (`page.buzzBudgetPerGen: 1000`). The step's `trainingData` is
+   `{ type: 'blobs', items: [{ air, caption }] }` — the host forwards a
+   pass-through `input` unmodified, and builds the same shape for its own
+   `kind: 'training'` runs. A quote above the budget is refused by the host
+   (`… use kind:'training'`) and the app points the trainer at path 2.
+2. **Civitai's trainer — `kind: 'training'`** (every base model the host accepts
+   for apps — the 22 image models listed in `TRAINING_KIND_CATALOG` in
+   `src/training.ts`, mirrored from civitai@dd6d276934, each with Training
+   Studio's default parameters; up to 5,000 Buzz a run). The host trains only on
+   blobs it uploaded for this block instance:
+   1. **Price** sends `{ kind: 'training', items: [{ air, caption }], model,
+      params, triggerWord, samplePrompts }` to `estimate()`; the reply's
+      `trainingQuote` is the price.
+   2. **Open Civitai confirmation** persists the snapshot, then calls
+      `useRunTraining().runTraining({ ...body, quoteId })`. Civitai's dialog shows
+      the server's price and is the charge; the run is then followed with
+      `watch()`.
+
+Steps and epochs are bounded as in Training Studio (1–10,000 steps, 1–20
+epochs; civitai@dd6d276934 `TARGET_STEPS` / `AI_TOOLKIT_EPOCHS`), and an empty
+trigger word is sent as an empty trigger word.
+
+   Failures say exactly what happened to the money: a dismissed dialog keeps the
+   quote; `training data not uploaded here` (e.g. after a page reload — the host
+   forgets its uploads) drops the uploads and asks for a fresh upload, nothing
+   charged; `submission-unconfirmed` means a run MAY exist and be charged, so the
+   app shows no retry button (a retry would be a new, separately charged job).
+
+   `kind: 'training'` is behind Civitai's `app-blocks-training-kind` flag (off by
+   default), page apps only, and refused from `dev:live` and review sessions —
+   exercise it with `npm run dev:harness` (the mock host models the upload, the
+   quote and every refusal above).
+
+Both paths end the same way: once moderation approves the run, `trainedEpochs`
+appears and the trainer publishes an epoch in Civitai's model wizard
+(`models/train/from-orchestrator?…`, site scope); the published model links back
+to the snapshot.
+
 ### Width-adaptive layout (`useBlockBreakpoint`)
 
 Your app renders inside whatever slot the host gave it, and **slot width is not

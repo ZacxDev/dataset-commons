@@ -135,7 +135,7 @@ describe('foldSharedEntries + buildCommunityView', () => {
     updatedAt: '2026-10-04T01:00:00.000Z',
   };
 
-  const trainingEvent = trainingFeeEvent({ snapshot, workflowId: 'wf1', grossBuzz: 700, loraId: 'lora_wf1' });
+  const trainingEvent = trainingFeeEvent({ snapshot, workflowId: 'wf1', grossBuzz: 700, loraId: 'lora_wf1', dataSource: 'snapshot' });
 
   function foldedCommunity() {
     return foldSharedEntries([
@@ -168,6 +168,47 @@ describe('foldSharedEntries + buildCommunityView', () => {
     expect(folded.snapshots).toHaveLength(1);
     expect(folded.loras).toHaveLength(1);
     expect(folded.ledgerEvents).toHaveLength(1);
+  });
+
+  it('old LoRA and ledger records without a data source fold unchanged (no field invented)', () => {
+    const folded = foldedCommunity();
+    expect(folded.loras[0]).not.toHaveProperty('dataSource');
+    // trainingEvent above was built with 'snapshot'; an OLD stored event has no field at all.
+    const { dataSource: _drop, ...oldEvent } = trainingEvent;
+    void _drop;
+    const old = foldSharedEntries([entry({ key: 'k-old', value: ledgerSharedValue(oldEvent as LedgerEvent) })]);
+    expect(old.ledgerEvents[0]).not.toHaveProperty('dataSource');
+    expect(old.ledgerEvents[0]).toMatchObject({ eventId: trainingEvent.eventId, grossBuzz: 700 });
+  });
+
+  it('a trainer-attested LoRA and ledger event keep their source through the fold; an unknown value is dropped', () => {
+    const attestedEvent = trainingFeeEvent({ snapshot, workflowId: 'wf2', grossBuzz: 725, loraId: 'lora_wf2', dataSource: 'trainer-attested' });
+    const folded = foldSharedEntries([
+      entry({ key: 'k-l2', value: loraSharedValue({ ...lora, loraId: 'lora_wf2', workflowId: 'wf2', dataSource: 'trainer-attested' }) }),
+      entry({ key: 'k-e2', value: ledgerSharedValue(attestedEvent) }),
+      entry({
+        key: 'k-l3',
+        value: { title: 'x', data: { kind: 'lora', loraId: 'lora_wf3', dataSource: 'verified-by-me' } },
+      }),
+      entry({
+        key: 'k-e3',
+        value: { title: 'x', data: { kind: 'ledger', event: { ...attestedEvent, eventId: 'e3', sourceRef: 'wf3', dataSource: 'verified-by-me' } } },
+      }),
+    ]);
+    expect(folded.loras.find((l) => l.loraId === 'lora_wf2')).toMatchObject({ dataSource: 'trainer-attested' });
+    expect(folded.loras.find((l) => l.loraId === 'lora_wf3')).not.toHaveProperty('dataSource');
+    expect(folded.ledgerEvents.find((e) => e.eventId === attestedEvent.eventId)).toMatchObject({ dataSource: 'trainer-attested' });
+    expect(folded.ledgerEvents.find((e) => e.eventId === 'e3')).not.toHaveProperty('dataSource');
+  });
+
+  it("an in-app generation event inherits its LoRA's attested source", () => {
+    expect(
+      generationLedgerEvent({ lora: { loraId: 'l', snapshotId: 's', dataSource: 'trainer-attested' }, workflowId: 'g1', grossBuzz: 8 })
+        .dataSource,
+    ).toBe('trainer-attested');
+    expect(generationLedgerEvent({ lora: { loraId: 'l', snapshotId: 's' }, workflowId: 'g2', grossBuzz: 8 })).not.toHaveProperty(
+      'dataSource',
+    );
   });
 
   it('dataset votes rank only; item votes drive trainable count and training items', () => {

@@ -14,6 +14,7 @@ interface Manifest {
   scopes: string[];
   scopeJustifications: Record<string, string>;
   page: { buzzBudgetPerGen: number };
+  version: string;
 }
 
 const manifest = JSON.parse(
@@ -22,7 +23,7 @@ const manifest = JSON.parse(
 
 const pkg = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
-) as { dependencies: Record<string, string> };
+) as { version: string; dependencies: Record<string, string> };
 
 describe('block.manifest.json — training contract', () => {
   it('declares the budgeted scope with an honest justification', () => {
@@ -64,8 +65,15 @@ describe('block.manifest.json — training contract', () => {
     expect(PAGE_BUZZ_BUDGET).toBe(manifest.page.buzzBudgetPerGen);
   });
 
-  it('pins the SDK pair that types the training hooks + trainedEpochs / publishedModel', () => {
-    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.58.0');
-    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.65.0');
+  it('pins the SDK pair whose kind:\'training\' body is items (uploaded blobs), not datasetId', () => {
+    // 0.77 replaced the prepared-dataset body ({ datasetId }) with
+    // { items: [{ air, caption }] } uploaded through useImageUpload({ purpose:
+    // 'trainingData' }); the TrainFlow upload path is written against it.
+    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.77.0');
+    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.77.0');
+  });
+
+  it('package.json and block.manifest.json carry the same app version', () => {
+    expect(manifest.version).toBe(pkg.version);
   });
 });
