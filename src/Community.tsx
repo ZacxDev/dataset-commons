@@ -6,7 +6,6 @@ import {
   useBuzzBalance,
   useBuzzWorkflow,
   useCivitaiNavigate,
-  useGatedImages,
   useImagePicker,
   useImageUpload,
   useRequestConsent,
@@ -16,7 +15,6 @@ import { Alert, Badge, Button, Modal, Stack } from '@civitai/blocks-react/ui';
 import '@civitai/components/civitai-nav-item/define';
 import '@civitai/components/civitai-nav-list/define';
 import '@civitai/components/civitai-avatar/define';
-import type { BlockGatedImage } from '@civitai/app-sdk/blocks';
 
 import {
   COSMETIC_TRUST_LINE,
@@ -65,6 +63,7 @@ import {
   type StorageAccess,
 } from './community-storage.js';
 import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
+import { useItemImages } from './item-images.js';
 import { DEFAULT_CHECKPOINT, loraOption } from './models.js';
 import { dataSourceLabel, type DatasetSnapshot, type LedgerEvent } from './training.js';
 import { TrainFlow, type TrainRunLink } from './TrainFlow.js';
@@ -1398,27 +1397,9 @@ function DatasetDetail(props: {
     () => dataset.items.map((i) => i.imageId).filter((id): id is number => id != null),
     [dataset.items],
   );
-  const { getImages } = useGatedImages();
-  const [gatedImages, setGatedImages] = useState<ReadonlyMap<number, BlockGatedImage>>(new Map());
-  useEffect(() => {
-    let alive = true;
-    if (imageIds.length === 0) {
-      setGatedImages(new Map());
-      return () => {
-        alive = false;
-      };
-    }
-    void getImages(imageIds)
-      .then((images) => {
-        if (alive) setGatedImages(new Map(images.map((image) => [image.imageId, image])));
-      })
-      .catch(() => {
-        if (alive) setGatedImages(new Map());
-      });
-    return () => {
-      alive = false;
-    };
-  }, [getImages, imageIds]);
+  // Posted images come from the block catalog, this app's own outputs from the
+  // gated read (./item-images.ts): the gated read alone never sees a posted image.
+  const gatedImages = useItemImages(imageIds);
   const isOwner = viewerId != null && dataset.ownerId === viewerId;
   const liveItems = dataset.items.filter((i) => !i.removed);
   // Contributing happens in a modal opened from the large Add-an-image CTA.
@@ -1583,7 +1564,7 @@ function DatasetDetail(props: {
               {item.imageId != null ? (
                 gatedImage == null ? (
                   <span style={hintStyle} data-testid={`dc-item-image-pending-${item.itemId}`}>
-                    Image is still being rated — check back shortly.
+                    Image can't be shown here — it may still be being rated, or it isn't public on Civitai.
                   </span>
                 ) : gatedImage.status === 'visible' ? (
                   <Stack gap={4}>
