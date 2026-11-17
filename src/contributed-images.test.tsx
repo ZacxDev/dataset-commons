@@ -172,6 +172,38 @@ describe('posted images contributed to a dataset', () => {
   }, 15000);
 });
 
+describe('the Upload tab shares the upload', () => {
+  let uninstall: (() => void) | undefined;
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+  });
+
+  it('asks the host for a display upload with share: true, and uses the image it returns', async () => {
+    const user = userEvent.setup();
+    const outbound: Array<{ type: string; payload?: Record<string, unknown> }> = [];
+    const opened = await openDataset(
+      {},
+      { onOutbound: (message) => outbound.push(message as { type: string; payload?: Record<string, unknown> }) },
+    );
+    uninstall = opened.uninstall;
+
+    await user.click(await screen.findByTestId('dc-add-image'));
+    await user.click(screen.getByTestId('dc-contribute-tab-upload'));
+    await user.click(screen.getByTestId('dc-contribute-upload'));
+
+    expect(await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 })).toHaveTextContent(
+      /Uploaded image #\d+ selected/,
+    );
+    const uploads = outbound.filter((m) => m.type === 'OPEN_IMAGE_UPLOAD');
+    expect(uploads).toHaveLength(1);
+    const { requestId, ...rest } = uploads[0]!.payload ?? {};
+    expect(typeof requestId).toBe('string');
+    // Shared, and otherwise exactly the default display upload: no purpose, no asyncScan.
+    expect(rest).toEqual({ share: true });
+  }, 15000);
+});
+
 describe('"Save #N" on posted images', () => {
   let uninstall: (() => void) | undefined;
   afterEach(() => {

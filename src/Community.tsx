@@ -7,7 +7,6 @@ import {
   useBuzzWorkflow,
   useCivitaiNavigate,
   useImagePicker,
-  useImageUpload,
   useRequestConsent,
   useRequestSignIn,
 } from '@civitai/blocks-react';
@@ -64,6 +63,7 @@ import {
 } from './community-storage.js';
 import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
 import { useItemImages } from './item-images.js';
+import { useSharedImageUpload } from './shared-upload.js';
 import { DEFAULT_CHECKPOINT, loraOption } from './models.js';
 import { dataSourceLabel, type DatasetSnapshot, type LedgerEvent } from './training.js';
 import { TrainFlow, type TrainRunLink } from './TrainFlow.js';
@@ -1179,7 +1179,8 @@ function ContributeForm(props: {
   onContribute: (input: { imageRef: string; imageId?: number; caption: string }) => Promise<string | null>;
   onSuccess?: () => void;
 }) {
-  const { open: openUpload } = useImageUpload();
+  // Shared with this dataset's viewers once scanned (./shared-upload.ts).
+  const { open: openUpload } = useSharedImageUpload();
   const { open: openPicker } = useImagePicker();
   const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('mine');
   const [reference, setReference] = useState('');
