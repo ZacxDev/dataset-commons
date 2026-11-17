@@ -1464,9 +1464,11 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           <span style={hintStyle}>
             Civitai trains only on images uploaded from this page — for both the quick path and
             Civitai's trainer — so you upload the training set yourself: save the numbered images
-            below, then upload exactly those files in Civitai's upload window. Each upload is
-            matched to one training-set image — in order by default — and carries that image's
-            frozen caption. Uploads are forgotten if this page reloads.
+            below, then upload exactly those files in Civitai's upload window, selecting them in
+            the saved order (#1 first, then #2, …). Civitai gives this page no preview of a
+            training upload, so uploads are matched by ORDER: upload #1 is image #1, and so on,
+            and each carries that image's frozen caption. Uploads are forgotten if this page
+            reloads.
           </span>
 
           {uploadBlocker ? (
@@ -1512,6 +1514,11 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
           {uploads && kindPhase !== 'unconfirmed' && (
             <div style={fieldStyle} data-testid="dc-train-pairs">
+              <span style={hintStyle} data-testid="dc-train-order-hint">
+                Each upload is matched to the training-set image with the same number. Change a row
+                only if you know you selected that file out of order — this page can't show the
+                uploaded files, so it can't check the match for you.
+              </span>
               {uploads.map((upload, index) => (
                 <div key={`${upload.air}-${index}`} style={kindRowStyle} data-testid="dc-train-pair">
                   {/* A training upload is private and comes back as an AIR key only
@@ -1565,9 +1572,9 @@ export function TrainFlow(props: TrainFlowProps = {}) {
                     data-testid="dc-train-attest"
                     onChange={(e) => setAttested(e.target.checked)}
                   />
-                  I confirm these uploads are the training set's images listed above, each matched to the
-                  right number. This app can't check the files; the run and the contributors' credit are
-                  recorded as trainer-attested.
+                  I uploaded the saved training-set files in their numbered order (#1 first), so each
+                  upload is the image matched to it above. This app can't see the uploaded files; the
+                  run and the contributors' credit are recorded as trainer-attested.
                 </label>
               )}
             </div>

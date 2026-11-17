@@ -93,11 +93,14 @@ images** once, and that upload feeds whichever path the base model uses:
    `[{ air }]` — an AIR key per upload and no url (SDK 0.90), so each upload
    row shows a numbered placeholder instead of a thumbnail. The uploads live
    only in the page; they never become dataset items or shared documents.
-3. Each upload is matched to one numbered snapshot image — by position by
-   default, changeable per row — and carries that image's frozen caption. The
-   app refuses to price a count mismatch, a double match or a repeated file.
+3. Uploads are matched by ORDER: the trainer selects the saved files in their
+   numbered order, and upload #1 is snapshot image #1, and so on. Each carries
+   that image's frozen caption. A row can be re-matched (for a file the trainer
+   knows they selected out of order). The app refuses to price a count
+   mismatch, a double match or a repeated file.
 4. The app only receives an AIR key per upload, so it cannot prove the uploads are the
-   snapshot's images. The trainer must tick an attestation (unchecked by
+   snapshot's images. The trainer must tick an attestation that they uploaded
+   the files in the numbered order (unchecked by
    default, cleared by any new upload, re-match or change in which items are in
    the training set) before either path prices, and **every run is recorded in
    the ledger and on the LoRA as trainer-attested**. Records written by earlier
