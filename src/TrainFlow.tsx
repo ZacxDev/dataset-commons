@@ -253,13 +253,18 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   /** The snapshot the standing pass-through quote was frozen for. */
   const [passSnapshot, setPassSnapshot] = useState<DatasetSnapshot | null>(null);
 
-  /** The host's upload result — the ONLY blobs either run path trains on. */
+  /**
+   * The host's upload result — the ONLY blobs either run path trains on. Each is
+   * an AIR key only (`{ air }`, SDK 0.90; the hook drops an older host's `url`).
+   * Held in page state for pairing and never written into a dataset item, a
+   * snapshot or any shared document.
+   */
   const [uploads, setUploads] = useState<BlockTrainingDataImage[] | null>(null);
   /** Snapshot item id per upload (upload order); defaults to the same position. */
   const [uploadAssignment, setUploadAssignment] = useState<string[]>([]);
   /**
    * The trainer's statement that the uploads ARE the snapshot's images, in the
-   * matched order. The app cannot check it (it only sees `{ url, air }`), so it
+   * matched order. The app cannot check it (it only sees `{ air }` keys), so it
    * is asked for explicitly, unchecked by default, and cleared by any new upload,
    * re-match or change in the training set. Neither path prices until it is given.
    */
@@ -1459,9 +1464,11 @@ export function TrainFlow(props: TrainFlowProps = {}) {
           <span style={hintStyle}>
             Civitai trains only on images uploaded from this page — for both the quick path and
             Civitai's trainer — so you upload the training set yourself: save the numbered images
-            below, then upload exactly those files in Civitai's upload window. Each upload is
-            matched to one training-set image — in order by default — and carries that image's
-            frozen caption. Uploads are forgotten if this page reloads.
+            below, then upload exactly those files in Civitai's upload window, selecting them in
+            the saved order (#1 first, then #2, …). Civitai gives this page no preview of a
+            training upload, so uploads are matched by ORDER: upload #1 is image #1, and so on,
+            and each carries that image's frozen caption. Uploads are forgotten if this page
+            reloads.
           </span>
 
           {uploadBlocker ? (
@@ -1507,9 +1514,25 @@ export function TrainFlow(props: TrainFlowProps = {}) {
 
           {uploads && kindPhase !== 'unconfirmed' && (
             <div style={fieldStyle} data-testid="dc-train-pairs">
+              <span style={hintStyle} data-testid="dc-train-order-hint">
+                Each upload is matched to the training-set image with the same number. Change a row
+                only if you know you selected that file out of order — this page can't show the
+                uploaded files, so it can't check the match for you.
+              </span>
               {uploads.map((upload, index) => (
                 <div key={`${upload.air}-${index}`} style={kindRowStyle} data-testid="dc-train-pair">
-                  <img src={upload.url} alt={`upload ${index + 1}`} style={kindThumbStyle} />
+                  {/* A training upload is private and comes back as an AIR key only
+                      (SDK 0.90, civitai-app-starters#844) — there is no url to show,
+                      so every upload gets a numbered placeholder, never an <img>. */}
+                  <span
+                    role="img"
+                    aria-label={`upload ${index + 1} (private training image, no preview)`}
+                    title={upload.air}
+                    style={kindThumbPlaceholderStyle}
+                    data-testid={`dc-train-pair-thumb-${index}`}
+                  >
+                    #{index + 1}
+                  </span>
                   <label style={miniLabelStyle}>
                     upload #{index + 1} is
                     <select
@@ -1549,9 +1572,9 @@ export function TrainFlow(props: TrainFlowProps = {}) {
                     data-testid="dc-train-attest"
                     onChange={(e) => setAttested(e.target.checked)}
                   />
-                  I confirm these uploads are the training set's images listed above, each matched to the
-                  right number. This app can't check the files; the run and the contributors' credit are
-                  recorded as trainer-attested.
+                  I uploaded the saved training-set files in their numbered order (#1 first), so each
+                  upload is the image matched to it above. This app can't see the uploaded files; the
+                  run and the contributors' credit are recorded as trainer-attested.
                 </label>
               )}
             </div>
@@ -1982,12 +2005,18 @@ const kindRowStyle: React.CSSProperties = {
   fontSize: 13,
   minWidth: 0,
 };
-const kindThumbStyle: React.CSSProperties = {
+const kindThumbPlaceholderStyle: React.CSSProperties = {
   width: 48,
   height: 48,
-  objectFit: 'cover',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
   borderRadius: 4,
-  border: '1px solid var(--civitai-color-border)',
+  border: '1px dashed var(--civitai-color-border)',
+  background: 'var(--civitai-color-surface)',
+  color: 'var(--civitai-color-text-dimmed, var(--civitai-color-text))',
+  fontFamily: 'var(--civitai-font-mono, ui-monospace, monospace)',
+  fontSize: 12,
   flex: '0 0 auto',
 };
 const confirmStyle: React.CSSProperties = {

@@ -69,13 +69,15 @@ describe('block.manifest.json — training contract', () => {
     expect(PAGE_BUZZ_BUDGET).toBe(manifest.page.buzzBudgetPerGen);
   });
 
-  it('pins the SDK pair whose kind:\'training\' body is items (uploaded blobs), not datasetId', () => {
+  it('pins the SDK pair whose trainingData upload is AIR-only ([{ air }], no url)', () => {
     // 0.77 replaced the prepared-dataset body ({ datasetId }) with
     // { items: [{ air, caption }] } uploaded through useImageUpload({ purpose:
-    // 'trainingData' }); the TrainFlow upload path is written against it.
-    // (Was ^0.70.1 / ^0.73.2 for useImagePicker, 2026-10-15.)
-    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.77.0');
-    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.77.0');
+    // 'trainingData' }); 0.90 / blocks-react 0.83 made that upload resolve
+    // [{ air }] with no url. The TrainFlow upload path is written against it.
+    // (Was ^0.77.0 / ^0.77.0; ^0.70.1 / ^0.73.2 for useImagePicker, 2026-10-15.)
+    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.90.0');
+    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.83.0');
+    expect(pkg.dependencies['@civitai/sdk']).toBe('0.28.0');
   });
 
   it('package.json and block.manifest.json carry the same app version', () => {
