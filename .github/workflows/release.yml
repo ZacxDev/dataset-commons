@@ -1,0 +1,21 @@
+name: Submit to Civitai
+
+# A tag equal to block.manifest.json's version (v0.4.1 for "0.4.1") submits that
+# exact commit for moderator review through civitai/app-submit-action. The
+# submit carries a GitHub-signed OIDC token, so Civitai records which repository,
+# tag and commit the run came from. Approval is still a moderator's.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read   # check out the repository
+      id-token: write  # let the action request a GitHub OIDC token
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: civitai/app-submit-action@v1
+        with:
+          api-key: ${{ secrets.CIVITAI_API_KEY }}
