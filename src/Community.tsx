@@ -1195,7 +1195,13 @@ function ContributeForm(props: {
   const hasSelection = picked != null || uploaded != null || reference.trim().length > 0;
 
   const upload = async () => {
-    const pickedImage = await openUpload();
+    let pickedImage: Awaited<ReturnType<typeof openUpload>>;
+    try {
+      pickedImage = await openUpload();
+    } catch (err) {
+      setError(`Civitai could not take this upload: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
     if (!pickedImage) return;
     setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url });
     setPicked(null);

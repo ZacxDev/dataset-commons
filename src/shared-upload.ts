@@ -31,12 +31,16 @@ export function sharedUploadRequest(): OutboundRequest {
   return { type: 'OPEN_IMAGE_UPLOAD', payload: { share: true } } as unknown as OutboundRequest;
 }
 
-/** `open()` resolves with the moderated image, or `null` when the viewer dismissed. */
+/** `open()` resolves with the moderated image, `null` when the viewer dismissed, and rejects when the host refused. */
 export function useSharedImageUpload(): { open: () => Promise<BlockUploadedImageInfo | null> } {
   const open = useCallback(async () => {
-    const { selected } = await sendTypedRequest(getTransport(), sharedUploadRequest(), 'IMAGE_UPLOAD_RESULT', {
+    const reply = await sendTypedRequest(getTransport(), sharedUploadRequest(), 'IMAGE_UPLOAD_RESULT', {
       timeoutMs: SHARED_UPLOAD_TIMEOUT_MS,
     });
+    // A refused shared upload (e.g. the host has no block token) is an error, never a
+    // dismissed picker: the Upload tab tells the viewer the image is shared.
+    if (typeof reply.error === 'string' && reply.error.length > 0) throw new Error(reply.error);
+    const { selected } = reply;
     // A multi-image training reply, or a shape without an image id, is not an answer to this upload.
     if (!selected || 'images' in selected || !('imageId' in selected)) return null;
     return selected as BlockUploadedImageInfo;

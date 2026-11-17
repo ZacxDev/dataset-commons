@@ -202,6 +202,37 @@ describe('the Upload tab shares the upload', () => {
     // Shared, and otherwise exactly the default display upload: no purpose, no asyncScan.
     expect(rest).toEqual({ share: true });
   }, 15000);
+
+  it('shows the host refusal of a shared upload, never treating it as a dismissed picker', async () => {
+    const user = userEvent.setup();
+    const opened = await openDataset(
+      {},
+      {
+        // The host refuses a shared upload it cannot attribute. Replied synchronously,
+        // so it settles the request before the mock host's own canned image.
+        onOutbound: (message) => {
+          const m = message as { type: string; payload?: { requestId?: string } };
+          if (m.type !== 'OPEN_IMAGE_UPLOAD') return;
+          window.dispatchEvent(
+            new MessageEvent('message', {
+              data: { type: 'IMAGE_UPLOAD_RESULT', payload: { requestId: m.payload?.requestId, error: 'no block token' } },
+              origin: window.location.origin,
+            }),
+          );
+        },
+      },
+    );
+    uninstall = opened.uninstall;
+
+    await user.click(await screen.findByTestId('dc-add-image'));
+    await user.click(screen.getByTestId('dc-contribute-tab-upload'));
+    await user.click(screen.getByTestId('dc-contribute-upload'));
+
+    expect(await screen.findByTestId('dc-contribute-error', {}, { timeout: 5000 })).toHaveTextContent(
+      'Civitai could not take this upload: no block token',
+    );
+    expect(screen.queryByTestId('dc-contribute-uploaded')).not.toBeInTheDocument();
+  }, 15000);
 });
 
 describe('"Save #N" on posted images', () => {
