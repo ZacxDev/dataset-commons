@@ -22,11 +22,8 @@ async function openTrain(user: ReturnType<typeof userEvent.setup>) {
   return screen.findByTestId('dc-train');
 }
 
-/** One `purpose: 'trainingData'` upload result, as the host returns it. */
-const trainingUpload = (n: number) => ({
-  url: `https://blobs.mock.invalid/v2/consumer/blobs/up${n}.png`,
-  air: `up${n}.png`,
-});
+/** One `purpose: 'trainingData'` upload result, as the host returns it (SDK 0.90: an AIR key, no url). */
+const trainingUpload = (n: number) => ({ air: `up${n}.png` });
 
 /** The shared step both paths need first: upload the training set, then attest the match. */
 async function uploadAndAttest(user: ReturnType<typeof userEvent.setup>) {
@@ -852,7 +849,7 @@ describe('TrainFlow (Option A′)', () => {
     expect(screen.getByTestId('dc-train-upload')).toBeEnabled();
   });
 
-  // --- Trainer attestation (kind: 'training' only): the app sees `{ url, air }`
+  // --- Trainer attestation (kind: 'training' only): the app sees `{ air }` keys
   // and cannot prove the uploads are the snapshot's images. ---
 
   it('the attestation is unchecked by default and gates pricing — no estimate is sent without it', async () => {

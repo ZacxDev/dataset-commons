@@ -480,8 +480,8 @@ describe('Community screens (voting option b)', () => {
         },
         // The quick path trains on the trainer's `trainingData` upload, like Civitai's trainer.
         cannedTrainingDataUpload: [
-          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up1.png', air: 'up1.png' },
-          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up2.png', air: 'up2.png' },
+          { air: 'up1.png' },
+          { air: 'up2.png' },
         ],
       });
       await openCommunity(user);
@@ -539,8 +539,8 @@ describe('Community screens (voting option b)', () => {
         declaredScopes: [...ALL_APP_SCOPES],
         generation: { trainedEpochs: 10 },
         cannedTrainingDataUpload: [
-          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up1.png', air: 'up1.png' },
-          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up2.png', air: 'up2.png' },
+          { air: 'up1.png' },
+          { air: 'up2.png' },
         ],
       });
       await openCommunity(user);
@@ -578,8 +578,8 @@ describe('Community screens (voting option b)', () => {
         declaredScopes: [...ALL_APP_SCOPES],
         generation: { trainedEpochs: 10 },
         cannedTrainingDataUpload: [
-          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up1.png', air: 'up1.png' },
-          { url: 'https://blobs.mock.invalid/v2/consumer/blobs/up2.png', air: 'up2.png' },
+          { air: 'up1.png' },
+          { air: 'up2.png' },
         ],
       });
       await openCommunity(user);

@@ -279,7 +279,7 @@ export type LedgerEventType = 'training' | 'generation_in_app' | 'generation_ons
  * Where a training run's images came from:
  *  - 'trainer-attested': the run trained on files the trainer uploaded through
  *    `useImageUpload({ purpose: 'trainingData' })`; the app only sees
- *    `{ url, air }` and cannot prove they are the snapshot's images, so the
+ *    an AIR key per upload and cannot prove they are the snapshot's images, so the
  *    trainer's own attestation is all there is. EVERY run this app starts now —
  *    pass-through step and Civitai's trainer alike — is recorded this way.
  *  - 'snapshot': a LEGACY value only. Earlier versions ran the pass-through step
