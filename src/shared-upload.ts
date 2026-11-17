@@ -12,8 +12,10 @@
  * 🔴 TEMPORARY: the published `@civitai/blocks-react` 0.83 `useImageUpload()`
  * cannot send `share` (its options have none, and it builds the payload
  * itself), so this sends the same message the hook's blocking display path
- * sends, plus `share: true`. The one cast below is that extra field. Replace
- * this module with `useImageUpload({ share: true })` once the SDK release that
+ * sends, plus `share: true`, and reads the host's `shared` echo. The two casts
+ * below are those two fields. Replace
+ * this module with `useImageUpload({ share: true })` (which resolves with the
+ * same `shared` echo) once the SDK release that
  * adds the option is published, and bump the dependency.
  */
 
@@ -31,8 +33,16 @@ export function sharedUploadRequest(): OutboundRequest {
   return { type: 'OPEN_IMAGE_UPLOAD', payload: { share: true } } as unknown as OutboundRequest;
 }
 
+/**
+ * The uploaded image, plus whether sharing TOOK EFFECT: the host echoes
+ * `shared: true` only when the server recorded the upload as shared. A host
+ * without the echo (one that predates sharing, and ignored `share`) reads as
+ * `false`: the upload is then private to the uploader.
+ */
+export type SharedUploadResult = BlockUploadedImageInfo & { shared: boolean };
+
 /** `open()` resolves with the moderated image, `null` when the viewer dismissed, and rejects when the host refused. */
-export function useSharedImageUpload(): { open: () => Promise<BlockUploadedImageInfo | null> } {
+export function useSharedImageUpload(): { open: () => Promise<SharedUploadResult | null> } {
   const open = useCallback(async () => {
     const reply = await sendTypedRequest(getTransport(), sharedUploadRequest(), 'IMAGE_UPLOAD_RESULT', {
       timeoutMs: SHARED_UPLOAD_TIMEOUT_MS,
@@ -41,9 +51,11 @@ export function useSharedImageUpload(): { open: () => Promise<BlockUploadedImage
     // dismissed picker: the Upload tab tells the viewer the image is shared.
     if (typeof reply.error === 'string' && reply.error.length > 0) throw new Error(reply.error);
     const { selected } = reply;
+    // The second (and last) cast: `shared` is not in the published IMAGE_UPLOAD_RESULT type yet.
+    const shared = (reply as { shared?: unknown }).shared === true;
     // A multi-image training reply, or a shape without an image id, is not an answer to this upload.
     if (!selected || 'images' in selected || !('imageId' in selected)) return null;
-    return selected as BlockUploadedImageInfo;
+    return { ...(selected as BlockUploadedImageInfo), shared };
   }, []);
   return { open };
 }

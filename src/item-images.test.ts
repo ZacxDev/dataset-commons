@@ -213,6 +213,28 @@ describe('resolveItemImages', () => {
     expect(found.size).toBe(150);
   });
 
+  it('splits the gated read at its 100-id ceiling, and every chunk answer reaches the result', async () => {
+    const ids = Array.from({ length: 230 }, (_, i) => i + 1);
+    // Models the host: it answers at most the first 100 ids of a call and drops the rest.
+    const gated = vi.fn(async (chunk: number[]) => chunk.slice(0, 100).map(gatedVisible));
+    const found = await resolveItemImages(ids, { catalog: null, gated, ceiling: ANY_VIEWER });
+    expect(gated.mock.calls.map(([chunk]) => chunk.length)).toEqual([100, 100, 30]);
+    expect(found.size).toBe(230);
+    expect(found.get(230)).toMatchObject({ status: 'visible', url: 'https://image.civitai.com/gated/230/width=1200/g.jpeg' });
+  });
+
+  it('a failed gated chunk loses only its own ids', async () => {
+    const ids = Array.from({ length: 150 }, (_, i) => i + 1);
+    const gated = vi.fn(async (chunk: number[]) => {
+      if (chunk[0] === 1) throw new Error('down');
+      return chunk.map(gatedVisible);
+    });
+    const found = await resolveItemImages(ids, { catalog: null, gated, ceiling: ANY_VIEWER });
+    expect(found.size).toBe(50);
+    expect(found.has(100)).toBe(false);
+    expect(found.has(101)).toBe(true);
+  });
+
   it('with no catalog yet, uses the gated read alone', async () => {
     const found = await resolveItemImages([9], {
       catalog: null,

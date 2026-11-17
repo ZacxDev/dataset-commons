@@ -167,7 +167,7 @@ describe('posted images contributed to a dataset', () => {
     await user.click(await screen.findByTestId('dc-add-image'));
     await user.click(screen.getByTestId('dc-contribute-tab-upload'));
     expect(screen.getByTestId('dc-contribute-upload-note').textContent?.replace(/\s+/g, ' ').trim()).toBe(
-      "Your upload is not posted on Civitai. It is shared with this dataset's viewers once Civitai has scanned it.",
+      "Your upload is not posted on Civitai. It is shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13.",
     );
   }, 15000);
 });
@@ -192,15 +192,61 @@ describe('the Upload tab shares the upload', () => {
     await user.click(screen.getByTestId('dc-contribute-tab-upload'));
     await user.click(screen.getByTestId('dc-contribute-upload'));
 
-    expect(await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 })).toHaveTextContent(
-      /Uploaded image #\d+ selected/,
-    );
+    // The mock host predates the `shared` echo, as today's civitai does: the upload is
+    // kept private, and the tab says so rather than claiming it is shared.
+    const uploaded = await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
+    expect(uploaded).toHaveTextContent(/Uploaded image #\d+ selected/);
+    expect(uploaded).toHaveTextContent("Kept private (this Civitai version doesn't support sharing yet).");
+    expect(uploaded).not.toHaveTextContent(/will be shared/);
     const uploads = outbound.filter((m) => m.type === 'OPEN_IMAGE_UPLOAD');
     expect(uploads).toHaveLength(1);
     const { requestId, ...rest } = uploads[0]!.payload ?? {};
     expect(typeof requestId).toBe('string');
     // Shared, and otherwise exactly the default display upload: no purpose, no asyncScan.
     expect(rest).toEqual({ share: true });
+  }, 15000);
+
+  it('says the upload will be shared only when the host echoes shared: true', async () => {
+    const user = userEvent.setup();
+    const opened = await openDataset(
+      {},
+      {
+        // A host that recorded the share. Replied synchronously, so it settles the
+        // request before the mock host's own canned image.
+        onOutbound: (message) => {
+          const m = message as { type: string; payload?: { requestId?: string } };
+          if (m.type !== 'OPEN_IMAGE_UPLOAD') return;
+          window.dispatchEvent(
+            new MessageEvent('message', {
+              data: {
+                type: 'IMAGE_UPLOAD_RESULT',
+                payload: {
+                  requestId: m.payload?.requestId,
+                  selected: {
+                    imageId: 7701,
+                    nsfwLevel: 1,
+                    contentRating: 'pg',
+                    url: 'https://image.civitai.com/x/original=true/u.jpeg',
+                  },
+                  shared: true,
+                },
+              },
+              origin: window.location.origin,
+            }),
+          );
+        },
+      },
+    );
+    uninstall = opened.uninstall;
+
+    await user.click(await screen.findByTestId('dc-add-image'));
+    await user.click(screen.getByTestId('dc-contribute-tab-upload'));
+    await user.click(screen.getByTestId('dc-contribute-upload'));
+
+    const uploaded = await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
+    expect(uploaded.textContent?.replace(/\s+/g, ' ').trim()).toBe(
+      "Uploaded image #7701 selected. It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13.",
+    );
   }, 15000);
 
   it('shows the host refusal of a shared upload, never treating it as a dismissed picker', async () => {

@@ -1186,7 +1186,7 @@ function ContributeForm(props: {
   const [reference, setReference] = useState('');
   const [caption, setCaption] = useState('');
   const [rights, setRights] = useState(false);
-  const [uploaded, setUploaded] = useState<{ imageId: number; url: string } | null>(null);
+  const [uploaded, setUploaded] = useState<{ imageId: number; url: string; shared: boolean } | null>(null);
   const [picked, setPicked] = useState<{ imageId?: number; url: string; source: 'posted' | 'generated' } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -1203,7 +1203,7 @@ function ContributeForm(props: {
       return;
     }
     if (!pickedImage) return;
-    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url });
+    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url, shared: pickedImage.shared });
     setPicked(null);
     setReference(pickedImage.url);
     setError(null);
@@ -1314,12 +1314,15 @@ function ContributeForm(props: {
           <span style={hintStyle} data-testid="dc-contribute-upload-note">
             {' '}
             Your upload is not posted on Civitai. It is shared with this dataset&apos;s viewers once Civitai has
-            scanned it.
+            scanned it and rated it PG or PG-13.
           </span>
           {uploaded && (
             <span style={hintStyle} data-testid="dc-contribute-uploaded">
               {' '}
-              Uploaded image #{uploaded.imageId} selected.
+              Uploaded image #{uploaded.imageId} selected.{' '}
+              {uploaded.shared
+                ? "It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13."
+                : "Kept private (this Civitai version doesn't support sharing yet)."}
             </span>
           )}
         </span>

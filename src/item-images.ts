@@ -44,6 +44,14 @@ import { apiBaseUrl } from './doc-storage.js';
 /** The catalog route's own `ids` ceiling (civitai `IMAGE_IDS_BATCH_MAX`). */
 export const CATALOG_IDS_MAX = 100;
 
+/** The gated read's own per-call ceiling (civitai `BLOCK_GATED_IMAGES_MAX_IDS`): it drops ids past it. */
+export const GATED_IDS_MAX = 100;
+
+/** `ids` in consecutive chunks of at most `size`. */
+function chunked(ids: number[], size: number): number[][] {
+  return Array.from({ length: Math.ceil(ids.length / size) }, (_, i) => ids.slice(i * size, (i + 1) * size));
+}
+
 /** The block catalog route, relative to `<origin>/api/v1`. */
 export const CATALOG_IMAGES_PATH = 'blocks/images';
 
@@ -199,8 +207,9 @@ function catalogChunk(
 }
 
 /**
- * Resolve item image ids: the gated read and the catalog (in chunks of
- * {@link CATALOG_IDS_MAX}, each under a deadline) run concurrently. The gated
+ * Resolve item image ids: the gated read (in chunks of {@link GATED_IDS_MAX})
+ * and the catalog (in chunks of {@link CATALOG_IDS_MAX}, each under a deadline)
+ * run concurrently. The gated
  * answer for an id wins; the catalog fills the rest. A failed read contributes
  * nothing and never discards the other's.
  */
@@ -219,13 +228,14 @@ export async function resolveItemImages(
   const asked = new Set(ids);
   const deadlineMs = deps.deadlineMs ?? CATALOG_DEADLINE_MS;
 
-  const gatedRead = deps.gated(ids).catch(() => [] as BlockGatedImage[]);
+  // In chunks: the host silently drops ids past its per-call ceiling. A failed chunk loses only its own ids.
+  const gatedRead = Promise.all(
+    chunked(ids, GATED_IDS_MAX).map((chunk) => deps.gated(chunk).catch(() => [] as BlockGatedImage[])),
+  ).then((pages) => pages.flat());
   const catalog = deps.catalog;
   const catalogRead = catalog
     ? Promise.all(
-        Array.from({ length: Math.ceil(ids.length / CATALOG_IDS_MAX) }, (_, i) =>
-          catalogChunk(catalog, ids.slice(i * CATALOG_IDS_MAX, (i + 1) * CATALOG_IDS_MAX), deps.ceiling, deadlineMs),
-        ),
+        chunked(ids, CATALOG_IDS_MAX).map((chunk) => catalogChunk(catalog, chunk, deps.ceiling, deadlineMs)),
       ).then((pages) => pages.flat())
     : Promise.resolve([] as ItemImage[]);
 
