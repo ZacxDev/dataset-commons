@@ -6,7 +6,7 @@ import { App } from './App.js';
 import { ALL_APP_SCOPES } from './community-storage.js';
 import { datasetDoc, itemDoc, type DatasetItemRecord, type DatasetRecord } from './community.js';
 import { seedCommunity } from './fake-doc-storage.js';
-import { installMockMoneyHost } from './mock-buzz.js';
+import { installMockMoneyHost, type MockMoneyHostOptions } from './mock-buzz.js';
 import { testDocStore } from './test-doc-store.js';
 import { TrainFlow } from './TrainFlow.js';
 import type { DatasetItem } from './training.js';
@@ -17,10 +17,24 @@ import type { DatasetItem } from './training.js';
 // these ids it returns NO images; the mock host is told to do the same
 // (`gatedImages: []`). The block image catalog (`/api/v1/blocks/images?ids=`)
 // is what returns posted images; it is served here from a stubbed `fetch`.
+//
+// The catalog is clamped server-side to the DOMAIN ceiling only, so the stub
+// returns every image whatever its rating, as the real route does on a mature
+// domain; keeping a mature image off a PG viewer's screen is the app's job.
+
+// Browsing-level bits (civitai): PG 1, PG13 2, R 4, X 8, XXX 16.
+const PG = 1;
+const R = 4;
+const X = 8;
+const ALL_RATED = 31;
 
 const POSTED_A = 501;
 const POSTED_B = 502;
-const catalogUrl = (id: number) => `https://image.civitai.com/catalog/original=true/posted-${id}.jpeg`;
+const MATURE_X = 503;
+const MATURE_R = 504;
+const LEVEL: Record<number, number> = { [POSTED_A]: PG, [POSTED_B]: PG, [MATURE_X]: X, [MATURE_R]: R };
+const originalUrl = (id: number) => `https://image.civitai.com/catalog/guid-${id}/original=true/posted-${id}.jpeg`;
+const gridUrl = (id: number) => `https://image.civitai.com/catalog/guid-${id}/width=1200/posted-${id}.jpeg`;
 
 /** Stub `fetch` as the block catalog route; every other request keeps failing. */
 function stubCatalog(): string[] {
@@ -33,8 +47,8 @@ function stubCatalog(): string[] {
       requested.push(url.toString());
       const ids = (url.searchParams.get('ids') ?? '').split(',').map(Number);
       const items = ids
-        .filter((id) => id === POSTED_A || id === POSTED_B)
-        .map((id) => ({ id, url: catalogUrl(id), width: 768, height: 1024 }));
+        .filter((id) => LEVEL[id] != null)
+        .map((id) => ({ id, url: originalUrl(id), type: 'image', browsingLevel: LEVEL[id], width: 768, height: 1024 }));
       return new Response(JSON.stringify({ items, metadata: {} }), {
         status: 200,
         headers: { 'content-type': 'application/json' },
@@ -42,6 +56,53 @@ function stubCatalog(): string[] {
     }),
   );
   return requested;
+}
+
+const dataset: DatasetRecord = {
+  datasetId: 'ds-posted',
+  ownerId: 7,
+  ownerName: 'archivist',
+  name: 'Posted Set',
+  description: '',
+  targetNote: '',
+  createdAt: '2026-10-21T00:00:00.000Z',
+  updatedAt: '2026-10-21T00:00:00.000Z',
+};
+const mkItem = (itemId: string, imageId: number): DatasetItemRecord => ({
+  itemId,
+  datasetId: dataset.datasetId,
+  contributorId: 7,
+  contributorName: 'archivist',
+  imageId,
+  imageRef: `https://civitai.com/images/${imageId}`,
+  caption: `caption ${itemId}`,
+  rightsAsserted: true,
+  createdAt: '2026-10-21T01:00:00.000Z',
+  updatedAt: '2026-10-21T01:00:00.000Z',
+});
+
+/** Seed the dataset with `items` (itemId → imageId), open it, and return the catalog requests. */
+async function openDataset(items: Record<string, number>, host: MockMoneyHostOptions) {
+  const user = userEvent.setup();
+  const requested = stubCatalog();
+  await seedCommunity(testDocStore(), [
+    { collection: 'datasets', author: 'archivist', data: datasetDoc(dataset) },
+    ...Object.entries(items).map(([itemId, imageId]) => ({
+      collection: 'items' as const,
+      author: 'archivist',
+      data: itemDoc(mkItem(itemId, imageId)),
+    })),
+  ]);
+  const uninstall = installMockMoneyHost({
+    viewer: { id: 7, username: 'archivist', status: 'active' },
+    declaredScopes: [...ALL_APP_SCOPES],
+    gatedImages: [],
+    ...host,
+  });
+  render(<App />);
+  await screen.findByTestId('dc-community');
+  await user.click(await screen.findByTestId('dc-open-dataset-ds-posted'));
+  return { requested, uninstall };
 }
 
 describe('posted images contributed to a dataset', () => {
@@ -52,68 +113,93 @@ describe('posted images contributed to a dataset', () => {
   });
 
   it('render from the block catalog when the gated read returns nothing for them', async () => {
-    const user = userEvent.setup();
-    const requested = stubCatalog();
-    const dataset: DatasetRecord = {
-      datasetId: 'ds-posted',
-      ownerId: 7,
-      ownerName: 'archivist',
-      name: 'Posted Set',
-      description: '',
-      targetNote: '',
-      createdAt: '2026-10-21T00:00:00.000Z',
-      updatedAt: '2026-10-21T00:00:00.000Z',
-    };
-    const mkItem = (itemId: string, imageId: number): DatasetItemRecord => ({
-      itemId,
-      datasetId: dataset.datasetId,
-      contributorId: 7,
-      contributorName: 'archivist',
-      imageId,
-      imageRef: `https://civitai.com/images/${imageId}`,
-      caption: `caption ${itemId}`,
-      rightsAsserted: true,
-      createdAt: '2026-10-21T01:00:00.000Z',
-      updatedAt: '2026-10-21T01:00:00.000Z',
-    });
-    await seedCommunity(testDocStore(), [
-      { collection: 'datasets', author: 'archivist', data: datasetDoc(dataset) },
-      { collection: 'items', author: 'archivist', data: itemDoc(mkItem('pa', POSTED_A)) },
-      { collection: 'items', author: 'archivist', data: itemDoc(mkItem('pb', POSTED_B)) },
-    ]);
-    uninstall = installMockMoneyHost({
-      viewer: { id: 7, username: 'archivist', status: 'active' },
-      declaredScopes: [...ALL_APP_SCOPES],
-      gatedImages: [],
-    });
-    render(<App />);
-    await screen.findByTestId('dc-community');
-    await user.click(await screen.findByTestId('dc-open-dataset-ds-posted'));
+    const opened = await openDataset({ pa: POSTED_A, pb: POSTED_B }, {});
+    uninstall = opened.uninstall;
 
     const a = await screen.findByTestId('dc-item-image-pa', {}, { timeout: 5000 });
-    expect(a).toHaveAttribute('src', catalogUrl(POSTED_A));
-    expect(screen.getByTestId('dc-item-image-pb')).toHaveAttribute('src', catalogUrl(POSTED_B));
+    // The grid shows the width-limited rendition, never the full-size original.
+    expect(a).toHaveAttribute('src', gridUrl(POSTED_A));
+    expect(screen.getByTestId('dc-item-image-pb')).toHaveAttribute('src', gridUrl(POSTED_B));
     expect(screen.queryByTestId('dc-item-image-pending-pa')).not.toBeInTheDocument();
     expect(screen.queryByTestId('dc-item-image-pending-pb')).not.toBeInTheDocument();
-    // One catalog request naming exactly the two item ids.
-    expect(requested).toHaveLength(1);
-    expect(new URL(requested[0]!).searchParams.get('ids')).toBe(`${POSTED_A},${POSTED_B}`);
+    // One catalog request naming exactly the two item ids, images only.
+    expect(opened.requested).toHaveLength(1);
+    const query = new URL(opened.requested[0]!).searchParams;
+    expect(query.get('ids')).toBe(`${POSTED_A},${POSTED_B}`);
+    expect(query.get('type')).toBe('image');
   }, 15000);
 
-  it('"Save #1" saves a posted image by its catalog url, not by id through the gated read', async () => {
+  it('an X-rated catalog image is hidden from a PG viewer on a mature domain', async () => {
+    const opened = await openDataset(
+      { pa: POSTED_A, mx: MATURE_X },
+      { maxBrowsingLevel: ALL_RATED, viewerBrowsingLevel: PG },
+    );
+    uninstall = opened.uninstall;
+
+    await screen.findByTestId('dc-item-image-pa', {}, { timeout: 5000 });
+    expect(await screen.findByTestId('dc-item-image-hidden-mx')).toHaveTextContent(/hidden by your content settings/i);
+    expect(screen.queryByTestId('dc-item-image-mx')).not.toBeInTheDocument();
+    expect(document.body.innerHTML).not.toContain(`posted-${MATURE_X}`);
+  }, 15000);
+
+  it('without a viewer level from the host, only PG and PG13 catalog images render', async () => {
+    const opened = await openDataset({ pa: POSTED_A, mr: MATURE_R }, { maxBrowsingLevel: ALL_RATED });
+    uninstall = opened.uninstall;
+
+    await screen.findByTestId('dc-item-image-pa', {}, { timeout: 5000 });
+    expect(screen.getByTestId('dc-item-image-pending-mr')).toBeInTheDocument();
+    expect(screen.queryByTestId('dc-item-image-mr')).not.toBeInTheDocument();
+    expect(document.body.innerHTML).not.toContain(`posted-${MATURE_R}`);
+  }, 15000);
+
+  it('a mature viewer on a mature domain sees the X-rated image', async () => {
+    const opened = await openDataset({ mx: MATURE_X }, { maxBrowsingLevel: ALL_RATED, viewerBrowsingLevel: ALL_RATED });
+    uninstall = opened.uninstall;
+
+    expect(await screen.findByTestId('dc-item-image-mx', {}, { timeout: 5000 })).toHaveAttribute('src', gridUrl(MATURE_X));
+  }, 15000);
+
+  it('the Upload tab says the upload is shared with the dataset viewers once scanned, and not posted', async () => {
     const user = userEvent.setup();
+    const opened = await openDataset({}, {});
+    uninstall = opened.uninstall;
+
+    await user.click(await screen.findByTestId('dc-add-image'));
+    await user.click(screen.getByTestId('dc-contribute-tab-upload'));
+    expect(screen.getByTestId('dc-contribute-upload-note').textContent?.replace(/\s+/g, ' ').trim()).toBe(
+      "Your upload is not posted on Civitai. It is shared with this dataset's viewers once Civitai has scanned it.",
+    );
+  }, 15000);
+});
+
+describe('"Save #N" on posted images', () => {
+  let uninstall: (() => void) | undefined;
+  afterEach(() => {
+    uninstall?.();
+    uninstall = undefined;
+  });
+
+  const items: DatasetItem[] = [
+    { itemId: 'a', contributorId: 'alice', imageUrl: `https://civitai.com/images/${POSTED_A}`, imageId: POSTED_A, caption: 'front', netVotes: 3 },
+    { itemId: 'x', contributorId: 'bob', imageUrl: `https://civitai.com/images/${MATURE_X}`, imageId: MATURE_X, caption: 'profile', netVotes: 1 },
+  ];
+
+  function renderTrain(host: MockMoneyHostOptions) {
     stubCatalog();
     const outbound: Array<{ type: string; payload?: unknown }> = [];
     uninstall = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       gatedImages: [],
       onOutbound: (message) => outbound.push(message as { type: string; payload?: unknown }),
+      ...host,
     });
-    const items: DatasetItem[] = [
-      { itemId: 'a', contributorId: 'alice', imageUrl: `https://civitai.com/images/${POSTED_A}`, imageId: POSTED_A, caption: 'front', netVotes: 3 },
-      { itemId: 'b', contributorId: 'bob', imageUrl: `https://civitai.com/images/${POSTED_B}`, imageId: POSTED_B, caption: 'profile', netVotes: 1 },
-    ];
     render(<TrainFlow initialItems={items} datasetId="ds-posted" trainerId="dev" allowLocalUploads={false} />);
+    return outbound;
+  }
+
+  it('saves a posted image by its full-size catalog original, not by id through the gated read', async () => {
+    const user = userEvent.setup();
+    const outbound = renderTrain({});
     await screen.findByTestId('dc-train');
 
     // The catalog read settles before the click, or the save could only go by id.
@@ -123,8 +209,27 @@ describe('posted images contributed to a dataset', () => {
 
     await waitFor(() => expect(outbound.some((m) => m.type === 'SAVE_IMAGE')).toBe(true));
     const save = outbound.find((m) => m.type === 'SAVE_IMAGE')!.payload as Record<string, unknown>;
-    expect(save.url).toBe(catalogUrl(POSTED_A));
+    expect(save.url).toBe(originalUrl(POSTED_A));
     expect(save).not.toHaveProperty('imageId');
     expect(save.filename).toBe('open-datasets-01');
+  }, 15000);
+
+  it('never saves an image hidden from this viewer by its catalog url', async () => {
+    const user = userEvent.setup();
+    const outbound = renderTrain({ maxBrowsingLevel: ALL_RATED, viewerBrowsingLevel: PG });
+    await screen.findByTestId('dc-train');
+
+    // The PG image resolving proves the catalog read has settled for both.
+    await waitFor(() => expect(screen.getByTestId('dc-train-save-a')).toHaveAttribute('data-save-by', 'url'), {
+      timeout: 5000,
+    });
+    const hidden = screen.getByTestId('dc-train-save-x');
+    expect(hidden).toHaveAttribute('data-save-by', 'id');
+    await user.click(hidden);
+
+    await waitFor(() => expect(outbound.some((m) => m.type === 'SAVE_IMAGE')).toBe(true));
+    const save = outbound.find((m) => m.type === 'SAVE_IMAGE')!.payload as Record<string, unknown>;
+    expect(save).not.toHaveProperty('url');
+    expect(save.imageId).toBe(MATURE_X);
   }, 15000);
 });

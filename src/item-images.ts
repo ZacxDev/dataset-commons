@@ -9,27 +9,35 @@
  * read as "still being rated" and "Save #N" failed with "image is not
  * available", for every viewer, the owner included.
  *
- * Two reads, each scoped by the server, never by this app:
+ * Two reads, run concurrently:
  *
- * 1. The block image CATALOG, `GET /api/v1/blocks/images?ids=…`: public posted
- *    images, clamped server-side to the block token's maturity ceiling. A posted
- *    item resolves here.
- * 2. The gated read, for whatever the catalog did not return: this app's own
- *    unposted outputs, including the viewer's own not-yet-rated ones and the
- *    `hidden` placeholder state.
+ * 1. The gated read: this app's own unposted outputs, already clamped by the
+ *    host to the VIEWER's browsing level, including the viewer's own
+ *    not-yet-rated ones and the `hidden` placeholder state. Its answer wins.
+ * 2. The block image CATALOG, `GET /api/v1/blocks/images?ids=…&type=image`:
+ *    public posted images. 🔴 The server clamps it to the DOMAIN ceiling only,
+ *    not to the viewer's own level, so this module applies the viewer's
+ *    ceiling itself ({@link viewerImageCeiling}) before any catalog url reaches
+ *    the screen or a save: a viewer with mature content off on a mature domain
+ *    must not be shown a mature contribution.
  *
- * Each read fails on its own: a catalog outage still leaves the gated read's
- * answer, and the reverse. An id neither read returns stays unresolved. That
- * covers an image that is unposted and not this app's (a bare upload), a
- * private post, or one above the viewer's ceiling; the two reads cannot tell
- * these apart.
+ * Each read fails on its own, and the catalog read has a deadline, so a stalled
+ * catalog never holds back the gated answer for long. An id neither read
+ * returns stays unresolved. That covers an image that is unposted and not this
+ * app's (a bare upload), a private post, or (when the viewer's level is
+ * unknown) one above PG13; the reads cannot tell these apart.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
-import { useBlockToken, useGatedImages, useHostOrigin } from '@civitai/blocks-react';
+import { getTransport, useBlockToken, useGatedImages, useHostOrigin } from '@civitai/blocks-react';
 import { initialize, type AppClient } from '@civitai/sdk';
-import type { BlockGatedImage } from '@civitai/app-sdk/blocks';
+import {
+  SFW_LEVELS,
+  effectiveBrowsingCeiling,
+  isLevelAllowed,
+  type BlockGatedImage,
+} from '@civitai/app-sdk/blocks';
 
 import { apiBaseUrl } from './doc-storage.js';
 
@@ -39,28 +47,95 @@ export const CATALOG_IDS_MAX = 100;
 /** The block catalog route, relative to `<origin>/api/v1`. */
 export const CATALOG_IMAGES_PATH = 'blocks/images';
 
+/** How long the catalog read may take before it counts as having returned nothing. */
+export const CATALOG_DEADLINE_MS = 8000;
+
+/** The grid width, the same one the host's gated read sizes its urls to. */
+export const GRID_IMAGE_EDGE_WIDTH = 1200;
+
+/** A resolved item image. `saveUrl` is the full-size original, when it differs from the grid `url`. */
+export type ItemImage = BlockGatedImage & { saveUrl?: string };
+
 /** Fetch one catalog page for at most {@link CATALOG_IDS_MAX} ids; resolves with the raw JSON body. */
-export type CatalogImagesFetch = (imageIds: number[]) => Promise<unknown>;
+export type CatalogImagesFetch = (imageIds: number[], signal?: AbortSignal) => Promise<unknown>;
 
 /** The gated read (`useGatedImages().getImages`). */
 export type GatedImagesFetch = (imageIds: number[]) => Promise<BlockGatedImage[]>;
+
+/**
+ * The ceiling a catalog image is checked against. `viewerKnown` is false when
+ * the host sent no per-viewer level: the mask is then SFW only (PG, PG13),
+ * never the domain ceiling, because the domain alone is wider than some viewers.
+ */
+export interface ViewerImageCeiling {
+  mask: number;
+  viewerKnown: boolean;
+}
+
+/** From the `BLOCK_INIT` maturity fields: domain ceiling narrowed to the viewer, or SFW when the viewer's level is absent. */
+export function viewerImageCeiling(snapshot: {
+  maxBrowsingLevel?: number;
+  effectiveBrowsingLevel?: number;
+}): ViewerImageCeiling {
+  if (snapshot.effectiveBrowsingLevel === undefined || snapshot.effectiveBrowsingLevel === null) {
+    return { mask: SFW_LEVELS, viewerKnown: false };
+  }
+  return {
+    mask: effectiveBrowsingCeiling(snapshot.maxBrowsingLevel, snapshot.effectiveBrowsingLevel),
+    viewerKnown: true,
+  };
+}
+
+/** Before `BLOCK_INIT`, nothing beyond SFW. */
+const UNKNOWN_CEILING: ViewerImageCeiling = { mask: SFW_LEVELS, viewerKnown: false };
 
 const isPositiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
 const dimension = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
 
 /**
- * The catalog body's `items` as visible images. Only an item with a positive
- * integer `id` and an `https:` `url` is kept, and only when its id was ASKED
- * for, so an unexpected reply cannot add a picture to an item it does not name.
+ * The grid form of an image-CDN original: `<base>/<key>/original=true/<name>`
+ * becomes `<base>/<key>/width=1200/<name>`. Any other url passes through.
  */
-export function parseCatalogImages(body: unknown, asked: ReadonlySet<number>): BlockGatedImage[] {
+export function gridEdgeUrl(original: string): string {
+  let url: URL;
+  try {
+    url = new URL(original);
+  } catch {
+    return original;
+  }
+  const segments = url.pathname.split('/');
+  if (segments.length < 3 || segments[segments.length - 2] !== 'original=true') return original;
+  segments[segments.length - 2] = `width=${GRID_IMAGE_EDGE_WIDTH}`;
+  url.pathname = segments.join('/');
+  return url.toString();
+}
+
+/**
+ * The catalog body's `items` checked against the viewer's ceiling. Kept only:
+ * an asked-for positive integer `id`, `type` exactly `image`, an `https:` url.
+ * A `browsingLevel` within the ceiling makes the image visible; outside it, the
+ * image is `hidden` when the viewer's level is known and dropped otherwise. A
+ * missing or malformed `browsingLevel` is outside every ceiling.
+ */
+export function parseCatalogImages(
+  body: unknown,
+  asked: ReadonlySet<number>,
+  ceiling: ViewerImageCeiling,
+): ItemImage[] {
   const items = (body as { items?: unknown } | null | undefined)?.items;
   if (!Array.isArray(items)) return [];
-  const out: BlockGatedImage[] = [];
+  const out: ItemImage[] = [];
   for (const raw of items) {
-    const item = raw as { id?: unknown; url?: unknown; width?: unknown; height?: unknown } | null;
+    const item = raw as {
+      id?: unknown;
+      url?: unknown;
+      type?: unknown;
+      browsingLevel?: unknown;
+      width?: unknown;
+      height?: unknown;
+    } | null;
     if (!item || !isPositiveInt(item.id) || !asked.has(item.id)) continue;
-    if (typeof item.url !== 'string') continue;
+    if (item.type !== 'image' || typeof item.url !== 'string') continue;
     let url: URL;
     try {
       url = new URL(item.url);
@@ -68,10 +143,16 @@ export function parseCatalogImages(body: unknown, asked: ReadonlySet<number>): B
       continue;
     }
     if (url.protocol !== 'https:') continue;
+    if (!isLevelAllowed(item.browsingLevel as number, ceiling.mask)) {
+      if (ceiling.viewerKnown) out.push({ imageId: item.id, status: 'hidden' });
+      continue;
+    }
     out.push({
       imageId: item.id,
       status: 'visible',
-      url: item.url,
+      nsfwLevel: item.browsingLevel as number,
+      url: gridEdgeUrl(item.url),
+      saveUrl: item.url,
       width: dimension(item.width),
       height: dimension(item.height),
     });
@@ -91,41 +172,69 @@ export function normalizeImageIds(imageIds: readonly number[]): number[] {
   return out;
 }
 
+/** One catalog chunk, or nothing once it fails or passes the deadline (the request is then aborted). */
+function catalogChunk(
+  catalog: CatalogImagesFetch,
+  chunk: number[],
+  ceiling: ViewerImageCeiling,
+  deadlineMs: number,
+): Promise<ItemImage[]> {
+  const controller = new AbortController();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      controller.abort();
+      resolve([]);
+    }, deadlineMs);
+    catalog(chunk, controller.signal).then(
+      (body) => {
+        clearTimeout(timer);
+        resolve(parseCatalogImages(body, new Set(chunk), ceiling));
+      },
+      () => {
+        clearTimeout(timer);
+        resolve([]);
+      },
+    );
+  });
+}
+
 /**
- * Resolve item image ids to displayable images: catalog first (in chunks of
- * {@link CATALOG_IDS_MAX}), then the gated read for the ids the catalog did not
- * return. A failed read contributes nothing and never discards the other's.
+ * Resolve item image ids: the gated read and the catalog (in chunks of
+ * {@link CATALOG_IDS_MAX}, each under a deadline) run concurrently. The gated
+ * answer for an id wins; the catalog fills the rest. A failed read contributes
+ * nothing and never discards the other's.
  */
 export async function resolveItemImages(
   imageIds: readonly number[],
-  deps: { catalog: CatalogImagesFetch | null; gated: GatedImagesFetch },
-): Promise<Map<number, BlockGatedImage>> {
+  deps: {
+    catalog: CatalogImagesFetch | null;
+    gated: GatedImagesFetch;
+    ceiling: ViewerImageCeiling;
+    deadlineMs?: number;
+  },
+): Promise<Map<number, ItemImage>> {
   const ids = normalizeImageIds(imageIds);
-  const resolved = new Map<number, BlockGatedImage>();
+  const resolved = new Map<number, ItemImage>();
   if (ids.length === 0) return resolved;
+  const asked = new Set(ids);
+  const deadlineMs = deps.deadlineMs ?? CATALOG_DEADLINE_MS;
 
-  if (deps.catalog) {
-    const catalog = deps.catalog;
-    const chunks: number[][] = [];
-    for (let i = 0; i < ids.length; i += CATALOG_IDS_MAX) chunks.push(ids.slice(i, i + CATALOG_IDS_MAX));
-    const pages = await Promise.all(
-      chunks.map((chunk) =>
-        catalog(chunk).then(
-          (body) => parseCatalogImages(body, new Set(chunk)),
-          () => [] as BlockGatedImage[],
+  const gatedRead = deps.gated(ids).catch(() => [] as BlockGatedImage[]);
+  const catalog = deps.catalog;
+  const catalogRead = catalog
+    ? Promise.all(
+        Array.from({ length: Math.ceil(ids.length / CATALOG_IDS_MAX) }, (_, i) =>
+          catalogChunk(catalog, ids.slice(i * CATALOG_IDS_MAX, (i + 1) * CATALOG_IDS_MAX), deps.ceiling, deadlineMs),
         ),
-      ),
-    );
-    for (const page of pages) for (const image of page) resolved.set(image.imageId, image);
-  }
+      ).then((pages) => pages.flat())
+    : Promise.resolve([] as ItemImage[]);
 
-  const missing = ids.filter((id) => !resolved.has(id));
-  if (missing.length > 0) {
-    const asked = new Set(missing);
-    const gated = await deps.gated(missing).catch(() => [] as BlockGatedImage[]);
-    for (const image of gated) {
-      if (asked.has(image.imageId) && !resolved.has(image.imageId)) resolved.set(image.imageId, image);
-    }
+  const [gated, fromCatalog] = await Promise.all([gatedRead, catalogRead]);
+  for (const image of gated) {
+    if (asked.has(image.imageId)) resolved.set(image.imageId, image);
+  }
+  for (const image of fromCatalog) {
+    if (!resolved.has(image.imageId)) resolved.set(image.imageId, image);
   }
   return resolved;
 }
@@ -151,10 +260,12 @@ function createCatalogFetch(deps: {
     }
     return client;
   };
-  return async (imageIds) =>
+  return async (imageIds, signal) =>
     (await app()).site.get(CATALOG_IMAGES_PATH, {
-      // Comma-joined, the form the route parses; `limit` so one page holds every id asked for.
-      query: { ids: imageIds.join(','), limit: imageIds.length },
+      // Comma-joined, the form the route parses; `limit` so one page holds every
+      // id asked for; images only, so a video never lands in an <img>.
+      query: { ids: imageIds.join(','), limit: imageIds.length, type: 'image' },
+      ...(signal ? { signal } : {}),
     });
 }
 
@@ -179,17 +290,42 @@ export function useCatalogImagesFetch(): CatalogImagesFetch | null {
 }
 
 /**
+ * The viewer's catalog ceiling, read from the transport snapshot's raw
+ * `BLOCK_INIT` maturity fields. Not `useDomainMaturity()`: that falls back to
+ * the DOMAIN ceiling when the host sends no per-viewer level, which is wider
+ * than this module may show.
+ */
+export function useViewerImageCeiling(): ViewerImageCeiling {
+  const transport = getTransport();
+  const max = useSyncExternalStore(
+    (cb) => transport.subscribe(cb),
+    () => transport.getSnapshot().maxBrowsingLevel,
+    () => undefined,
+  );
+  const effective = useSyncExternalStore(
+    (cb) => transport.subscribe(cb),
+    () => transport.getSnapshot().effectiveBrowsingLevel,
+    () => undefined,
+  );
+  return useMemo(
+    () => (max === undefined ? UNKNOWN_CEILING : viewerImageCeiling({ maxBrowsingLevel: max, effectiveBrowsingLevel: effective })),
+    [max, effective],
+  );
+}
+
+/**
  * The resolved images for `imageIds`, keyed by image id. Empty until the reads
  * settle; an id absent from the map is unresolved (see the module note).
  */
-export function useItemImages(imageIds: readonly number[]): ReadonlyMap<number, BlockGatedImage> {
+export function useItemImages(imageIds: readonly number[]): ReadonlyMap<number, ItemImage> {
   const { getImages } = useGatedImages();
   const catalog = useCatalogImagesFetch();
+  const ceiling = useViewerImageCeiling();
   const key = normalizeImageIds(imageIds).join(',');
-  const [images, setImages] = useState<ReadonlyMap<number, BlockGatedImage>>(new Map());
+  const [images, setImages] = useState<ReadonlyMap<number, ItemImage>>(new Map());
   const resolve = useCallback(
-    (ids: number[]) => resolveItemImages(ids, { catalog, gated: getImages }),
-    [catalog, getImages],
+    (ids: number[]) => resolveItemImages(ids, { catalog, gated: getImages, ceiling }),
+    [catalog, getImages, ceiling],
   );
   useEffect(() => {
     let alive = true;
@@ -214,18 +350,19 @@ export function useItemImages(imageIds: readonly number[]): ReadonlyMap<number, 
 export type ItemSaveTarget = { url: string } | { imageId: number };
 
 /**
- * How "Save #N" fetches an item: by the resolved image's url when one of the
- * reads above returned it visible. Saving by `imageId` goes through the host's
- * gated read, which refuses every posted image (see the module note).
+ * How "Save #N" fetches an item: by the resolved image's full-size url when a
+ * read above returned it VISIBLE to this viewer. Saving by `imageId` goes
+ * through the host's gated read, which refuses every posted image (see the
+ * module note), so a hidden or unresolved image stays unsaveable here.
  * Otherwise by id, and last by the stored url.
  */
 export function saveTargetForItem(
   item: { imageId?: number; imageUrl: string },
-  resolved: ReadonlyMap<number, BlockGatedImage>,
+  resolved: ReadonlyMap<number, ItemImage>,
 ): ItemSaveTarget {
   if (item.imageId != null) {
     const image = resolved.get(item.imageId);
-    if (image?.status === 'visible') return { url: image.url };
+    if (image?.status === 'visible') return { url: image.saveUrl ?? image.url };
     return { imageId: item.imageId };
   }
   return { url: item.imageUrl };

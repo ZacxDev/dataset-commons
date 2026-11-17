@@ -1304,6 +1304,11 @@ function ContributeForm(props: {
           <Button size="sm" variant="light" onClick={() => void upload()} data-testid="dc-contribute-upload">
             Upload an image
           </Button>
+          <span style={hintStyle} data-testid="dc-contribute-upload-note">
+            {' '}
+            Your upload is not posted on Civitai. It is shared with this dataset&apos;s viewers once Civitai has
+            scanned it.
+          </span>
           {uploaded && (
             <span style={hintStyle} data-testid="dc-contribute-uploaded">
               {' '}
