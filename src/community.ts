@@ -144,7 +144,6 @@ export interface FoldedCommunity {
   items: DatasetItemRecord[];
   votes: VoteRecord[];
   snapshots: DatasetSnapshot[];
-  snapshotStorageKeys: ReadonlyMap<string, string>;
   loras: LoraRecord[];
   ledgerEvents: LedgerEvent[];
   removals: ItemRemovalRecord[];
@@ -285,8 +284,7 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
   const datasets: DatasetRecord[] = [];
   const items: DatasetItemRecord[] = [];
   const votes: VoteRecord[] = [];
-  const snapshots: DatasetSnapshot[] = [];
-  const snapshotStorageKeys = new Map<string, string>();
+  const snapshotsById = new Map<string, { snapshot: DatasetSnapshot; storedAt: string; key: string }>();
   const loras: LoraRecord[] = [];
   const ledgerEvents: LedgerEvent[] = [];
   const removals: ItemRemovalRecord[] = [];
@@ -349,9 +347,15 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
     } else if (entry.collection === 'snapshots') {
       const snapshot = parseSnapshot(data);
       if (!snapshot) continue;
-      snapshots.push(snapshot);
-      const prev = snapshotStorageKeys.get(snapshot.snapshotId);
-      if (!prev || entry.key > prev) snapshotStorageKeys.set(snapshot.snapshotId, entry.key);
+      // A frozen snapshot never changes, so the FIRST document stored under an
+      // id is the snapshot. Ordered by the store's own creation time and key,
+      // never by the writer's `createdAt`: a later document under a published
+      // id cannot replace the split every ledger event is credited against.
+      const storedAt = iso(entry.createdAt);
+      const prev = snapshotsById.get(snapshot.snapshotId);
+      if (!prev || storedAt < prev.storedAt || (storedAt === prev.storedAt && entry.key < prev.key)) {
+        snapshotsById.set(snapshot.snapshotId, { snapshot, storedAt, key: entry.key });
+      }
     } else if (entry.collection === 'loras') {
       const loraId = str(data.loraId);
       const trainerId = num(data.trainerId);
@@ -376,19 +380,28 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
         updatedAt: iso(data.updatedAt) || at,
       });
     } else if (entry.collection === 'ledger') {
-      if (typeof data.eventId !== 'string' || typeof data.sourceRef !== 'string') continue;
-      // An unknown stored dataSource is dropped; a missing one reads as 'snapshot'.
-      const { dataSource: rawSource, ...rest } = data;
-      const dataSource = parseDataSource(rawSource);
-      const event = { ...rest, ...(dataSource ? { dataSource } : {}) } as unknown as LedgerEvent;
-      if (
-        event.eventType !== 'training' &&
-        event.eventType !== 'generation_in_app' &&
-        event.eventType !== 'generation_onsite'
-      ) {
+      const eventId = str(data.eventId);
+      const sourceRef = str(data.sourceRef);
+      const loraId = str(data.loraId);
+      const snapshotId = str(data.snapshotId);
+      const grossBuzz = num(data.grossBuzz);
+      const eventType = data.eventType;
+      if (!eventId || !sourceRef || !loraId || !snapshotId || grossBuzz == null || grossBuzz < 0) continue;
+      if (eventType !== 'training' && eventType !== 'generation_in_app' && eventType !== 'generation_onsite') {
         continue;
       }
-      ledgerEvents.push(event);
+      // An unknown stored dataSource is dropped; a missing one reads as 'snapshot'.
+      const dataSource = parseDataSource(data.dataSource);
+      ledgerEvents.push({
+        eventId,
+        loraId,
+        snapshotId,
+        eventType,
+        grossBuzz,
+        sourceRef,
+        createdAt: iso(data.createdAt) || at,
+        ...(dataSource ? { dataSource } : {}),
+      });
     } else if (entry.collection === 'removals') {
       const itemId = str(data.itemId);
       const actorId = num(data.actorId);
@@ -416,8 +429,7 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
     // One tally per dataset/item DOCUMENT; duplicates of one id (a legacy double
     // write) keep their own marks and `tallyVotes` sums them.
     votes,
-    snapshots: latestBy(snapshots, (s) => s.snapshotId, (s) => s.createdAt, (s) => s.snapshotId),
-    snapshotStorageKeys,
+    snapshots: [...snapshotsById.values()].map((v) => v.snapshot),
     loras: latestBy(loras, (l) => l.loraId, (l) => l.updatedAt, (l) => l.storageKey ?? ''),
     ledgerEvents: dedupedLedger,
     removals: latestBy(removals, (r) => r.itemId, (r) => r.createdAt, (r) => r.storageKey ?? ''),

@@ -16,7 +16,7 @@ import {
 import { seedCommunity } from './fake-doc-storage.js';
 import { installMockMoneyHost } from './mock-buzz.js';
 import { testDocStore } from './test-doc-store.js';
-import { deriveContributorCredits } from './training.js';
+import { deriveContributorCredits, freezeSnapshot } from './training.js';
 
 // A shared `snapshots` document is written by its author and read by everyone,
 // and a client can write one straight to the store. These pin that the fold
@@ -104,6 +104,66 @@ describe('folding a stored snapshot', () => {
     'datasetId missing': { ...GOOD, datasetId: undefined },
     'items not an array': { ...GOOD, items: { a: GOOD.items[0] } },
   };
+
+  it('keeps every snapshot freezeSnapshot writes: owner override, manual exclusion, net-negative', () => {
+    const frozen = freezeSnapshot(
+      'ds1',
+      'user:2',
+      [
+        { itemId: 'up', contributorId: 'user:11', imageUrl: '', caption: 'a', netVotes: 3 },
+        { itemId: 'override', contributorId: 'user:12', imageUrl: '', caption: 'b', netVotes: -2 },
+        { itemId: 'manual', contributorId: 'user:13', imageUrl: '', caption: 'c', netVotes: 4 },
+        { itemId: 'negative', contributorId: 'user:14', imageUrl: '', caption: 'd', netVotes: -1, imageId: 77 },
+      ],
+      { snapshotId: 'snap_frozen', now: '2026-11-18T00:00:00.000Z', ownerOverrides: ['override'], manualExclusions: ['manual'] },
+    );
+    const folded = foldSharedEntries([snapshotEntry(JSON.parse(JSON.stringify(frozen)))]);
+    expect(folded.snapshots).toEqual([frozen]);
+    expect(folded.snapshots[0]!.totalWeight).toBe(4);
+  });
+
+  it('a later document under a published snapshot id never replaces the first one', () => {
+    const hijack = {
+      ...GOOD,
+      createdAt: '2027-01-01T00:00:00.000Z',
+      items: [{ itemId: 'z', contributorId: 'user:666', imageUrl: '', caption: 'x', frozenNetVotes: 9, weight: 9, included: true }],
+    };
+    const folded = foldSharedEntries([
+      snapshotEntry(GOOD),
+      { ...snapshotEntry(hijack), key: 'k-hijack', createdAt: '2026-11-19T00:00:00.000Z' },
+    ]);
+    expect(folded.snapshots.map((s) => s.items.map((i) => i.contributorId))).toEqual([['user:11', 'user:12', 'user:13']]);
+    // Order of arrival does not matter either.
+    const reversed = foldSharedEntries([
+      { ...snapshotEntry(hijack), key: 'k-hijack', createdAt: '2026-11-19T00:00:00.000Z' },
+      snapshotEntry(GOOD),
+    ]);
+    expect(reversed.snapshots.map((s) => s.items[0]!.contributorId)).toEqual(['user:11']);
+  });
+
+  it('ignores a ledger event whose grossBuzz is not a non-negative number, or whose ids are missing', () => {
+    const ledgerEntry = (data: unknown, key: string): SharedEntryLike => ({ ...snapshotEntry(data), collection: 'ledger', key });
+    const good = {
+      eventId: 'e1',
+      loraId: 'lora_1',
+      snapshotId: GOOD.snapshotId,
+      eventType: 'training',
+      grossBuzz: 600,
+      sourceRef: 'wf1',
+      createdAt: '2026-11-18T01:00:00.000Z',
+    };
+    const folded = foldSharedEntries([
+      ledgerEntry(good, 'l1'),
+      ledgerEntry({ ...good, eventId: 'e2', sourceRef: 'wf2', grossBuzz: '600' }, 'l2'),
+      ledgerEntry({ ...good, eventId: 'e3', sourceRef: 'wf3', grossBuzz: -5 }, 'l3'),
+      ledgerEntry({ ...good, eventId: 'e4', sourceRef: 'wf4', snapshotId: 7 }, 'l4'),
+      ledgerEntry({ ...good, eventId: 'e5', sourceRef: 'wf5', loraId: undefined }, 'l5'),
+      ledgerEntry({ ...good, eventId: 'e6', sourceRef: 'wf6', createdAt: 12345 }, 'l6'),
+    ]);
+    expect(folded.ledgerEvents.map((e) => e.eventId).sort()).toEqual(['e1', 'e6']);
+    // A non-string createdAt falls back to the store's own time instead of breaking the sort.
+    expect(folded.ledgerEvents.find((e) => e.eventId === 'e6')!.createdAt).toBe('2026-11-18T00:00:00.000Z');
+  });
 
   for (const [name, data] of Object.entries(MALFORMED)) {
     it(`ignores a snapshot with ${name}`, () => {

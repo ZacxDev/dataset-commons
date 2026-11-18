@@ -1724,8 +1724,9 @@ function LoraDetail(props: {
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const creditedRef = useRef<string | null>(null);
-  // Leaving the LoRA screen mid-poll stops the loop: no state writes and no
-  // ledger write from a screen that is gone (TrainFlow's pollCancelRef pattern).
+  // Leaving the LoRA screen mid-poll: the run is still polled to the end and its
+  // tracked-credit event still written (it was charged), but no state write
+  // reaches this unmounted screen. See onConfirm.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -1785,19 +1786,21 @@ function LoraDetail(props: {
   const onConfirm = async () => {
     const body = buildBody();
     if (!body || quote == null || insufficient) return;
+    // After the screen unmounts the run keeps being polled to the end — it was
+    // charged, and its tracked-credit event belongs to Community (still
+    // mounted) — but nothing writes THIS screen's state any more.
+    const live = () => mountedRef.current;
     setPhase('submitting');
     setError(null);
     try {
       let snap = await submit(body);
-      if (!mountedRef.current) return;
-      setPhase('polling');
+      if (live()) setPhase('polling');
       for (let attempt = 0; attempt < 60 && (snap.status === 'pending' || snap.status === 'processing'); attempt++) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        if (!mountedRef.current) return;
         snap = await poll(snap.workflowId);
-        if (!mountedRef.current) return;
       }
       if (snap.status !== 'succeeded') {
+        if (!live()) return;
         setError(
           snap.status === 'failed' || snap.status === 'expired' || snap.status === 'canceled'
             ? `That generation ${snap.status}. Check the run before assuming any charge.`
@@ -1806,9 +1809,10 @@ function LoraDetail(props: {
         setPhase('idle');
         return;
       }
-      setImageUrl(firstImageUrl(snap));
-      await refetchBalance();
-      if (!mountedRef.current) return;
+      if (live()) {
+        setImageUrl(firstImageUrl(snap));
+        await refetchBalance();
+      }
       const gross = snap.cost?.total;
       if (gross != null && gross > 0 && creditedRef.current !== snap.workflowId) {
         creditedRef.current = snap.workflowId;
@@ -1823,9 +1827,9 @@ function LoraDetail(props: {
       } else if (gross == null) {
         props.onNotice('The generation finished without a reported cost, so no tracked credit was recorded for it.');
       }
-      setPhase('idle');
+      if (live()) setPhase('idle');
     } catch {
-      if (!mountedRef.current) return;
+      if (!live()) return;
       setError('That generation did not submit cleanly. If no run appears above, no Buzz was charged.');
       setPhase('idle');
     }
