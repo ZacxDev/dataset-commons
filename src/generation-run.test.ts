@@ -1,7 +1,7 @@
 import type { BlockWorkflowSnapshot } from '@civitai/app-sdk/blocks';
 import { describe, expect, it } from 'vitest';
 
-import { runGenerationToEnd, type GenerationRunDeps } from './generation.js';
+import { pollGenerationToEnd, runGenerationToEnd, type GenerationRunDeps } from './generation.js';
 
 // runGenerationToEnd: a submit failure and a lost poll are different outcomes.
 // Every script below is literal; the clock is virtual (sleep advances it).
@@ -107,5 +107,28 @@ describe('runGenerationToEnd', () => {
     const d = deps(snap('wf1', 'processing'), [snap('wf1', 'processing')]);
     expect(await runGenerationToEnd('body', d)).toEqual({ kind: 'still-running', workflowId: 'wf1' });
     expect(d.polls).toBe(60);
+  });
+
+  it('resuming a run by id polls before concluding anything, at once, and can then succeed', async () => {
+    const done = snap('wf1', 'succeeded');
+    const d = deps(snap('unused', 'pending'), [done]);
+    expect(await pollGenerationToEnd('wf1', null, d)).toEqual({ kind: 'succeeded', snapshot: done });
+    expect(d.sleeps).toEqual([0]);
+    expect(d.polls).toBe(1);
+  });
+
+  it('resuming a run that still answers with the placeholder backs off and reports lost contact again', async () => {
+    const d = deps(snap('unused', 'pending'), [FAILURE_PLACEHOLDER]);
+    expect(await pollGenerationToEnd('wf1', null, d)).toEqual({
+      kind: 'lost-contact',
+      workflowId: 'wf1',
+      detail: 'block token expired',
+    });
+  });
+
+  it('never polls a sentinel id', async () => {
+    const d = deps(snap('unused', 'pending'), [snap('whatif', 'succeeded')]);
+    expect(await pollGenerationToEnd('whatif', null, d)).toEqual({ kind: 'unconfirmed' });
+    expect(d.polls).toBe(0);
   });
 });

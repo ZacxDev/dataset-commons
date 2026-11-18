@@ -61,7 +61,16 @@ import {
   saveViewerIndex,
   type StorageAccess,
 } from './community-storage.js';
-import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope, runGenerationToEnd } from './generation.js';
+import {
+  buildWorkflowBody,
+  firstImageUrl,
+  formatCost,
+  hasBudgetedScope,
+  pollGenerationToEnd,
+  runGenerationToEnd,
+  type GenerationPollDeps,
+  type GenerationRunOutcome,
+} from './generation.js';
 import { useItemImages } from './item-images.js';
 import { imageRefDisplay } from './civitai-url.js';
 import { DEFAULT_CHECKPOINT, loraOption } from './models.js';
@@ -205,19 +214,27 @@ export function Community() {
   }, [requestSignIn, viewerId]);
 
   const writeFailed = useCallback(
-    (error: unknown, busy: string | null) => {
+    (error: unknown, busy: string | null, partial = false) => {
       if (busy) setBusyKey((cur) => (cur === busy ? null : cur));
       const access = classifyStorageError(error);
       if (access === 'not-permitted') {
         setNoticeDetail(null);
         setFailedRetry(null);
-        setNotice('Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.');
+        setNotice(
+          partial
+            ? 'That stopped partway: some of it was saved, and community storage access is not granted for the rest. Confirm it in the Civitai dialog, then try again to finish.'
+            : 'Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.',
+        );
         if (isConsentRefusal(error)) requestConsent({ scopes: [PUBLISH_SCOPE] });
       } else {
         // Surface the store's actual error (walks report it verbatim) and
         // keep the failed write one tap away — never a silent dead banner.
         setNoticeDetail(describeStorageError(error));
-        setNotice('That did not save. Nothing was written — try again in a moment.');
+        setNotice(
+          partial
+            ? 'That stopped partway: some of it was saved before the error. Try again to finish it — the steps already done are skipped.'
+            : 'That did not save. Nothing was written — try again in a moment.',
+        );
       }
     },
     [requestConsent],
@@ -261,9 +278,19 @@ export function Community() {
     [ensurePublishConsent],
   );
 
-  /** Run one shared-storage write with sign-in/consent gates and honest failure copy. */
+  /**
+   * Run one shared-storage write with sign-in/consent gates and honest failure
+   * copy. A multi-step write passes `landed`, which says whether any of its
+   * steps reached the store, so a failure partway is never reported as
+   * "nothing was written".
+   */
   const runWrite = useCallback(
-    async (busy: string, fn: () => Promise<void>, successNote?: string): Promise<WriteResult> => {
+    async (
+      busy: string,
+      fn: () => Promise<void>,
+      successNote?: string,
+      landed?: () => boolean,
+    ): Promise<WriteResult> => {
       if (!requireViewer()) return { ok: false, reason: 'Sign in to save.' };
       // Serialized: this write (and its refresh) finishes before the next
       // one starts, so rapid contribute/vote sequences can't overlap store
@@ -284,10 +311,10 @@ export function Community() {
           if (successNote) setNotice(successNote);
           return { ok: true, reason: null };
         } catch (error) {
-          writeFailed(error, busy);
-          // The retry re-runs this same write; queued writes recompute
-          // from the latest folded state when they execute.
-          setFailedRetry({ run: () => runWrite(busy, fn, successNote) });
+          writeFailed(error, busy, landed?.() ?? false);
+          // The retry re-runs this same write (a multi-step write's steps are
+          // idempotent across re-runs; see deleteDataset).
+          setFailedRetry({ run: () => runWrite(busy, fn, successNote, landed) });
           return { ok: false, reason: describeStorageError(error) };
         }
       });
@@ -378,46 +405,76 @@ export function Community() {
         setNotice('Only the dataset owner can delete it.');
         return false;
       }
-      const result = await runWrite(`delete-dataset-${datasetId}`, async () => {
-        const datasetItems = folded.items.filter((item) => item.datasetId === datasetId);
-        // Remove the dataset's visible contents first. The owner's own
-        // entries are withdrawn; another contributor's item gets the same
-        // removal record the detail screen writes, so the fold hides it.
-        for (const item of datasetItems) {
-          if (folded.removals.some((r) => r.itemId === item.itemId)) continue;
-          if (item.contributorId === viewerId && item.storageKey) {
-            const withdrawn = await storeRef.current.remove('items', item.storageKey);
-            if (!withdrawn.deleted) throw new Error('an item record was not withdrawn');
-          } else {
-            await storeRef.current.create(
-              'removals',
-              removalDoc({
-                itemId: item.itemId,
-                datasetId,
-                actorId: viewerId,
-                reason: 'owner-remove',
-                createdAt: new Date().toISOString(),
-              }),
-            );
+      // Each run re-reads the current shared state (below), and a remove the
+      // store answers `deleted: false` ("nothing was there") is the goal
+      // reached, so a delete that stopped partway can be finished, not wedged.
+      // `done` additionally remembers this delete's own landed steps: the
+      // `landed` probe for honest failure copy, and a skip for a retry that
+      // runs before a landed write is visible in the read.
+      const done = new Set<string>();
+      const step = async (key: string, write: () => Promise<void>) => {
+        if (done.has(key)) return;
+        await write();
+        done.add(key);
+      };
+      const removeOwn = async (collection: 'items' | 'loras' | 'datasets', storageKey: string) => {
+        // `deleted: false` means the document is already gone, which is the goal.
+        await storeRef.current.remove(collection, storageKey);
+      };
+      const result = await runWrite(
+        `delete-dataset-${datasetId}`,
+        async () => {
+          // Read the CURRENT shared state on every run — the first attempt, the
+          // consent retry, the banner's Retry, or a fresh Delete after a delete
+          // that stopped partway — so what already landed is seen and skipped.
+          const loaded = await loadSharedEntries(storeRef.current);
+          if (loaded.access !== 'ready') throw new Error('the shared dataset list could not be read');
+          const current = foldSharedEntries(loaded.entries);
+          const datasetItems = current.items.filter((item) => item.datasetId === datasetId);
+          // Remove the dataset's visible contents first. The owner's own
+          // entries are withdrawn; another contributor's item gets the same
+          // removal record the detail screen writes, so the fold hides it.
+          for (const item of datasetItems) {
+            if (current.removals.some((r) => r.itemId === item.itemId)) continue;
+            if (item.contributorId === viewerId && item.storageKey) {
+              const storageKey = item.storageKey;
+              await step(`item:${item.itemId}`, () => removeOwn('items', storageKey));
+            } else {
+              await step(`removal:${item.itemId}`, async () => {
+                await storeRef.current.create(
+                  'removals',
+                  removalDoc({
+                    itemId: item.itemId,
+                    datasetId,
+                    actorId: viewerId,
+                    reason: 'owner-remove',
+                    createdAt: new Date().toISOString(),
+                  }),
+                );
+              });
+            }
           }
-        }
-        // Votes are marks ON the documents: a deleted document takes them with
-        // it, and a removed item no longer folds, so there is nothing to withdraw.
-        // Frozen snapshots are KEPT: they are every credited contributor's
-        // record ("Snapshots I'm in", tracked credit), and deleting the dataset
-        // must not rewrite other accounts' history. Only the viewer's OWN LoRA
-        // links are withdrawn — the store refuses anyone else's (`write: own`).
-        for (const lora of folded.loras.filter((l) => l.datasetId === datasetId && l.trainerId === viewerId)) {
-          if (lora.storageKey) {
-            const withdrawn = await storeRef.current.remove('loras', lora.storageKey);
-            if (!withdrawn.deleted) throw new Error('a LoRA record was not withdrawn');
+          // Votes are marks ON the documents: a deleted document takes them with
+          // it, and a removed item no longer folds, so there is nothing to withdraw.
+          // Frozen snapshots are KEPT: they are every credited contributor's
+          // record ("Snapshots I'm in", tracked credit), and deleting the dataset
+          // must not rewrite other accounts' history. Only the viewer's OWN LoRA
+          // links are withdrawn — the store refuses anyone else's (`write: own`).
+          for (const lora of current.loras.filter((l) => l.datasetId === datasetId && l.trainerId === viewerId)) {
+            const storageKey = lora.storageKey;
+            if (storageKey) await step(`lora:${lora.loraId}`, () => removeOwn('loras', storageKey));
           }
-        }
-        if (!existing.storageKey) throw new Error('dataset record has no storage key to withdraw');
-        const withdrawn = await storeRef.current.remove('datasets', existing.storageKey);
-        if (!withdrawn.deleted) throw new Error('dataset record was not withdrawn');
-        setRoute({ name: 'explore' });
-      }, 'Dataset deleted.');
+          const record = current.datasets.find((d) => d.datasetId === datasetId);
+          // Gone already (an earlier attempt removed it): the delete is done.
+          if (record?.storageKey) {
+            const datasetKey = record.storageKey;
+            await step('dataset', () => removeOwn('datasets', datasetKey));
+          }
+          setRoute({ name: 'explore' });
+        },
+        'Dataset deleted.',
+        () => done.size > 0,
+      );
       return result.ok;
     },
     [folded, runWrite, viewerId],
@@ -1468,6 +1525,9 @@ function DatasetDetail(props: {
   const armOrDelete = useCallback(() => {
     if (deleteArmed) {
       if (disarmTimer.current) clearTimeout(disarmTimer.current);
+      // Fired: disarm, so a further tap (a slow delete, or one that stopped
+      // partway) arms again rather than starting a second delete at once.
+      setDeleteArmed(false);
       props.onDelete();
       return;
     }
@@ -1728,6 +1788,13 @@ function LoraDetail(props: {
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const creditedRef = useRef<string | null>(null);
+  // One run at a time: set synchronously when a submit or a resume starts, so
+  // a second click (Price again, Generate, Check again) cannot start a run
+  // alongside it — the phase state alone updates too late to stop a double tap.
+  const runningRef = useRef(false);
+  /** The run a wait gave up on (lost contact / still running), resumable by its id. */
+  const [pendingRunId, setPendingRunId] = useState<string | null>(null);
+  const inFlight = phase === 'submitting' || phase === 'polling';
   // Leaving the LoRA screen mid-poll: the run is still polled to the end and its
   // tracked-credit event still written (it was charged), but no state write
   // reaches this unmounted screen. See onConfirm.
@@ -1755,7 +1822,7 @@ function LoraDetail(props: {
 
   const doEstimate = useCallback(async () => {
     const body = buildBody();
-    if (!body) return;
+    if (!body || runningRef.current) return;
     setPhase('estimating');
     setError(null);
     try {
@@ -1775,6 +1842,7 @@ function LoraDetail(props: {
   }, [buildBody, estimate]);
 
   const onEstimateClick = () => {
+    if (runningRef.current) return;
     if (!viewer) {
       requestSignIn();
       return;
@@ -1787,26 +1855,21 @@ function LoraDetail(props: {
     void doEstimate();
   };
 
-  const onConfirm = async () => {
-    const body = buildBody();
-    if (!body || quote == null || insufficient) return;
-    // After the screen unmounts the run keeps being polled to the end — it was
-    // charged, and its tracked-credit event belongs to Community (still
-    // mounted) — but nothing writes THIS screen's state any more.
+  const pollDeps: GenerationPollDeps = {
+    poll,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    now: () => Date.now(),
+    visible: () => typeof document === 'undefined' || !document.hidden,
+  };
+
+  /**
+   * Show a run's outcome and record its tracked credit. After the screen
+   * unmounts the run is still polled to the end and credited (it was charged,
+   * and the ledger belongs to Community, still mounted), but nothing writes
+   * THIS screen's state any more.
+   */
+  const finishRun = async (outcome: GenerationRunOutcome) => {
     const live = () => mountedRef.current;
-    setPhase('submitting');
-    setError(null);
-    // A submit failure and a lost poll are different outcomes: see runGenerationToEnd.
-    const outcome = await runGenerationToEnd(body, {
-      submit,
-      poll,
-      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-      now: () => Date.now(),
-      visible: () => typeof document === 'undefined' || !document.hidden,
-      onSubmitted: () => {
-        if (live()) setPhase('polling');
-      },
-    });
     if (outcome.kind !== 'succeeded') {
       if (!live()) return;
       // Copy is chosen by outcome only; the host's own error text is
@@ -1818,10 +1881,12 @@ function LoraDetail(props: {
           "Civitai couldn't confirm whether that generation started, so its charge status is unknown. Check your Buzz history before trying again.",
         );
       } else if (outcome.kind === 'lost-contact') {
+        setPendingRunId(outcome.workflowId);
         setError(
-          'Lost contact with Civitai while the generation ran, so its charge status is unknown. Check your Buzz history before assuming it was or was not charged.',
+          'Lost contact with Civitai while the generation ran, so its charge status is unknown. Check again to pick the run back up, or check your Buzz history before trying again.',
         );
       } else if (outcome.kind === 'still-running') {
+        setPendingRunId(outcome.workflowId);
         setError('That generation is still running — check again in a moment.');
       } else {
         setError(`That generation ${outcome.snapshot.status}. Check the run before assuming any charge.`);
@@ -1831,6 +1896,7 @@ function LoraDetail(props: {
     }
     const snap = outcome.snapshot;
     if (live()) {
+      setPendingRunId(null);
       setImageUrl(firstImageUrl(snap));
       try {
         await refetchBalance();
@@ -1851,6 +1917,41 @@ function LoraDetail(props: {
       props.onNotice('The generation finished without a reported cost, so no tracked credit was recorded for it.');
     }
     if (live()) setPhase('idle');
+  };
+
+  const onConfirm = async () => {
+    const body = buildBody();
+    if (!body || quote == null || insufficient || phase !== 'quoted' || runningRef.current) return;
+    runningRef.current = true;
+    try {
+      setPhase('submitting');
+      setError(null);
+      setPendingRunId(null);
+      // A submit outcome and a lost poll are different outcomes: see runGenerationToEnd.
+      const outcome = await runGenerationToEnd(body, {
+        submit,
+        ...pollDeps,
+        onSubmitted: () => {
+          if (mountedRef.current) setPhase('polling');
+        },
+      });
+      await finishRun(outcome);
+    } finally {
+      runningRef.current = false;
+    }
+  };
+
+  /** Pick a run the last wait gave up on back up by its id — it may have finished (and been charged) since. */
+  const onCheckAgain = async () => {
+    if (pendingRunId == null || runningRef.current) return;
+    runningRef.current = true;
+    try {
+      setPhase('polling');
+      setError(null);
+      await finishRun(await pollGenerationToEnd(pendingRunId, null, pollDeps));
+    } finally {
+      runningRef.current = false;
+    }
   };
 
   return (
@@ -1906,8 +2007,13 @@ function LoraDetail(props: {
               data-testid="dc-lora-prompt"
             />
             {phase !== 'quoted' ? (
-              <Button loading={phase === 'estimating'} onClick={onEstimateClick} data-testid="dc-lora-estimate">
-                Price test generation
+              <Button
+                loading={phase === 'estimating' || inFlight}
+                disabled={inFlight}
+                onClick={onEstimateClick}
+                data-testid="dc-lora-estimate"
+              >
+                {inFlight ? 'Generating…' : 'Price test generation'}
               </Button>
             ) : (
               <div style={subCardStyle} data-testid="dc-lora-confirm">
@@ -1925,6 +2031,13 @@ function LoraDetail(props: {
                   </Button>
                 )}
               </div>
+            )}
+            {pendingRunId != null && !inFlight && (
+              <span>
+                <Button size="sm" variant="light" onClick={() => void onCheckAgain()} data-testid="dc-lora-check-again">
+                  Check again
+                </Button>
+              </span>
             )}
             {imageUrl && <img src={imageUrl} alt="Test generation" style={imageStyle} data-testid="dc-lora-image" />}
           </Stack>

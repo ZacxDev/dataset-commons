@@ -423,13 +423,17 @@ export type GenerationRunOutcome =
   | { kind: 'still-running'; workflowId: string }
   | { kind: 'lost-contact'; workflowId: string; detail: string };
 
-export interface GenerationRunDeps<B> {
-  submit: (body: B) => Promise<BlockWorkflowSnapshot>;
+/** What polling a run needs (no submit): the clock, the page's visibility, and the poll call. */
+export interface GenerationPollDeps {
   poll: (workflowId: string) => Promise<BlockWorkflowSnapshot>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   /** Whether the page is in view now (hidden time never gives up; see recordLostContact). */
   visible: () => boolean;
+}
+
+export interface GenerationRunDeps<B> extends GenerationPollDeps {
+  submit: (body: B) => Promise<BlockWorkflowSnapshot>;
   /** Called once the run is submitted and polling starts. */
   onSubmitted?: (workflowId: string) => void;
 }
@@ -466,13 +470,27 @@ export async function runGenerationToEnd<B>(body: B, deps: GenerationRunDeps<B>)
   if (isHostSentinelWorkflowId(snap.workflowId)) {
     return snap.status === 'failed' && typeof snap.cost?.total === 'number' ? { kind: 'refused' } : { kind: 'unconfirmed' };
   }
-  const workflowId = snap.workflowId;
-  deps.onSubmitted?.(workflowId);
+  deps.onSubmitted?.(snap.workflowId);
+  return pollGenerationToEnd(snap.workflowId, snap, deps);
+}
 
+/**
+ * Poll an already-submitted run to its end — after a submit (`initial` is its
+ * reply), or to RESUME a run an earlier wait gave up on (`initial` null: the
+ * first poll is made before anything is concluded). A sentinel id is never
+ * polled: nothing could answer it as this run.
+ */
+export async function pollGenerationToEnd(
+  workflowId: string,
+  initial: BlockWorkflowSnapshot | null,
+  deps: GenerationPollDeps,
+): Promise<GenerationRunOutcome> {
+  if (isHostSentinelWorkflowId(workflowId)) return { kind: 'unconfirmed' };
+  let snap = initial;
   let streak: LostContactStreak = NO_LOST_CONTACT;
   let answered = 0;
-  let delay = GENERATION_POLL_INTERVAL_MS;
-  while (isRunning(snap)) {
+  let delay = initial == null ? 0 : GENERATION_POLL_INTERVAL_MS;
+  while (snap == null || isRunning(snap)) {
     if (answered >= GENERATION_MAX_ANSWERED_POLLS) return { kind: 'still-running', workflowId };
     await deps.sleep(delay);
     let reply: BlockWorkflowSnapshot | null = null;
