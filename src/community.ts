@@ -38,6 +38,7 @@ import {
   type DatasetItem,
   type DatasetSnapshot,
   type LedgerEvent,
+  type SnapshotItem,
   type TrainingDataSource,
 } from './training.js';
 
@@ -143,7 +144,6 @@ export interface FoldedCommunity {
   items: DatasetItemRecord[];
   votes: VoteRecord[];
   snapshots: DatasetSnapshot[];
-  snapshotStorageKeys: ReadonlyMap<string, string>;
   loras: LoraRecord[];
   ledgerEvents: LedgerEvent[];
   removals: ItemRemovalRecord[];
@@ -172,6 +172,70 @@ function iso(v: unknown): string {
   if (v instanceof Date) return v.toISOString();
   if (typeof v === 'string' && v.length > 0) return v;
   return '';
+}
+
+/** The largest per-item weight a frozen snapshot can carry (net votes are document mark counts). */
+const MAX_SNAPSHOT_WEIGHT = 1_000_000;
+
+function parseSnapshotItem(v: unknown): SnapshotItem | null {
+  const item = asRecord(v);
+  if (!item) return null;
+  const itemId = str(item.itemId);
+  const contributorId = str(item.contributorId);
+  if (!itemId || !contributorId || typeof item.included !== 'boolean') return null;
+  const weight = num(item.weight);
+  if (weight == null || weight < 0 || weight > MAX_SNAPSHOT_WEIGHT) return null;
+  // freezeSnapshot gives an included item weight max(net, 1) and an excluded one 0.
+  if (item.included ? weight <= 0 : weight !== 0) return null;
+  const frozenNetVotes = num(item.frozenNetVotes);
+  if (frozenNetVotes == null || !Number.isInteger(frozenNetVotes)) return null;
+  const imageId = num(item.imageId);
+  const exclusionReason =
+    item.exclusionReason === 'net-not-positive' || item.exclusionReason === 'manual' ? item.exclusionReason : undefined;
+  return {
+    itemId,
+    contributorId,
+    ...(typeof item.contributorName === 'string' && item.contributorName ? { contributorName: item.contributorName } : {}),
+    imageUrl: str(item.imageUrl),
+    ...(imageId != null && imageId > 0 && Number.isSafeInteger(imageId) ? { imageId } : {}),
+    caption: str(item.caption),
+    frozenNetVotes,
+    weight,
+    included: item.included,
+    ...(!item.included && exclusionReason ? { exclusionReason } : {}),
+    ...(item.included && item.ownerOverride === true ? { ownerOverride: true } : {}),
+  };
+}
+
+/**
+ * A stored snapshot, field-validated like every other shared collection, or
+ * `null` (ignored) when anything in it is malformed. Snapshots feed the share
+ * and credit math, so a directly-written document must not be able to put a
+ * non-number, a negative weight or a fabricated denominator into it:
+ * `totalWeight` is RECOMPUTED from the items — the stored one is never read —
+ * and an item id may appear once.
+ */
+export function parseSnapshot(data: Record<string, unknown>): DatasetSnapshot | null {
+  const snapshotId = str(data.snapshotId);
+  const datasetId = str(data.datasetId);
+  if (!snapshotId || !datasetId || !Array.isArray(data.items)) return null;
+  const items: SnapshotItem[] = [];
+  const seen = new Set<string>();
+  for (const raw of data.items) {
+    const item = parseSnapshotItem(raw);
+    if (!item || seen.has(item.itemId)) return null;
+    seen.add(item.itemId);
+    items.push(item);
+  }
+  const totalWeight = items.reduce((sum, i) => sum + (i.included ? i.weight : 0), 0);
+  return {
+    snapshotId,
+    datasetId,
+    trainerId: str(data.trainerId),
+    createdAt: iso(data.createdAt),
+    items,
+    totalWeight,
+  };
 }
 
 /** Stable snapshot contributor id for a numeric Civitai user id. */
@@ -220,8 +284,7 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
   const datasets: DatasetRecord[] = [];
   const items: DatasetItemRecord[] = [];
   const votes: VoteRecord[] = [];
-  const snapshots: DatasetSnapshot[] = [];
-  const snapshotStorageKeys = new Map<string, string>();
+  const snapshotsById = new Map<string, { snapshot: DatasetSnapshot; storedAt: string; key: string }>();
   const loras: LoraRecord[] = [];
   const ledgerEvents: LedgerEvent[] = [];
   const removals: ItemRemovalRecord[] = [];
@@ -282,11 +345,17 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
         viewerVote: entry.viewerVote,
       });
     } else if (entry.collection === 'snapshots') {
-      if (typeof data.snapshotId !== 'string' || !Array.isArray(data.items)) continue;
-      const snapshot = data as unknown as DatasetSnapshot;
-      snapshots.push(snapshot);
-      const prev = snapshotStorageKeys.get(snapshot.snapshotId);
-      if (!prev || entry.key > prev) snapshotStorageKeys.set(snapshot.snapshotId, entry.key);
+      const snapshot = parseSnapshot(data);
+      if (!snapshot) continue;
+      // A frozen snapshot never changes, so the FIRST document stored under an
+      // id is the snapshot. Ordered by the store's own creation time and key,
+      // never by the writer's `createdAt`: a later document under a published
+      // id cannot replace the split every ledger event is credited against.
+      const storedAt = iso(entry.createdAt);
+      const prev = snapshotsById.get(snapshot.snapshotId);
+      if (!prev || storedAt < prev.storedAt || (storedAt === prev.storedAt && entry.key < prev.key)) {
+        snapshotsById.set(snapshot.snapshotId, { snapshot, storedAt, key: entry.key });
+      }
     } else if (entry.collection === 'loras') {
       const loraId = str(data.loraId);
       const trainerId = num(data.trainerId);
@@ -311,19 +380,28 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
         updatedAt: iso(data.updatedAt) || at,
       });
     } else if (entry.collection === 'ledger') {
-      if (typeof data.eventId !== 'string' || typeof data.sourceRef !== 'string') continue;
-      // An unknown stored dataSource is dropped; a missing one reads as 'snapshot'.
-      const { dataSource: rawSource, ...rest } = data;
-      const dataSource = parseDataSource(rawSource);
-      const event = { ...rest, ...(dataSource ? { dataSource } : {}) } as unknown as LedgerEvent;
-      if (
-        event.eventType !== 'training' &&
-        event.eventType !== 'generation_in_app' &&
-        event.eventType !== 'generation_onsite'
-      ) {
+      const eventId = str(data.eventId);
+      const sourceRef = str(data.sourceRef);
+      const loraId = str(data.loraId);
+      const snapshotId = str(data.snapshotId);
+      const grossBuzz = num(data.grossBuzz);
+      const eventType = data.eventType;
+      if (!eventId || !sourceRef || !loraId || !snapshotId || grossBuzz == null || grossBuzz < 0) continue;
+      if (eventType !== 'training' && eventType !== 'generation_in_app' && eventType !== 'generation_onsite') {
         continue;
       }
-      ledgerEvents.push(event);
+      // An unknown stored dataSource is dropped; a missing one reads as 'snapshot'.
+      const dataSource = parseDataSource(data.dataSource);
+      ledgerEvents.push({
+        eventId,
+        loraId,
+        snapshotId,
+        eventType,
+        grossBuzz,
+        sourceRef,
+        createdAt: iso(data.createdAt) || at,
+        ...(dataSource ? { dataSource } : {}),
+      });
     } else if (entry.collection === 'removals') {
       const itemId = str(data.itemId);
       const actorId = num(data.actorId);
@@ -351,8 +429,7 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
     // One tally per dataset/item DOCUMENT; duplicates of one id (a legacy double
     // write) keep their own marks and `tallyVotes` sums them.
     votes,
-    snapshots: latestBy(snapshots, (s) => s.snapshotId, (s) => s.createdAt, (s) => s.snapshotId),
-    snapshotStorageKeys,
+    snapshots: [...snapshotsById.values()].map((v) => v.snapshot),
     loras: latestBy(loras, (l) => l.loraId, (l) => l.updatedAt, (l) => l.storageKey ?? ''),
     ledgerEvents: dedupedLedger,
     removals: latestBy(removals, (r) => r.itemId, (r) => r.createdAt, (r) => r.storageKey ?? ''),
