@@ -1090,6 +1090,10 @@ export function trainingStateForSnapshot(
       return 'expired';
     case 'canceled':
       return 'canceled';
+    default:
+      // A status this build does not know: not terminal, so keep polling and
+      // show it as running rather than as no state at all.
+      return 'running';
   }
 }
 

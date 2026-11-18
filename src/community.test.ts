@@ -349,10 +349,12 @@ describe('image references and validation', () => {
     expect(parseImageReference('https://civitai.com/posts/303')).toMatchObject({ ok: true, value: { postId: 303 } });
     expect(isPostReference('https://civitai.com/posts/303')).toBe(true);
     expect(isPostReference('https://civitai.com/images/202')).toBe(false);
-    expect(parseImageReference('https://civitai.com/v2/consumer/blobs/abc')).toEqual({
+    expect(parseImageReference('https://orchestration.civitai.com/v2/consumer/blobs/abc')).toEqual({
       ok: true,
-      value: { imageRef: 'https://civitai.com/v2/consumer/blobs/abc' },
+      value: { imageRef: 'https://orchestration.civitai.com/v2/consumer/blobs/abc' },
     });
+    // A Civitai site page that is neither an image page nor a post is not an image.
+    expect(parseImageReference('https://civitai.com/v2/consumer/blobs/abc').ok).toBe(false);
     expect(parseImageReference('https://example.com/x.jpg').ok).toBe(false);
     expect(parseImageReference('not a url').ok).toBe(false);
     expect(parseImageReference('').ok).toBe(false);

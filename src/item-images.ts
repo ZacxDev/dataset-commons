@@ -39,6 +39,7 @@ import {
   type BlockGatedImage,
 } from '@civitai/app-sdk/blocks';
 
+import { safeCivitaiMediaUrl } from './civitai-url.js';
 import { apiBaseUrl } from './doc-storage.js';
 
 /** The catalog route's own `ids` ceiling (civitai `IMAGE_IDS_BATCH_MAX`). */
@@ -364,16 +365,19 @@ export type ItemSaveTarget = { url: string } | { imageId: number };
  * read above returned it VISIBLE to this viewer. Saving by `imageId` goes
  * through the host's gated read, which refuses every posted image (see the
  * module note), so a hidden or unresolved image stays unsaveable here.
- * Otherwise by id, and last by the stored url.
+ * Otherwise by id, and last by the stored url — only when it is a Civitai
+ * media URL (./civitai-url.ts): the stored url is contributor-written, so
+ * anything else is `null` (no Save offered).
  */
 export function saveTargetForItem(
   item: { imageId?: number; imageUrl: string },
   resolved: ReadonlyMap<number, ItemImage>,
-): ItemSaveTarget {
+): ItemSaveTarget | null {
   if (item.imageId != null) {
     const image = resolved.get(item.imageId);
     if (image?.status === 'visible') return { url: image.saveUrl ?? image.url };
     return { imageId: item.imageId };
   }
-  return { url: item.imageUrl };
+  const url = safeCivitaiMediaUrl(item.imageUrl);
+  return url ? { url } : null;
 }

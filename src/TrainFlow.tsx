@@ -196,21 +196,21 @@ const MOCK_ITEMS: DatasetItem[] = [
   {
     itemId: 'item-a',
     contributorId: 'alice',
-    imageUrl: 'https://civitai.com/v2/consumer/blobs/archive-ink-a',
+    imageUrl: 'https://orchestration.civitai.com/v2/consumer/blobs/archive-ink-a',
     caption: 'ink portrait, front view',
     netVotes: 5,
   },
   {
     itemId: 'item-b',
     contributorId: 'bob',
-    imageUrl: 'https://civitai.com/v2/consumer/blobs/archive-ink-b',
+    imageUrl: 'https://orchestration.civitai.com/v2/consumer/blobs/archive-ink-b',
     caption: 'ink portrait, profile view',
     netVotes: 1,
   },
   {
     itemId: 'item-c',
     contributorId: 'alice',
-    imageUrl: 'https://civitai.com/v2/consumer/blobs/archive-ink-c',
+    imageUrl: 'https://orchestration.civitai.com/v2/consumer/blobs/archive-ink-c',
     caption: 'ink portrait, back view',
     netVotes: 0,
   },
@@ -1040,8 +1040,10 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   const onSaveItemClick = useCallback(
     async (item: Pick<DatasetItem, 'imageId' | 'imageUrl'>, position: number) => {
       const filename = `open-datasets-${String(position).padStart(2, '0')}`;
+      const target = saveTargetForItem(item, itemImages);
+      if (!target) return;
       try {
-        await saveImage({ ...saveTargetForItem(item, itemImages), filename });
+        await saveImage({ ...target, filename });
       } catch (err) {
         setNotice(`Could not save image #${position}: ${describeEstimateFailure(err)}`);
       }
@@ -1215,7 +1217,14 @@ export function TrainFlow(props: TrainFlowProps = {}) {
   }, [activeRun, epoch, navigate]);
 
   const onUploadClick = useCallback(async () => {
-    const uploaded = await openUpload();
+    let uploaded: Awaited<ReturnType<typeof openUpload>>;
+    try {
+      uploaded = await openUpload();
+    } catch {
+      // The host's no-token refusal (or a lost host) rejects: nothing was added.
+      setNotice("Civitai couldn't take this upload just now, so nothing was added. Try again in a moment.");
+      return;
+    }
     if (!uploaded) return;
     setItems((cur) => [
       ...cur,
@@ -1483,24 +1492,27 @@ export function TrainFlow(props: TrainFlowProps = {}) {
             </Alert>
           ) : (
             <ol style={kindListStyle} data-testid="dc-train-list">
-              {included.map((item, index) => (
+              {included.map((item, index) => {
+                const saveTarget = saveTargetForItem(item, itemImages);
+                return (
                 <li key={item.itemId} style={kindRowStyle}>
                   <span style={monoStyle}>#{index + 1}</span>
                   <span style={itemCaptionStyle}>{item.caption || '(no caption)'}</span>
                   <span style={hintStyle}>by {item.contributorName ?? item.contributorId}</span>
-                  {(item.imageId != null || /^https:\/\//.test(item.imageUrl)) && (
+                  {saveTarget && (
                     <Button
                       size="sm"
                       variant="subtle"
                       onClick={() => void onSaveItemClick(item, index + 1)}
                       data-testid={`dc-train-save-${item.itemId}`}
-                      data-save-by={'url' in saveTargetForItem(item, itemImages) ? 'url' : 'id'}
+                      data-save-by={'url' in saveTarget ? 'url' : 'id'}
                     >
                       Save #{index + 1}
                     </Button>
                   )}
                 </li>
-              ))}
+                );
+              })}
             </ol>
           )}
 
