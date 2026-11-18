@@ -66,8 +66,13 @@ describe('LoRA test generation through lost contact', () => {
       { collection: 'snapshots', author: 'owner', data: snapshotDoc(snapshot) },
       { collection: 'loras', author: 'owner', data: loraDoc(lora) },
     ]);
+    let hostDown = false;
+    let pollsWhileDown = 0;
     host = installMockMoneyHost({
       viewer: { id: 11, username: 'alice', status: 'active' },
+      onOutbound: (message) => {
+        if (hostDown && (message as { type?: string }).type === 'POLL_WORKFLOW') pollsWhileDown += 1;
+      },
       consentGranted: true,
       cost: 8,
       pollsUntilDone: 1,
@@ -84,13 +89,17 @@ describe('LoRA test generation through lost contact', () => {
     // From the first poll on, the host answers with its failure placeholder
     // (`workflowId: 'failed'`), as it does when the block token has lapsed.
     host.setHostPollError('block token expired');
+    hostDown = true;
     await user.click(confirm);
     await new Promise((resolve) => setTimeout(resolve, 2500));
+    // The placeholder was actually served (not a submit too slow to reach a poll).
+    expect(pollsWhileDown).toBeGreaterThanOrEqual(1);
     expect(screen.queryByTestId('dc-lora-image')).not.toBeInTheDocument();
     expect(screen.queryByTestId('dc-lora-error')).not.toBeInTheDocument();
 
     // The host answers again: the run's own snapshot ends the wait.
     host.setHostPollError(null);
+    hostDown = false;
     expect(await screen.findByTestId('dc-lora-image', {}, { timeout: 15000 })).toBeInTheDocument();
     expect(screen.queryByTestId('dc-lora-error')).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId('dc-lora-events')).toHaveTextContent(/In-app generation/), {

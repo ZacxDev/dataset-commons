@@ -400,8 +400,15 @@ export function phaseForSnapshot(snapshot: BlockWorkflowSnapshot): GenPhase {
 
 /**
  * How a generation run ended, as far as this page can tell:
- * - `submit-failed`: the submit itself threw or the host refused it (a sentinel
- *   id) — nothing was started, so nothing was charged.
+ * - `refused`: the submit resolved as the host's refusal — a sentinel id with
+ *   `status: 'failed'` AND a numeric `cost.total`, which is how a budget or
+ *   spend-cap rejection arrives (it never throws). Nothing ran, nothing was
+ *   charged. A REAL workflow id that is already failed is polled like any run.
+ * - `unconfirmed`: the submit threw (`WorkflowSubmitError` 'exception' or
+ *   'workflow-failed', or a lost host), or resolved with a sentinel id this
+ *   page cannot poll (`'whatif'`, or `'failed'` with no cost). The SDK is
+ *   explicit that Buzz MAY have been spent on these, so the charge status is
+ *   unknown — never report "nothing was charged" for them.
  * - `succeeded` / `ended`: the run's own terminal snapshot.
  * - `still-running`: the run answered every poll but had not finished.
  * - `lost-contact`: the run WAS submitted, then the host stopped answering
@@ -409,7 +416,8 @@ export function phaseForSnapshot(snapshot: BlockWorkflowSnapshot): GenPhase {
  *   it was charged is unknown.
  */
 export type GenerationRunOutcome =
-  | { kind: 'submit-failed'; detail: string }
+  | { kind: 'refused' }
+  | { kind: 'unconfirmed' }
   | { kind: 'succeeded'; snapshot: BlockWorkflowSnapshot }
   | { kind: 'ended'; snapshot: BlockWorkflowSnapshot }
   | { kind: 'still-running'; workflowId: string }
@@ -432,15 +440,16 @@ export const GENERATION_MAX_ANSWERED_POLLS = 60;
 export const GENERATION_POLL_INTERVAL_MS = 1000;
 /**
  * Consecutive unanswered polls after which the page gives up even while the tab
- * is hidden (where the visible-time clock never runs) — about 25 minutes at the
- * 60 s backoff cap, so a hidden tab cannot poll forever.
+ * is hidden (where the visible-time clock never runs), so a hidden tab cannot
+ * poll forever. That is ~25 minutes of backoff at the 60 s cap, plus however
+ * long each failing request takes to fail (up to the SDK's request timeout).
  */
 export const GENERATION_MAX_UNANSWERED_POLLS = 30;
 
 const isRunning = (s: BlockWorkflowSnapshot) => s.status === 'pending' || s.status === 'processing';
 
 /**
- * Submit `body` and poll the run to its end. A submit failure and a poll failure
+ * Submit `body` and poll the run to its end. A submit outcome and a poll failure
  * are DIFFERENT outcomes: once submit returned a real workflow id the run exists
  * (and may be charged), so a thrown poll or the host's failure placeholder
  * (isHostPollFailure) is lost contact — re-polled with backoff
@@ -451,10 +460,12 @@ export async function runGenerationToEnd<B>(body: B, deps: GenerationRunDeps<B>)
   let snap: BlockWorkflowSnapshot;
   try {
     snap = await deps.submit(body);
-  } catch (err) {
-    return { kind: 'submit-failed', detail: err instanceof Error ? err.message : '' };
+  } catch {
+    return { kind: 'unconfirmed' };
   }
-  if (isHostSentinelWorkflowId(snap.workflowId)) return { kind: 'submit-failed', detail: snap.error ?? '' };
+  if (isHostSentinelWorkflowId(snap.workflowId)) {
+    return snap.status === 'failed' && typeof snap.cost?.total === 'number' ? { kind: 'refused' } : { kind: 'unconfirmed' };
+  }
   const workflowId = snap.workflowId;
   deps.onSubmitted?.(workflowId);
 

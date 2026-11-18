@@ -187,9 +187,10 @@ export function Community() {
         .map((v) => `${v.targetKind}:${v.targetId}`),
       snapshotIds: viewerLedger.snapshotsIn.map((s) => s.snapshotId),
     };
-    // Compare the CONTENT only: a timestamp inside the compared string would
-    // differ on every run, so the guard would never skip an unchanged write.
-    const json = JSON.stringify(index);
+    // Compare the CONTENT (and whose index it is) only: a timestamp inside the
+    // compared string would differ on every run, so the guard would never skip
+    // an unchanged write.
+    const json = JSON.stringify({ viewerId, ...index });
     if (indexJsonRef.current === json) return;
     indexJsonRef.current = json;
     void saveViewerIndex(appStorage, viewerId, { ...index, updatedAt: new Date().toISOString() }).then(
@@ -1808,9 +1809,13 @@ function LoraDetail(props: {
     });
     if (outcome.kind !== 'succeeded') {
       if (!live()) return;
-      if (outcome.kind === 'submit-failed') {
+      // Copy is chosen by outcome only; the host's own error text is
+      // server-authored and unsanitised, so it is never shown to the viewer.
+      if (outcome.kind === 'refused') {
+        setError('Civitai turned that generation down before it ran (a budget or spend limit), so no Buzz was charged.');
+      } else if (outcome.kind === 'unconfirmed') {
         setError(
-          `That generation did not submit cleanly. If no run appears above, no Buzz was charged.${outcome.detail ? ` (${outcome.detail})` : ''}`,
+          "Civitai couldn't confirm whether that generation started, so its charge status is unknown. Check your Buzz history before trying again.",
         );
       } else if (outcome.kind === 'lost-contact') {
         setError(

@@ -42,17 +42,27 @@ function deps(
 const FAILURE_PLACEHOLDER = snap('failed', 'failed', { error: 'block token expired' });
 
 describe('runGenerationToEnd', () => {
-  it('a thrown submit is submit-failed', async () => {
-    expect(await runGenerationToEnd('body', deps(new Error('network'), []))).toEqual({
-      kind: 'submit-failed',
-      detail: 'network',
-    });
+  it('a thrown submit is unconfirmed: the SDK says Buzz may have been spent', async () => {
+    expect(await runGenerationToEnd('body', deps(new Error('network'), []))).toEqual({ kind: 'unconfirmed' });
   });
 
-  it("a submit the host refused (its 'failed' sentinel) is submit-failed with the host's reason", async () => {
-    const d = deps(snap('failed', 'failed', { error: 'over the spend cap' }), []);
-    expect(await runGenerationToEnd('body', d)).toEqual({ kind: 'submit-failed', detail: 'over the spend cap' });
+  it("a budget or spend-cap refusal ('failed' sentinel WITH a cost) is refused, and nothing is polled", async () => {
+    const d = deps(snap('failed', 'failed', { error: 'over the spend cap', cost: { total: 40 } } as never), []);
+    expect(await runGenerationToEnd('body', d)).toEqual({ kind: 'refused' });
     expect(d.polls).toBe(0);
+  });
+
+  it("a sentinel with no cost, or a pending 'whatif', is unconfirmed and never polled", async () => {
+    for (const reply of [snap('failed', 'failed'), snap('whatif', 'pending')]) {
+      const d = deps(reply, []);
+      expect(await runGenerationToEnd('body', d)).toEqual({ kind: 'unconfirmed' });
+      expect(d.polls).toBe(0);
+    }
+  });
+
+  it('a REAL workflow id that is already failed is polled like any run, never reported as refused', async () => {
+    const failed = snap('wf1', 'failed', { cost: { total: 40 } } as never);
+    expect(await runGenerationToEnd('body', deps(failed, []))).toEqual({ kind: 'ended', snapshot: failed });
   });
 
   it('a thrown poll after submit is lost contact, re-polled, and the run still succeeds', async () => {
