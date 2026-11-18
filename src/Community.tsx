@@ -61,7 +61,7 @@ import {
   saveViewerIndex,
   type StorageAccess,
 } from './community-storage.js';
-import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
+import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope, runGenerationToEnd } from './generation.js';
 import { useItemImages } from './item-images.js';
 import { imageRefDisplay } from './civitai-url.js';
 import { DEFAULT_CHECKPOINT, loraOption } from './models.js';
@@ -186,12 +186,15 @@ export function Community() {
         .filter((v) => v.viewerVote !== 0)
         .map((v) => `${v.targetKind}:${v.targetId}`),
       snapshotIds: viewerLedger.snapshotsIn.map((s) => s.snapshotId),
-      updatedAt: new Date().toISOString(),
     };
+    // Compare the CONTENT only: a timestamp inside the compared string would
+    // differ on every run, so the guard would never skip an unchanged write.
     const json = JSON.stringify(index);
     if (indexJsonRef.current === json) return;
     indexJsonRef.current = json;
-    void saveViewerIndex(appStorage, viewerId, index).then(setViewerIndexAccess);
+    void saveViewerIndex(appStorage, viewerId, { ...index, updatedAt: new Date().toISOString() }).then(
+      setViewerIndexAccess,
+    );
   }, [appStorage, folded, loadState, viewerId, viewerLedger]);
 
   const requireViewer = useCallback((): boolean => {
@@ -1792,47 +1795,57 @@ function LoraDetail(props: {
     const live = () => mountedRef.current;
     setPhase('submitting');
     setError(null);
-    try {
-      let snap = await submit(body);
-      if (live()) setPhase('polling');
-      for (let attempt = 0; attempt < 60 && (snap.status === 'pending' || snap.status === 'processing'); attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        snap = await poll(snap.workflowId);
-      }
-      if (snap.status !== 'succeeded') {
-        if (!live()) return;
-        setError(
-          snap.status === 'failed' || snap.status === 'expired' || snap.status === 'canceled'
-            ? `That generation ${snap.status}. Check the run before assuming any charge.`
-            : 'That generation is still running — check again in a moment.',
-        );
-        setPhase('idle');
-        return;
-      }
-      if (live()) {
-        setImageUrl(firstImageUrl(snap));
-        await refetchBalance();
-      }
-      const gross = snap.cost?.total;
-      if (gross != null && gross > 0 && creditedRef.current !== snap.workflowId) {
-        creditedRef.current = snap.workflowId;
-        try {
-          await props.onLedgerEvent(
-            generationLedgerEvent({ lora, workflowId: snap.workflowId, grossBuzz: gross }),
-          );
-        } catch {
-          creditedRef.current = null;
-          props.onNotice('The generation succeeded, but saving its tracked-credit event failed. Refresh before relying on the ledger.');
-        }
-      } else if (gross == null) {
-        props.onNotice('The generation finished without a reported cost, so no tracked credit was recorded for it.');
-      }
-      if (live()) setPhase('idle');
-    } catch {
+    // A submit failure and a lost poll are different outcomes: see runGenerationToEnd.
+    const outcome = await runGenerationToEnd(body, {
+      submit,
+      poll,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      now: () => Date.now(),
+      visible: () => typeof document === 'undefined' || !document.hidden,
+      onSubmitted: () => {
+        if (live()) setPhase('polling');
+      },
+    });
+    if (outcome.kind !== 'succeeded') {
       if (!live()) return;
-      setError('That generation did not submit cleanly. If no run appears above, no Buzz was charged.');
+      if (outcome.kind === 'submit-failed') {
+        setError(
+          `That generation did not submit cleanly. If no run appears above, no Buzz was charged.${outcome.detail ? ` (${outcome.detail})` : ''}`,
+        );
+      } else if (outcome.kind === 'lost-contact') {
+        setError(
+          'Lost contact with Civitai while the generation ran, so its charge status is unknown. Check your Buzz history before assuming it was or was not charged.',
+        );
+      } else if (outcome.kind === 'still-running') {
+        setError('That generation is still running — check again in a moment.');
+      } else {
+        setError(`That generation ${outcome.snapshot.status}. Check the run before assuming any charge.`);
+      }
       setPhase('idle');
+      return;
     }
+    const snap = outcome.snapshot;
+    if (live()) {
+      setImageUrl(firstImageUrl(snap));
+      try {
+        await refetchBalance();
+      } catch {
+        // A stale balance is not a reason to skip the run's tracked credit below.
+      }
+    }
+    const gross = snap.cost?.total;
+    if (gross != null && gross > 0 && creditedRef.current !== snap.workflowId) {
+      creditedRef.current = snap.workflowId;
+      try {
+        await props.onLedgerEvent(generationLedgerEvent({ lora, workflowId: snap.workflowId, grossBuzz: gross }));
+      } catch {
+        creditedRef.current = null;
+        props.onNotice('The generation succeeded, but saving its tracked-credit event failed. Refresh before relying on the ledger.');
+      }
+    } else if (gross == null) {
+      props.onNotice('The generation finished without a reported cost, so no tracked credit was recorded for it.');
+    }
+    if (live()) setPhase('idle');
   };
 
   return (
