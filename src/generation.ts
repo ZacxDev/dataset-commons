@@ -7,6 +7,13 @@ import type { BlockWorkflowSnapshot, BuzzAccountType } from '@civitai/app-sdk/bl
 
 import type { CheckpointOption, LoraOption } from './models.js';
 import { clampLoraWeight, roundLoraWeight } from './models.js';
+import {
+  NO_LOST_CONTACT,
+  isHostPollFailure,
+  isHostSentinelWorkflowId,
+  recordLostContact,
+  type LostContactStreak,
+} from './training.js';
 
 /** Server cap mirror — prompts over this are rejected by the workflow schema. */
 export const PROMPT_MAX = 1500;
@@ -385,4 +392,113 @@ export function phaseForSnapshot(snapshot: BlockWorkflowSnapshot): GenPhase {
     case 'processing':
       return 'polling';
   }
+}
+
+// ---------------------------------------------------------------------------
+// Running one in-app generation to its end (LoraDetail's test generation).
+// ---------------------------------------------------------------------------
+
+/**
+ * How a generation run ended, as far as this page can tell:
+ * - `refused`: the submit resolved as the host's refusal — a sentinel id with
+ *   `status: 'failed'` AND a numeric `cost.total`, which is how a budget or
+ *   spend-cap rejection arrives (it never throws). Nothing ran, nothing was
+ *   charged. A REAL workflow id that is already failed is polled like any run.
+ * - `unconfirmed`: the submit threw (`WorkflowSubmitError` 'exception' or
+ *   'workflow-failed', or a lost host), or resolved with a sentinel id this
+ *   page cannot poll (`'whatif'`, or `'failed'` with no cost). The SDK is
+ *   explicit that Buzz MAY have been spent on these, so the charge status is
+ *   unknown — never report "nothing was charged" for them.
+ * - `succeeded` / `ended`: the run's own terminal snapshot.
+ * - `still-running`: the run answered every poll but had not finished.
+ * - `lost-contact`: the run WAS submitted, then the host stopped answering
+ *   (thrown polls or its failure placeholder) long enough to give up. Whether
+ *   it was charged is unknown.
+ */
+export type GenerationRunOutcome =
+  | { kind: 'refused' }
+  | { kind: 'unconfirmed' }
+  | { kind: 'succeeded'; snapshot: BlockWorkflowSnapshot }
+  | { kind: 'ended'; snapshot: BlockWorkflowSnapshot }
+  | { kind: 'still-running'; workflowId: string }
+  | { kind: 'lost-contact'; workflowId: string; detail: string };
+
+export interface GenerationRunDeps<B> {
+  submit: (body: B) => Promise<BlockWorkflowSnapshot>;
+  poll: (workflowId: string) => Promise<BlockWorkflowSnapshot>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  /** Whether the page is in view now (hidden time never gives up; see recordLostContact). */
+  visible: () => boolean;
+  /** Called once the run is submitted and polling starts. */
+  onSubmitted?: (workflowId: string) => void;
+}
+
+/** Answered polls of a still-running workflow before the page reports `still-running`. */
+export const GENERATION_MAX_ANSWERED_POLLS = 60;
+/** The wait between answered polls. */
+export const GENERATION_POLL_INTERVAL_MS = 1000;
+/**
+ * Consecutive unanswered polls after which the page gives up even while the tab
+ * is hidden (where the visible-time clock never runs), so a hidden tab cannot
+ * poll forever. That is ~25 minutes of backoff at the 60 s cap, plus however
+ * long each failing request takes to fail (up to the SDK's request timeout).
+ */
+export const GENERATION_MAX_UNANSWERED_POLLS = 30;
+
+const isRunning = (s: BlockWorkflowSnapshot) => s.status === 'pending' || s.status === 'processing';
+
+/**
+ * Submit `body` and poll the run to its end. A submit outcome and a poll failure
+ * are DIFFERENT outcomes: once submit returned a real workflow id the run exists
+ * (and may be charged), so a thrown poll or the host's failure placeholder
+ * (isHostPollFailure) is lost contact — re-polled with backoff
+ * (recordLostContact) until the run answers or the page gives up — never a
+ * verdict on the run.
+ */
+export async function runGenerationToEnd<B>(body: B, deps: GenerationRunDeps<B>): Promise<GenerationRunOutcome> {
+  let snap: BlockWorkflowSnapshot;
+  try {
+    snap = await deps.submit(body);
+  } catch {
+    return { kind: 'unconfirmed' };
+  }
+  if (isHostSentinelWorkflowId(snap.workflowId)) {
+    return snap.status === 'failed' && typeof snap.cost?.total === 'number' ? { kind: 'refused' } : { kind: 'unconfirmed' };
+  }
+  const workflowId = snap.workflowId;
+  deps.onSubmitted?.(workflowId);
+
+  let streak: LostContactStreak = NO_LOST_CONTACT;
+  let answered = 0;
+  let delay = GENERATION_POLL_INTERVAL_MS;
+  while (isRunning(snap)) {
+    if (answered >= GENERATION_MAX_ANSWERED_POLLS) return { kind: 'still-running', workflowId };
+    await deps.sleep(delay);
+    let reply: BlockWorkflowSnapshot | null = null;
+    let detail = '';
+    try {
+      reply = await deps.poll(workflowId);
+      if (isHostPollFailure(reply, workflowId)) {
+        detail = reply.error ?? '';
+        reply = null;
+      }
+    } catch (err) {
+      detail = err instanceof Error ? err.message : '';
+    }
+    if (reply == null) {
+      const next = recordLostContact(streak, deps.now(), deps.visible());
+      streak = next.streak;
+      if (next.giveUp || streak.failures >= GENERATION_MAX_UNANSWERED_POLLS) {
+        return { kind: 'lost-contact', workflowId, detail };
+      }
+      delay = next.delayMs;
+      continue;
+    }
+    streak = NO_LOST_CONTACT;
+    delay = GENERATION_POLL_INTERVAL_MS;
+    answered += 1;
+    snap = reply;
+  }
+  return snap.status === 'succeeded' ? { kind: 'succeeded', snapshot: snap } : { kind: 'ended', snapshot: snap };
 }
