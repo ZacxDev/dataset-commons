@@ -6,7 +6,6 @@ import {
   useBuzzBalance,
   useBuzzWorkflow,
   useCivitaiNavigate,
-  useGatedImages,
   useImagePicker,
   useImageUpload,
   useRequestConsent,
@@ -16,7 +15,6 @@ import { Alert, Badge, Button, Modal, Stack } from '@civitai/blocks-react/ui';
 import '@civitai/components/civitai-nav-item/define';
 import '@civitai/components/civitai-nav-list/define';
 import '@civitai/components/civitai-avatar/define';
-import type { BlockGatedImage } from '@civitai/app-sdk/blocks';
 
 import {
   COSMETIC_TRUST_LINE,
@@ -65,6 +63,7 @@ import {
   type StorageAccess,
 } from './community-storage.js';
 import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
+import { useItemImages } from './item-images.js';
 import { DEFAULT_CHECKPOINT, loraOption } from './models.js';
 import { dataSourceLabel, type DatasetSnapshot, type LedgerEvent } from './training.js';
 import { TrainFlow, type TrainRunLink } from './TrainFlow.js';
@@ -1180,13 +1179,18 @@ function ContributeForm(props: {
   onContribute: (input: { imageRef: string; imageId?: number; caption: string }) => Promise<string | null>;
   onSuccess?: () => void;
 }) {
-  const { open: openUpload } = useImageUpload();
+  // Shared with this dataset's viewers once Civitai has scanned it (PG / PG13
+  // only), read back through the gated image read (./item-images.ts). `open()`
+  // resolves `shared: true` only when the server recorded the share; it resolves
+  // `null` on a dismiss (and on the host's review-mode / pre-handshake refusals),
+  // and REJECTS on the host's no-token refusal.
+  const { open: openUpload } = useImageUpload({ share: true });
   const { open: openPicker } = useImagePicker();
   const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('mine');
   const [reference, setReference] = useState('');
   const [caption, setCaption] = useState('');
   const [rights, setRights] = useState(false);
-  const [uploaded, setUploaded] = useState<{ imageId: number; url: string } | null>(null);
+  const [uploaded, setUploaded] = useState<{ imageId: number; url: string; shared: boolean } | null>(null);
   const [picked, setPicked] = useState<{ imageId?: number; url: string; source: 'posted' | 'generated' } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -1195,9 +1199,18 @@ function ContributeForm(props: {
   const hasSelection = picked != null || uploaded != null || reference.trim().length > 0;
 
   const upload = async () => {
-    const pickedImage = await openUpload();
+    let pickedImage: Awaited<ReturnType<typeof openUpload>>;
+    try {
+      pickedImage = await openUpload();
+    } catch {
+      // The host's no-token refusal (or a lost host) rejects: nothing was selected.
+      setError(
+        "Civitai couldn't take this upload just now, so nothing was added. Try again, or choose an image from My Images or paste a link.",
+      );
+      return;
+    }
     if (!pickedImage) return;
-    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url });
+    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url, shared: pickedImage.shared });
     setPicked(null);
     setReference(pickedImage.url);
     setError(null);
@@ -1305,10 +1318,18 @@ function ContributeForm(props: {
           <Button size="sm" variant="light" onClick={() => void upload()} data-testid="dc-contribute-upload">
             Upload an image
           </Button>
+          <span style={hintStyle} data-testid="dc-contribute-upload-note">
+            {' '}
+            Your upload is not posted on Civitai. It is shared with this dataset&apos;s viewers once Civitai has
+            scanned it and rated it PG or PG-13.
+          </span>
           {uploaded && (
             <span style={hintStyle} data-testid="dc-contribute-uploaded">
               {' '}
-              Uploaded image #{uploaded.imageId} selected.
+              Uploaded image #{uploaded.imageId} selected.{' '}
+              {uploaded.shared
+                ? "It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13."
+                : "Kept private: Civitai didn't confirm sharing for this upload, so only you can see it."}
             </span>
           )}
         </span>
@@ -1398,27 +1419,9 @@ function DatasetDetail(props: {
     () => dataset.items.map((i) => i.imageId).filter((id): id is number => id != null),
     [dataset.items],
   );
-  const { getImages } = useGatedImages();
-  const [gatedImages, setGatedImages] = useState<ReadonlyMap<number, BlockGatedImage>>(new Map());
-  useEffect(() => {
-    let alive = true;
-    if (imageIds.length === 0) {
-      setGatedImages(new Map());
-      return () => {
-        alive = false;
-      };
-    }
-    void getImages(imageIds)
-      .then((images) => {
-        if (alive) setGatedImages(new Map(images.map((image) => [image.imageId, image])));
-      })
-      .catch(() => {
-        if (alive) setGatedImages(new Map());
-      });
-    return () => {
-      alive = false;
-    };
-  }, [getImages, imageIds]);
+  // Posted images come from the block catalog, this app's own outputs from the
+  // gated read (./item-images.ts): the gated read alone never sees a posted image.
+  const gatedImages = useItemImages(imageIds);
   const isOwner = viewerId != null && dataset.ownerId === viewerId;
   const liveItems = dataset.items.filter((i) => !i.removed);
   // Contributing happens in a modal opened from the large Add-an-image CTA.
@@ -1583,7 +1586,7 @@ function DatasetDetail(props: {
               {item.imageId != null ? (
                 gatedImage == null ? (
                   <span style={hintStyle} data-testid={`dc-item-image-pending-${item.itemId}`}>
-                    Image is still being rated — check back shortly.
+                    Image can't be shown here — it may still be being rated, or it isn't public on Civitai.
                   </span>
                 ) : gatedImage.status === 'visible' ? (
                   <Stack gap={4}>

@@ -69,14 +69,16 @@ describe('block.manifest.json — training contract', () => {
     expect(PAGE_BUZZ_BUDGET).toBe(manifest.page.buzzBudgetPerGen);
   });
 
-  it('pins the SDK pair whose trainingData upload is AIR-only ([{ air }], no url)', () => {
+  it('pins the SDK pair with the AIR-only trainingData upload and the typed shared upload', () => {
     // 0.77 replaced the prepared-dataset body ({ datasetId }) with
     // { items: [{ air, caption }] } uploaded through useImageUpload({ purpose:
     // 'trainingData' }); 0.90 / blocks-react 0.83 made that upload resolve
     // [{ air }] with no url. The TrainFlow upload path is written against it.
-    // (Was ^0.77.0 / ^0.77.0; ^0.70.1 / ^0.73.2 for useImagePicker, 2026-10-15.)
-    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.90.0');
-    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.83.0');
+    // 0.91 / blocks-react 0.84 added useImageUpload({ share: true }) resolving
+    // with a typed `shared`, which the Upload tab uses.
+    // (Was ^0.90.0 / ^0.83.0; ^0.77.0 / ^0.77.0; ^0.70.1 / ^0.73.2 for useImagePicker, 2026-10-15.)
+    expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.91.0');
+    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.84.0');
     expect(pkg.dependencies['@civitai/sdk']).toBe('0.28.0');
   });
 

@@ -24,6 +24,7 @@ import type {
 } from '@civitai/app-sdk/blocks';
 
 import { formatCost, hasBudgetedScope } from './generation.js';
+import { saveTargetForItem, useItemImages } from './item-images.js';
 import {
   DEFAULT_TRAINING_PRESET,
   TRAINING_EPOCHS_BOUNDS,
@@ -1030,17 +1031,22 @@ export function TrainFlow(props: TrainFlowProps = {}) {
     setKindPhase('idle');
   }, [clearKindQuote]);
 
+  // A posted image is saved by its catalog url: by id, the host's gated read refuses it.
+  const itemImageIds = useMemo(
+    () => items.map((item) => item.imageId).filter((id): id is number => id != null),
+    [items],
+  );
+  const itemImages = useItemImages(itemImageIds);
   const onSaveItemClick = useCallback(
     async (item: Pick<DatasetItem, 'imageId' | 'imageUrl'>, position: number) => {
       const filename = `open-datasets-${String(position).padStart(2, '0')}`;
       try {
-        if (item.imageId != null) await saveImage({ imageId: item.imageId, filename });
-        else await saveImage({ url: item.imageUrl, filename });
+        await saveImage({ ...saveTargetForItem(item, itemImages), filename });
       } catch (err) {
         setNotice(`Could not save image #${position}: ${describeEstimateFailure(err)}`);
       }
     },
-    [saveImage],
+    [saveImage, itemImages],
   );
 
   /** Pass-through: freeze the snapshot, pair the uploads with it, and price the step. */
@@ -1488,6 +1494,7 @@ export function TrainFlow(props: TrainFlowProps = {}) {
                       variant="subtle"
                       onClick={() => void onSaveItemClick(item, index + 1)}
                       data-testid={`dc-train-save-${item.itemId}`}
+                      data-save-by={'url' in saveTargetForItem(item, itemImages) ? 'url' : 'id'}
                     >
                       Save #{index + 1}
                     </Button>
