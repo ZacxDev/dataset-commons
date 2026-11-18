@@ -26,6 +26,12 @@
 // (`write: "own"`).
 
 import {
+  imageRefDisplay,
+  isCivitaiSiteUrl,
+  safeCivitaiMediaUrl,
+  safeCivitaiPostUrl,
+} from './civitai-url.js';
+import {
   creditLedgerEvent,
   deriveContributorCredits,
   parseDataSource,
@@ -686,38 +692,53 @@ export interface ParsedImageReference {
   imageRef: string;
 }
 
+const NOT_A_CIVITAI_REFERENCE = 'Use a Civitai image or post URL, or an image ID — v1 stores Civitai references only.';
+
 /**
  * Parse a contributed Civitai image reference: a bare Image id, an image-page
- * URL carrying the id, or any Civitai-hosted image/blob URL. Anything else is
- * refused rather than stored as an unusable reference.
+ * URL carrying the id (`https://civitai.com/images/<id>`), a post URL
+ * (`https://civitai.com/posts/<id>`), or a Civitai media URL (see
+ * ./civitai-url.ts for the exact hosts). Anything else is refused rather than
+ * stored as an unusable reference.
  */
 export function parseImageReference(raw: string): Validation<ParsedImageReference> {
   const input = raw.trim();
   if (!input) return { ok: false, error: 'Add a Civitai image URL or image ID.' };
   if (/^\d+$/.test(input)) {
     const imageId = Number(input);
-    if (imageId > 0) return { ok: true, value: { imageId, imageRef: input } };
+    if (imageId > 0 && Number.isSafeInteger(imageId)) return { ok: true, value: { imageId, imageRef: input } };
   }
-  let url: URL;
-  try {
-    url = new URL(input);
-  } catch {
-    return { ok: false, error: 'That does not look like a Civitai image URL or image ID.' };
+  const post = safeCivitaiPostUrl(input);
+  if (post) return { ok: true, value: { postId: post.postId, imageRef: post.href } };
+  if (isCivitaiSiteUrl(input)) {
+    const url = new URL(input);
+    const idMatch = url.pathname.match(/^\/images\/(\d+)\/?$/) ?? url.search.match(/[?&]imageId=(\d+)/);
+    const imageId = idMatch ? Number(idMatch[1]) : 0;
+    if (imageId > 0 && Number.isSafeInteger(imageId)) return { ok: true, value: { imageId, imageRef: url.href } };
+    return { ok: false, error: NOT_A_CIVITAI_REFERENCE };
   }
-  if (!/(^|\.)civitai\.com$/i.test(url.hostname) && url.hostname !== 'image.civitai.com') {
-    return { ok: false, error: 'Use a Civitai image URL or image ID — v1 stores Civitai references only.' };
-  }
-  const idMatch = url.pathname.match(/\/images?\/(\d+)/i) ?? url.search.match(/[?&]imageId=(\d+)/i);
-  const imageId = idMatch ? Number(idMatch[1]) : undefined;
-  if (imageId) return { ok: true, value: { imageId, imageRef: url.toString() } };
-  const postMatch = url.pathname.match(/\/posts?\/(\d+)/i);
-  if (postMatch) return { ok: true, value: { postId: Number(postMatch[1]), imageRef: url.toString() } };
-  return { ok: true, value: { imageRef: url.toString() } };
+  const media = safeCivitaiMediaUrl(input);
+  if (media) return { ok: true, value: { imageRef: media } };
+  return { ok: false, error: NOT_A_CIVITAI_REFERENCE };
 }
 
-/** True when a stored reference points at a Civitai post, not a single image. */
+/** True when a stored reference is a Civitai post link (parsed host + `/posts/<digits>`), not a single image. */
 export function isPostReference(imageRef: string): boolean {
-  return /civitai\.com\/posts?\//i.test(imageRef);
+  return safeCivitaiPostUrl(imageRef) != null;
+}
+
+/**
+ * Whether `imageRef` may be WRITTEN to shared storage. With an `imageId` the
+ * item is shown through the host's gated read, so the ref is only a label: a
+ * bare id, a Civitai page URL or a Civitai media URL. Without one the ref is
+ * what viewers see, so it must render as a Civitai image or post link
+ * (./civitai-url.ts `imageRefDisplay`) or be a bare id (shown as text).
+ */
+function isStorableImageRef(imageRef: string, imageId: number | undefined): boolean {
+  if (imageRef === '' && imageId != null) return true;
+  if (/^\d+$/.test(imageRef)) return true;
+  if (imageId != null) return isCivitaiSiteUrl(imageRef) || safeCivitaiMediaUrl(imageRef) != null;
+  return imageRefDisplay(imageRef).kind !== 'unavailable';
 }
 
 export function validateContribution(input: {
@@ -728,6 +749,12 @@ export function validateContribution(input: {
 }): Validation<{ imageRef: string; imageId?: number; caption: string }> {
   if (!input.imageRef.trim() && input.imageId == null) {
     return { ok: false, error: 'Add a Civitai image URL/ID or upload an image first.' };
+  }
+  if (input.imageId != null && !(Number.isSafeInteger(input.imageId) && input.imageId > 0)) {
+    return { ok: false, error: NOT_A_CIVITAI_REFERENCE };
+  }
+  if (!isStorableImageRef(input.imageRef.trim(), input.imageId)) {
+    return { ok: false, error: NOT_A_CIVITAI_REFERENCE };
   }
   const caption = input.caption.trim();
   if (!caption) return { ok: false, error: 'Give the image a caption — captions are the training text.' };
@@ -831,7 +858,7 @@ export function demoSharedSeed(): CommunitySeedDoc[] {
       datasetId: dataset.datasetId,
       contributorId: 11,
       contributorName: 'alice',
-      imageRef: 'https://civitai.com/v2/consumer/blobs/archive-ink-a',
+      imageRef: 'https://orchestration.civitai.com/v2/consumer/blobs/archive-ink-a',
       caption: 'ink portrait, front view',
       rightsAsserted: true,
       createdAt: '2026-10-05T00:01:00.000Z',
@@ -842,7 +869,7 @@ export function demoSharedSeed(): CommunitySeedDoc[] {
       datasetId: dataset.datasetId,
       contributorId: 12,
       contributorName: 'bob',
-      imageRef: 'https://civitai.com/v2/consumer/blobs/archive-ink-b',
+      imageRef: 'https://orchestration.civitai.com/v2/consumer/blobs/archive-ink-b',
       caption: 'ink portrait, profile view',
       rightsAsserted: true,
       createdAt: '2026-10-05T00:02:00.000Z',
@@ -853,7 +880,7 @@ export function demoSharedSeed(): CommunitySeedDoc[] {
       datasetId: dataset.datasetId,
       contributorId: 11,
       contributorName: 'alice',
-      imageRef: 'https://civitai.com/v2/consumer/blobs/archive-ink-c',
+      imageRef: 'https://orchestration.civitai.com/v2/consumer/blobs/archive-ink-c',
       caption: 'ink portrait, back view',
       rightsAsserted: true,
       createdAt: '2026-10-05T00:03:00.000Z',

@@ -269,11 +269,15 @@ function CopyButton({ text, onCopied }: { text: string; onCopied?: () => void })
       aria-label={copied ? 'Copied' : 'Copy command'}
       title={copied ? 'Copied!' : 'Copy'}
       onClick={() => {
-        void navigator.clipboard?.writeText(text).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-          onCopied?.();
-        });
+        void navigator.clipboard
+          ?.writeText(text)
+          .then(() => {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+            onCopied?.();
+          })
+          // A refused clipboard write (iframe permission policy) is not "Copied".
+          .catch(() => undefined);
       }}
     >
       {copied ? <CheckGlyph /> : <ClipboardGlyph />}

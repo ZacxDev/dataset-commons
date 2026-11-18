@@ -22,7 +22,6 @@ import {
   buildCommunityView,
   buildViewerLedger,
   contributorKey,
-  isPostReference,
   datasetDoc,
   filterAndSortDatasets,
   foldSharedEntries,
@@ -64,6 +63,7 @@ import {
 } from './community-storage.js';
 import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
 import { useItemImages } from './item-images.js';
+import { imageRefDisplay } from './civitai-url.js';
 import { DEFAULT_CHECKPOINT, loraOption } from './models.js';
 import { dataSourceLabel, type DatasetSnapshot, type LedgerEvent } from './training.js';
 import { TrainFlow, type TrainRunLink } from './TrainFlow.js';
@@ -1390,6 +1390,37 @@ function ContributeForm(props: {
   );
 }
 
+/**
+ * An item with no `imageId`, shown from its stored `imageRef`. The ref came out
+ * of shared storage, which any contributor can write directly, so it reaches
+ * `src` / `href` only through ./civitai-url.ts `imageRefDisplay` (exact Civitai
+ * host, `https:`); anything else is plain text, never a link or an image.
+ */
+function StoredImageRef(props: { itemId: string; imageRef: string; caption: string }) {
+  const display = imageRefDisplay(props.imageRef);
+  if (display.kind === 'post') {
+    return (
+      <span style={hintStyle} data-testid={`dc-item-post-${props.itemId}`}>
+        Linked from a Civitai post —{' '}
+        <a href={display.href} target="_blank" rel="noreferrer">
+          view the post
+        </a>
+      </span>
+    );
+  }
+  if (display.kind === 'image') {
+    return <img src={display.src} alt={props.caption} style={imageStyle} data-testid={`dc-item-image-${props.itemId}`} />;
+  }
+  if (/^\d+$/.test(props.imageRef)) {
+    return <span style={hintStyle}>Image reference #{props.imageRef}</span>;
+  }
+  return (
+    <span style={hintStyle} data-testid={`dc-item-image-unavailable-${props.itemId}`}>
+      Image unavailable
+    </span>
+  );
+}
+
 /** Author display on the upstream civitai-avatar element (initials + name). */
 function AuthorByline(props: { name: string }) {
   return (
@@ -1605,17 +1636,8 @@ function DatasetDetail(props: {
                     Image hidden by your content settings.
                   </span>
                 )
-              ) : isPostReference(item.imageRef) ? (
-                <span style={hintStyle} data-testid={`dc-item-post-${item.itemId}`}>
-                  Linked from a Civitai post —{' '}
-                  <a href={item.imageRef} target="_blank" rel="noreferrer">
-                    view the post
-                  </a>
-                </span>
-              ) : /^https?:\/\//.test(item.imageRef) ? (
-                <img src={item.imageRef} alt={item.caption} style={imageStyle} data-testid={`dc-item-image-${item.itemId}`} />
               ) : (
-                <span style={hintStyle}>Image reference #{item.imageRef}</span>
+                <StoredImageRef itemId={item.itemId} imageRef={item.imageRef} caption={item.caption} />
               )}
               <div style={itemHeadStyle}>
                 <span style={cardTitleStyle}>{item.caption || '(no caption)'}</span>
