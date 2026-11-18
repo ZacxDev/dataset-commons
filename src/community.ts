@@ -38,6 +38,7 @@ import {
   type DatasetItem,
   type DatasetSnapshot,
   type LedgerEvent,
+  type SnapshotItem,
   type TrainingDataSource,
 } from './training.js';
 
@@ -174,6 +175,70 @@ function iso(v: unknown): string {
   return '';
 }
 
+/** The largest per-item weight a frozen snapshot can carry (net votes are document mark counts). */
+const MAX_SNAPSHOT_WEIGHT = 1_000_000;
+
+function parseSnapshotItem(v: unknown): SnapshotItem | null {
+  const item = asRecord(v);
+  if (!item) return null;
+  const itemId = str(item.itemId);
+  const contributorId = str(item.contributorId);
+  if (!itemId || !contributorId || typeof item.included !== 'boolean') return null;
+  const weight = num(item.weight);
+  if (weight == null || weight < 0 || weight > MAX_SNAPSHOT_WEIGHT) return null;
+  // freezeSnapshot gives an included item weight max(net, 1) and an excluded one 0.
+  if (item.included ? weight <= 0 : weight !== 0) return null;
+  const frozenNetVotes = num(item.frozenNetVotes);
+  if (frozenNetVotes == null || !Number.isInteger(frozenNetVotes)) return null;
+  const imageId = num(item.imageId);
+  const exclusionReason =
+    item.exclusionReason === 'net-not-positive' || item.exclusionReason === 'manual' ? item.exclusionReason : undefined;
+  return {
+    itemId,
+    contributorId,
+    ...(typeof item.contributorName === 'string' && item.contributorName ? { contributorName: item.contributorName } : {}),
+    imageUrl: str(item.imageUrl),
+    ...(imageId != null && imageId > 0 && Number.isSafeInteger(imageId) ? { imageId } : {}),
+    caption: str(item.caption),
+    frozenNetVotes,
+    weight,
+    included: item.included,
+    ...(!item.included && exclusionReason ? { exclusionReason } : {}),
+    ...(item.included && item.ownerOverride === true ? { ownerOverride: true } : {}),
+  };
+}
+
+/**
+ * A stored snapshot, field-validated like every other shared collection, or
+ * `null` (ignored) when anything in it is malformed. Snapshots feed the share
+ * and credit math, so a directly-written document must not be able to put a
+ * non-number, a negative weight or a fabricated denominator into it:
+ * `totalWeight` is RECOMPUTED from the items — the stored one is never read —
+ * and an item id may appear once.
+ */
+export function parseSnapshot(data: Record<string, unknown>): DatasetSnapshot | null {
+  const snapshotId = str(data.snapshotId);
+  const datasetId = str(data.datasetId);
+  if (!snapshotId || !datasetId || !Array.isArray(data.items)) return null;
+  const items: SnapshotItem[] = [];
+  const seen = new Set<string>();
+  for (const raw of data.items) {
+    const item = parseSnapshotItem(raw);
+    if (!item || seen.has(item.itemId)) return null;
+    seen.add(item.itemId);
+    items.push(item);
+  }
+  const totalWeight = items.reduce((sum, i) => sum + (i.included ? i.weight : 0), 0);
+  return {
+    snapshotId,
+    datasetId,
+    trainerId: str(data.trainerId),
+    createdAt: iso(data.createdAt),
+    items,
+    totalWeight,
+  };
+}
+
 /** Stable snapshot contributor id for a numeric Civitai user id. */
 export function contributorKey(userId: number): string {
   return `user:${userId}`;
@@ -282,8 +347,8 @@ export function foldSharedEntries(entries: readonly SharedEntryLike[]): FoldedCo
         viewerVote: entry.viewerVote,
       });
     } else if (entry.collection === 'snapshots') {
-      if (typeof data.snapshotId !== 'string' || !Array.isArray(data.items)) continue;
-      const snapshot = data as unknown as DatasetSnapshot;
+      const snapshot = parseSnapshot(data);
+      if (!snapshot) continue;
       snapshots.push(snapshot);
       const prev = snapshotStorageKeys.get(snapshot.snapshotId);
       if (!prev || entry.key > prev) snapshotStorageKeys.set(snapshot.snapshotId, entry.key);

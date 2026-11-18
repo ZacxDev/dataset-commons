@@ -399,17 +399,11 @@ export function Community() {
         }
         // Votes are marks ON the documents: a deleted document takes them with
         // it, and a removed item no longer folds, so there is nothing to withdraw.
-        // Frozen snapshots and LoRA links belong to the dataset's training
-        // history; withdrawing them keeps a deleted scratch dataset from
-        // resurfacing through LoRA detail or the contributor ledger.
-        for (const snapshot of folded.snapshots.filter((s) => s.datasetId === datasetId)) {
-          const key = folded.snapshotStorageKeys.get(snapshot.snapshotId);
-          if (key) {
-            const withdrawn = await storeRef.current.remove('snapshots', key);
-            if (!withdrawn.deleted) throw new Error('a snapshot record was not withdrawn');
-          }
-        }
-        for (const lora of folded.loras.filter((l) => l.datasetId === datasetId)) {
+        // Frozen snapshots are KEPT: they are every credited contributor's
+        // record ("Snapshots I'm in", tracked credit), and deleting the dataset
+        // must not rewrite other accounts' history. Only the viewer's OWN LoRA
+        // links are withdrawn — the store refuses anyone else's (`write: own`).
+        for (const lora of folded.loras.filter((l) => l.datasetId === datasetId && l.trainerId === viewerId)) {
           if (lora.storageKey) {
             const withdrawn = await storeRef.current.remove('loras', lora.storageKey);
             if (!withdrawn.deleted) throw new Error('a LoRA record was not withdrawn');
@@ -1730,6 +1724,15 @@ function LoraDetail(props: {
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const creditedRef = useRef<string | null>(null);
+  // Leaving the LoRA screen mid-poll stops the loop: no state writes and no
+  // ledger write from a screen that is gone (TrainFlow's pollCancelRef pattern).
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const snapshot = lora.snapshot;
   const shares = snapshot ? snapshotShareRows(snapshot) : [];
@@ -1786,10 +1789,13 @@ function LoraDetail(props: {
     setError(null);
     try {
       let snap = await submit(body);
+      if (!mountedRef.current) return;
       setPhase('polling');
       for (let attempt = 0; attempt < 60 && (snap.status === 'pending' || snap.status === 'processing'); attempt++) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (!mountedRef.current) return;
         snap = await poll(snap.workflowId);
+        if (!mountedRef.current) return;
       }
       if (snap.status !== 'succeeded') {
         setError(
@@ -1802,6 +1808,7 @@ function LoraDetail(props: {
       }
       setImageUrl(firstImageUrl(snap));
       await refetchBalance();
+      if (!mountedRef.current) return;
       const gross = snap.cost?.total;
       if (gross != null && gross > 0 && creditedRef.current !== snap.workflowId) {
         creditedRef.current = snap.workflowId;
@@ -1818,6 +1825,7 @@ function LoraDetail(props: {
       }
       setPhase('idle');
     } catch {
+      if (!mountedRef.current) return;
       setError('That generation did not submit cleanly. If no run appears above, no Buzz was charged.');
       setPhase('idle');
     }
