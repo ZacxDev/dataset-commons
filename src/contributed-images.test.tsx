@@ -1,6 +1,8 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { useImageUpload } from '@civitai/blocks-react';
+import type { BlockSharedUploadImageInfo } from '@civitai/app-sdk/blocks';
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import { App } from './App.js';
 import { ALL_APP_SCOPES } from './community-storage.js';
@@ -179,25 +181,45 @@ describe('the Upload tab shares the upload', () => {
     uninstall = undefined;
   });
 
-  it('asks the host for a display upload with share: true, and uses the image it returns', async () => {
+  // An image id the mock host's default upload cannot produce, so the copy below
+  // can only name it if the tab rendered THIS reply.
+  const UPLOADED = {
+    imageId: 7701,
+    nsfwLevel: 1,
+    contentRating: 'pg',
+    url: 'https://image.civitai.com/x/original=true/u.jpeg',
+  } as const;
+  const SHARED_COPY =
+    "Uploaded image #7701 selected. It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13.";
+  const PRIVATE_COPY =
+    "Uploaded image #7701 selected. Kept private: Civitai didn't confirm sharing for this upload, so only you can see it.";
+  const REFUSED_COPY =
+    "Civitai couldn't take this upload just now, so nothing was added. Try again, or choose an image from My Images or paste a link.";
+  const text = (el: HTMLElement) => el.textContent?.replace(/\s+/g, ' ').trim();
+
+  async function clickUpload(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(await screen.findByTestId('dc-add-image'));
+    await user.click(screen.getByTestId('dc-contribute-tab-upload'));
+    await user.click(screen.getByTestId('dc-contribute-upload'));
+  }
+
+  it('asks the host for a display upload with share: true, and says it will be shared when the host echoes shared: true', async () => {
     const user = userEvent.setup();
     const outbound: Array<{ type: string; payload?: Record<string, unknown> }> = [];
     const opened = await openDataset(
       {},
-      { onOutbound: (message) => outbound.push(message as { type: string; payload?: Record<string, unknown> }) },
+      {
+        cannedImageUpload: UPLOADED,
+        cannedImageUploadShared: true,
+        onOutbound: (message) => outbound.push(message as { type: string; payload?: Record<string, unknown> }),
+      },
     );
     uninstall = opened.uninstall;
 
-    await user.click(await screen.findByTestId('dc-add-image'));
-    await user.click(screen.getByTestId('dc-contribute-tab-upload'));
-    await user.click(screen.getByTestId('dc-contribute-upload'));
+    await clickUpload(user);
 
-    // The mock host predates the `shared` echo, as today's civitai does: the upload is
-    // kept private, and the tab says so rather than claiming it is shared.
     const uploaded = await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
-    expect(uploaded).toHaveTextContent(/Uploaded image #\d+ selected/);
-    expect(uploaded).toHaveTextContent("Kept private (this Civitai version doesn't support sharing yet).");
-    expect(uploaded).not.toHaveTextContent(/will be shared/);
+    expect(text(uploaded)).toBe(SHARED_COPY);
     const uploads = outbound.filter((m) => m.type === 'OPEN_IMAGE_UPLOAD');
     expect(uploads).toHaveLength(1);
     const { requestId, ...rest } = uploads[0]!.payload ?? {};
@@ -206,79 +228,45 @@ describe('the Upload tab shares the upload', () => {
     expect(rest).toEqual({ share: true });
   }, 15000);
 
-  it('says the upload will be shared only when the host echoes shared: true', async () => {
+  it('says the upload is kept private when the host answers shared: false', async () => {
     const user = userEvent.setup();
-    const opened = await openDataset(
-      {},
-      {
-        // A host that recorded the share. Replied synchronously, so it settles the
-        // request before the mock host's own canned image.
-        onOutbound: (message) => {
-          const m = message as { type: string; payload?: { requestId?: string } };
-          if (m.type !== 'OPEN_IMAGE_UPLOAD') return;
-          window.dispatchEvent(
-            new MessageEvent('message', {
-              data: {
-                type: 'IMAGE_UPLOAD_RESULT',
-                payload: {
-                  requestId: m.payload?.requestId,
-                  selected: {
-                    imageId: 7701,
-                    nsfwLevel: 1,
-                    contentRating: 'pg',
-                    url: 'https://image.civitai.com/x/original=true/u.jpeg',
-                  },
-                  shared: true,
-                },
-              },
-              origin: window.location.origin,
-            }),
-          );
-        },
-      },
-    );
+    const opened = await openDataset({}, { cannedImageUpload: UPLOADED, cannedImageUploadShared: false });
     uninstall = opened.uninstall;
 
-    await user.click(await screen.findByTestId('dc-add-image'));
-    await user.click(screen.getByTestId('dc-contribute-tab-upload'));
-    await user.click(screen.getByTestId('dc-contribute-upload'));
+    await clickUpload(user);
 
     const uploaded = await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
-    expect(uploaded.textContent?.replace(/\s+/g, ' ').trim()).toBe(
-      "Uploaded image #7701 selected. It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13.",
-    );
+    expect(text(uploaded)).toBe(PRIVATE_COPY);
+    expect(uploaded).not.toHaveTextContent(/will be shared/);
   }, 15000);
 
-  it('shows the host refusal of a shared upload, never treating it as a dismissed picker', async () => {
+  it("a no-token refusal shows a calm message, selects nothing, and leaves the Upload tab working", async () => {
     const user = userEvent.setup();
-    const opened = await openDataset(
-      {},
-      {
-        // The host refuses a shared upload it cannot attribute. Replied synchronously,
-        // so it settles the request before the mock host's own canned image.
-        onOutbound: (message) => {
-          const m = message as { type: string; payload?: { requestId?: string } };
-          if (m.type !== 'OPEN_IMAGE_UPLOAD') return;
-          window.dispatchEvent(
-            new MessageEvent('message', {
-              data: { type: 'IMAGE_UPLOAD_RESULT', payload: { requestId: m.payload?.requestId, error: 'no block token' } },
-              origin: window.location.origin,
-            }),
-          );
-        },
-      },
-    );
+    const opened = await openDataset({}, { cannedImageUpload: UPLOADED, imageUploadShareRefused: true });
     uninstall = opened.uninstall;
 
-    await user.click(await screen.findByTestId('dc-add-image'));
-    await user.click(screen.getByTestId('dc-contribute-tab-upload'));
-    await user.click(screen.getByTestId('dc-contribute-upload'));
+    await clickUpload(user);
 
-    expect(await screen.findByTestId('dc-contribute-error', {}, { timeout: 5000 })).toHaveTextContent(
-      'Civitai could not take this upload: no block token',
-    );
+    expect(text(await screen.findByTestId('dc-contribute-error', {}, { timeout: 5000 }))).toContain(REFUSED_COPY);
+    expect(screen.getByTestId('dc-contribute-error')).not.toHaveTextContent(/no block token/);
     expect(screen.queryByTestId('dc-contribute-uploaded')).not.toBeInTheDocument();
+
+    // The tab survived the rejection: once the host can share, the same button uploads.
+    opened.uninstall.setScenario({ imageUploadShareRefused: false, cannedImageUploadShared: true });
+    await user.click(screen.getByTestId('dc-contribute-upload'));
+    expect(text(await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 }))).toBe(SHARED_COPY);
+    expect(screen.queryByTestId('dc-contribute-error')).not.toBeInTheDocument();
   }, 15000);
+
+  it('the share hook is typed: open() resolves with `shared` at the call the Upload tab makes, no cast', () => {
+    // Compile-time only (never called): `npm run typecheck` fails here on an SDK
+    // whose useImageUpload has no `share` option or no typed `shared` echo.
+    function uploadTabOpen() {
+      return useImageUpload({ share: true }).open();
+    }
+    expectTypeOf<Awaited<ReturnType<typeof uploadTabOpen>>>().toEqualTypeOf<BlockSharedUploadImageInfo | null>();
+    expectTypeOf<BlockSharedUploadImageInfo['shared']>().toEqualTypeOf<boolean>();
+  });
 });
 
 describe('"Save #N" on posted images', () => {

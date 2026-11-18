@@ -7,6 +7,7 @@ import {
   useBuzzWorkflow,
   useCivitaiNavigate,
   useImagePicker,
+  useImageUpload,
   useRequestConsent,
   useRequestSignIn,
 } from '@civitai/blocks-react';
@@ -63,7 +64,6 @@ import {
 } from './community-storage.js';
 import { buildWorkflowBody, firstImageUrl, formatCost, hasBudgetedScope } from './generation.js';
 import { useItemImages } from './item-images.js';
-import { useSharedImageUpload } from './shared-upload.js';
 import { DEFAULT_CHECKPOINT, loraOption } from './models.js';
 import { dataSourceLabel, type DatasetSnapshot, type LedgerEvent } from './training.js';
 import { TrainFlow, type TrainRunLink } from './TrainFlow.js';
@@ -1179,8 +1179,12 @@ function ContributeForm(props: {
   onContribute: (input: { imageRef: string; imageId?: number; caption: string }) => Promise<string | null>;
   onSuccess?: () => void;
 }) {
-  // Shared with this dataset's viewers once scanned (./shared-upload.ts).
-  const { open: openUpload } = useSharedImageUpload();
+  // Shared with this dataset's viewers once Civitai has scanned it (PG / PG13
+  // only), read back through the gated image read (./item-images.ts). `open()`
+  // resolves `shared: true` only when the server recorded the share; it resolves
+  // `null` on a dismiss (and on the host's review-mode / pre-handshake refusals),
+  // and REJECTS on the host's no-token refusal.
+  const { open: openUpload } = useImageUpload({ share: true });
   const { open: openPicker } = useImagePicker();
   const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('mine');
   const [reference, setReference] = useState('');
@@ -1198,8 +1202,11 @@ function ContributeForm(props: {
     let pickedImage: Awaited<ReturnType<typeof openUpload>>;
     try {
       pickedImage = await openUpload();
-    } catch (err) {
-      setError(`Civitai could not take this upload: ${err instanceof Error ? err.message : String(err)}`);
+    } catch {
+      // The host's no-token refusal (or a lost host) rejects: nothing was selected.
+      setError(
+        "Civitai couldn't take this upload just now, so nothing was added. Try again, or choose an image from My Images or paste a link.",
+      );
       return;
     }
     if (!pickedImage) return;
@@ -1322,7 +1329,7 @@ function ContributeForm(props: {
               Uploaded image #{uploaded.imageId} selected.{' '}
               {uploaded.shared
                 ? "It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13."
-                : "Kept private (this Civitai version doesn't support sharing yet)."}
+                : "Kept private: Civitai didn't confirm sharing for this upload, so only you can see it."}
             </span>
           )}
         </span>
