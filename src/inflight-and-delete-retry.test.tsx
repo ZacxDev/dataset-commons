@@ -127,7 +127,8 @@ describe('deleting a dataset that fails partway', () => {
     host = undefined;
   });
 
-  it('says some of it was saved, and Retry finishes it without duplicating the removal record', async () => {
+  /** Seed, open, delete once (it fails at the dataset step); returns the store and the user. */
+  async function deleteThatStopsPartway() {
     const user = userEvent.setup();
     const item = (itemId: string, contributorId: number, contributorName: string): DatasetItemRecord => ({
       itemId,
@@ -147,7 +148,10 @@ describe('deleting a dataset that fails partway', () => {
       { collection: 'items', author: 'dev-viewer', data: itemDoc(item('mine', 2, 'dev')) },
       { collection: 'items', author: 'bob', data: itemDoc(item('bobs', 12, 'bob')) },
     ]);
-    configureDocumentStorage(async () => failFirstDatasetDelete(fake.storage));
+    // ONE wrapper for the whole test: the app re-asks the source on every
+    // collection access, so a wrapper per call would fail every delete.
+    const failing = failFirstDatasetDelete(fake.storage);
+    configureDocumentStorage(async () => failing);
     host = installMockMoneyHost({
       viewer: { id: 2, username: 'dev', status: 'active' },
       declaredScopes: [...ALL_APP_SCOPES],
@@ -164,11 +168,29 @@ describe('deleting a dataset that fails partway', () => {
     expect(notice).toHaveTextContent(/stopped partway/i);
     expect(notice).not.toHaveTextContent(/Nothing was written/i);
 
-    await user.click(screen.getByTestId('dc-community-notice-retry'));
-    expect(await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 })).toBeInTheDocument();
-    const removals = (await fake.storage.collection('removals').list()).items.filter(
+    return { user, fake };
+  }
+
+  const bobsRemovals = async (fake: ReturnType<typeof testDocStore>) =>
+    (await fake.storage.collection('removals').list()).items.filter(
       (doc) => (doc.data as { itemId?: string }).itemId === 'bobs',
     );
-    expect(removals).toHaveLength(1);
+
+  it('says some of it was saved, and Retry finishes it without duplicating the removal record', async () => {
+    const { user, fake } = await deleteThatStopsPartway();
+    await user.click(screen.getByTestId('dc-community-notice-retry'));
+    expect(await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(await bobsRemovals(fake)).toHaveLength(1);
+  }, 30000);
+
+  it('a fresh Delete after the partial failure also finishes it without a duplicate removal record', async () => {
+    const { user, fake } = await deleteThatStopsPartway();
+    if (!screen.queryByTestId('dc-delete-dataset')) await user.click(screen.getByTestId('dc-dataset-menu'));
+    // Two taps again: the fired button disarmed itself.
+    await user.click(screen.getByTestId('dc-delete-dataset'));
+    expect(screen.getByTestId('dc-delete-dataset')).toHaveTextContent('Tap again to confirm delete');
+    await user.click(screen.getByTestId('dc-delete-dataset'));
+    expect(await screen.findByTestId('dc-explore-empty', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(await bobsRemovals(fake)).toHaveLength(1);
   }, 30000);
 });

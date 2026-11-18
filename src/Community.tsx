@@ -220,7 +220,11 @@ export function Community() {
       if (access === 'not-permitted') {
         setNoticeDetail(null);
         setFailedRetry(null);
-        setNotice('Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.');
+        setNotice(
+          partial
+            ? 'That stopped partway: some of it was saved, and community storage access is not granted for the rest. Confirm it in the Civitai dialog, then try again to finish.'
+            : 'Community storage access is not granted yet. Confirm it in the Civitai dialog, then try again.',
+        );
         if (isConsentRefusal(error)) requestConsent({ scopes: [PUBLISH_SCOPE] });
       } else {
         // Surface the store's actual error (walks report it verbatim) and
@@ -401,11 +405,12 @@ export function Community() {
         setNotice('Only the dataset owner can delete it.');
         return false;
       }
-      // Every step is idempotent across re-runs (the consent retry and the
-      // failure banner's retry both re-run this same function): what this
-      // delete already did is remembered here, and a remove the store answers
-      // `deleted: false` ("nothing was there") is a step already done — so a
-      // delete that stopped partway can be finished, never wedged or doubled.
+      // Each run re-reads the current shared state (below), and a remove the
+      // store answers `deleted: false` ("nothing was there") is the goal
+      // reached, so a delete that stopped partway can be finished, not wedged.
+      // `done` additionally remembers this delete's own landed steps: the
+      // `landed` probe for honest failure copy, and a skip for a retry that
+      // runs before a landed write is visible in the read.
       const done = new Set<string>();
       const step = async (key: string, write: () => Promise<void>) => {
         if (done.has(key)) return;
@@ -419,12 +424,18 @@ export function Community() {
       const result = await runWrite(
         `delete-dataset-${datasetId}`,
         async () => {
-          const datasetItems = folded.items.filter((item) => item.datasetId === datasetId);
+          // Read the CURRENT shared state on every run — the first attempt, the
+          // consent retry, the banner's Retry, or a fresh Delete after a delete
+          // that stopped partway — so what already landed is seen and skipped.
+          const loaded = await loadSharedEntries(storeRef.current);
+          if (loaded.access !== 'ready') throw new Error('the shared dataset list could not be read');
+          const current = foldSharedEntries(loaded.entries);
+          const datasetItems = current.items.filter((item) => item.datasetId === datasetId);
           // Remove the dataset's visible contents first. The owner's own
           // entries are withdrawn; another contributor's item gets the same
           // removal record the detail screen writes, so the fold hides it.
           for (const item of datasetItems) {
-            if (folded.removals.some((r) => r.itemId === item.itemId)) continue;
+            if (current.removals.some((r) => r.itemId === item.itemId)) continue;
             if (item.contributorId === viewerId && item.storageKey) {
               const storageKey = item.storageKey;
               await step(`item:${item.itemId}`, () => removeOwn('items', storageKey));
@@ -449,13 +460,16 @@ export function Community() {
           // record ("Snapshots I'm in", tracked credit), and deleting the dataset
           // must not rewrite other accounts' history. Only the viewer's OWN LoRA
           // links are withdrawn — the store refuses anyone else's (`write: own`).
-          for (const lora of folded.loras.filter((l) => l.datasetId === datasetId && l.trainerId === viewerId)) {
+          for (const lora of current.loras.filter((l) => l.datasetId === datasetId && l.trainerId === viewerId)) {
             const storageKey = lora.storageKey;
             if (storageKey) await step(`lora:${lora.loraId}`, () => removeOwn('loras', storageKey));
           }
-          if (!existing.storageKey) throw new Error('dataset record has no storage key to withdraw');
-          const datasetKey = existing.storageKey;
-          await step('dataset', () => removeOwn('datasets', datasetKey));
+          const record = current.datasets.find((d) => d.datasetId === datasetId);
+          // Gone already (an earlier attempt removed it): the delete is done.
+          if (record?.storageKey) {
+            const datasetKey = record.storageKey;
+            await step('dataset', () => removeOwn('datasets', datasetKey));
+          }
           setRoute({ name: 'explore' });
         },
         'Dataset deleted.',
@@ -1511,6 +1525,9 @@ function DatasetDetail(props: {
   const armOrDelete = useCallback(() => {
     if (deleteArmed) {
       if (disarmTimer.current) clearTimeout(disarmTimer.current);
+      // Fired: disarm, so a further tap (a slow delete, or one that stopped
+      // partway) arms again rather than starting a second delete at once.
+      setDeleteArmed(false);
       props.onDelete();
       return;
     }
