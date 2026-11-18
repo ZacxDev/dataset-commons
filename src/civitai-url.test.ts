@@ -13,6 +13,10 @@ describe('safeCivitaiMediaUrl', () => {
     expect(safeCivitaiMediaUrl('https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/k/width=1200/k.jpeg')).toBe(
       'https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/k/width=1200/k.jpeg',
     );
+    // A proxied region's generated image (civitai ORCHESTRATOR_PROXY_HOST).
+    expect(safeCivitaiMediaUrl('https://orchestration-proxy.civitai.com/v2/consumer/blobs/abc.jpeg?sig=x')).toBe(
+      'https://orchestration-proxy.civitai.com/v2/consumer/blobs/abc.jpeg?sig=x',
+    );
     expect(safeCivitaiMediaUrl('https://orchestration.civitai.com/v2/consumer/blobs/abc.jpeg?sig=x')).toBe(
       'https://orchestration.civitai.com/v2/consumer/blobs/abc.jpeg?sig=x',
     );
@@ -98,6 +102,7 @@ describe('host ledger', () => {
       'orchestration.civitai.com',
       'orchestration-new.civitai.com',
       'orchestration-next.civitai.com',
+      'orchestration-proxy.civitai.com',
     ]);
     expect([...CIVITAI_SITE_HOSTS]).toEqual(['civitai.com', 'www.civitai.com']);
   });

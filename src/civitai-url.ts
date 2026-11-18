@@ -22,13 +22,22 @@
  *   (`block-image-upload.service.ts`) all return urls built by it.
  * - the orchestrator blob hosts: the image picker's GENERATED images are the
  *   output's own consumer-blob url. Same set as civitai's
- *   `KNOWN_ORCHESTRATOR_HOSTS` (`src/server/services/orchestrator/trusted-blob-url.ts`).
+ *   `KNOWN_ORCHESTRATOR_HOSTS` (`src/server/services/orchestrator/trusted-blob-url.ts`),
+ *   plus `orchestration-proxy.civitai.com`: for a proxied region civitai
+ *   rewrites those urls onto that Cloudflare-fronted route to the same service
+ *   (`ORCHESTRATOR_PROXY_HOST`, `src/server/orchestrator/region-proxy.ts`), so a
+ *   generated image picked there arrives on it.
+ *
+ * A host check is not a content-rating check: an item with no `imageId` is
+ * shown without the host's gated read, so this module bounds WHERE the browser
+ * fetches from, not WHICH Civitai image it shows.
  */
 export const CIVITAI_MEDIA_HOSTS: readonly string[] = [
   'image.civitai.com',
   'orchestration.civitai.com',
   'orchestration-new.civitai.com',
   'orchestration-next.civitai.com',
+  'orchestration-proxy.civitai.com',
 ];
 
 /** Hosts a Civitai post page lives on — the only hosts a post link may point at. */

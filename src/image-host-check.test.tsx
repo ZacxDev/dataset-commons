@@ -139,9 +139,18 @@ describe('rendering a stored imageRef', () => {
     }
 
     // And nowhere on the page does any hostile ref reach a src or href.
-    const hostileValues = new Set(Object.values(HOSTILE));
+    // Each ref as written AND as `new URL()` would normalise it.
+    const hostileForms = Object.values(HOSTILE).flatMap((ref) => {
+      try {
+        return [ref, new URL(ref).href];
+      } catch {
+        return [ref];
+      }
+    });
     const carriers = [...document.querySelectorAll('[src], [href]')].filter((el) =>
-      hostileValues.has(el.getAttribute('src') ?? el.getAttribute('href') ?? ''),
+      [el.getAttribute('src'), el.getAttribute('href')].some(
+        (value) => value != null && hostileForms.some((form) => value.includes(form)),
+      ),
     );
     expect(carriers).toEqual([]);
   }, 20000);
