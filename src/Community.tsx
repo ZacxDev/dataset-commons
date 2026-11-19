@@ -134,6 +134,17 @@ export function Community() {
   // re-folded on render).
   const [folded, setFolded] = useState<FoldedCommunity>(() => foldSharedEntries([]));
   const [loadState, setLoadState] = useState<LoadState>('loading');
+  // The last applied load stopped at the page cap in some collection: what is
+  // shown is a partial list, and the screen says so.
+  const [truncated, setTruncated] = useState(false);
+  // The newest refresh failed after an earlier load succeeded: the last good
+  // data stays on screen (and in foldedRef, so queued votes still work), with
+  // a notice and a Retry instead of the failure view.
+  const [staleAfterFailure, setStaleAfterFailure] = useState(false);
+  // The same, readable at write time. The kept fold may predate a write that
+  // just landed, so a vote computed from it could re-mark a document: votes
+  // refuse until a refresh succeeds again.
+  const staleAfterFailureRef = useRef(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeDetail, setNoticeDetail] = useState<string | null>(null);
   const [failedRetry, setFailedRetry] = useState<{ run: () => Promise<WriteResult> } | null>(null);
@@ -183,6 +194,16 @@ export function Community() {
       return;
     }
     refreshAppliedRef.current = Math.max(refreshAppliedRef.current, seq);
+    if (result.access === 'failed' && refreshSucceededRef.current > 0) {
+      // A transient read failure after a good load keeps the last good data.
+      // (A 'not-permitted' answer is not transient: it still switches views.)
+      staleAfterFailureRef.current = true;
+      setStaleAfterFailure(true);
+      return;
+    }
+    staleAfterFailureRef.current = false;
+    setStaleAfterFailure(false);
+    setTruncated(result.access === 'ready' && result.truncated);
     // Update the fold ref NOW, not on the next render: the serial write queue
     // starts the next queued write as soon as this refresh resolves, before
     // React re-renders, and castVote computes its `from` vote from this ref.
@@ -510,6 +531,9 @@ export function Community() {
         // is whatever the previous write landed, never the render that
         // scheduled this one. A vote is the viewer's `up`/`down` MARK on the
         // target's own document — marks need no publish consent.
+        if (staleAfterFailureRef.current) {
+          throw new Error('the community list could not be refreshed, so your current vote is unknown — use Retry, then vote again');
+        }
         const target = voteTarget(foldedRef.current?.votes ?? [], targetKind, targetId);
         if (!target) throw new Error(`that ${targetKind} is no longer available`);
         await storeRef.current.setVote(
@@ -803,6 +827,22 @@ export function Community() {
                 </Button>
               </>
             )}
+          </Alert>
+        )}
+
+        {loadState === 'ready' && staleAfterFailure && (
+          <Alert color="warning" title="Couldn't refresh the community" data-testid="dc-community-stale">
+            The latest read of the shared dataset list failed, so this shows the last list that loaded. Voting
+            waits until it refreshes.{' '}
+            <Button size="sm" variant="light" onClick={() => void refresh()} data-testid="dc-community-stale-retry">
+              Retry
+            </Button>
+          </Alert>
+        )}
+        {loadState === 'ready' && truncated && (
+          <Alert color="warning" title="Partial list" data-testid="dc-community-partial">
+            The community has more entries than this app reads at once, so some datasets, items or votes may be
+            missing from what is shown.
           </Alert>
         )}
 
