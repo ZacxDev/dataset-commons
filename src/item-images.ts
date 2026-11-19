@@ -353,9 +353,16 @@ export function useItemImages(imageIds: readonly number[]): ReadonlyMap<number, 
         alive = false;
       };
     }
-    void resolve(ids).then((found) => {
-      if (alive) setImages(found);
-    });
+    resolve(ids).then(
+      (found) => {
+        if (alive) setImages(found);
+      },
+      () => {
+        // A failed read resolves nothing (each item then says it can't be
+        // shown) instead of an unhandled rejection.
+        if (alive) setImages(new Map());
+      },
+    );
     return () => {
       alive = false;
     };

@@ -164,6 +164,11 @@ export function Community() {
 
   const refresh = useCallback(async () => {
     const result = await loadSharedEntries(storeRef.current);
+    // Update the fold ref NOW, not on the next render: the serial write queue
+    // starts the next queued write as soon as this refresh resolves, before
+    // React re-renders, and castVote computes its `from` vote from this ref.
+    // A stale ref there double-marked a document on a second quick vote.
+    foldedRef.current = foldSharedEntries(result.entries);
     setEntries(result.entries);
     setLoadState(result.access);
     return result;
@@ -1843,6 +1848,9 @@ function LoraDetail(props: {
   // an edit after pricing drops the quote (the prompt's onChange), and a body
   // that no longer matches is refused rather than charged at a stale price.
   const quotedBodyRef = useRef<string | null>(null);
+  // Set by a prompt edit made while a price is being fetched: that price is
+  // for the OLD prompt, so it is dropped when it arrives.
+  const promptEditedWhilePricingRef = useRef(false);
   // One run at a time: set synchronously when a submit or a resume starts, so
   // a second click (Price again, Generate, Check again) cannot start a run
   // alongside it — the phase state alone updates too late to stop a double tap.
@@ -1888,11 +1896,17 @@ function LoraDetail(props: {
     setPhase('estimating');
     setError(null);
     quotedBodyRef.current = null;
+    promptEditedWhilePricingRef.current = false;
     try {
       const est = await estimate(body);
       const cost = est.cost?.total;
       if (cost == null || !Number.isFinite(cost) || cost < 0) {
         setError('The generator returned no usable price, so there is nothing honest to confirm against. No Buzz was charged.');
+        setPhase('idle');
+        return;
+      }
+      if (promptEditedWhilePricingRef.current) {
+        setError('The prompt changed while it was being priced, so that price was dropped. Price it again.');
         setPhase('idle');
         return;
       }
@@ -2082,7 +2096,8 @@ function LoraDetail(props: {
               value={prompt}
               onChange={(e) => {
                 setPrompt(e.target.value);
-                // A standing quote priced the OLD prompt.
+                // A standing (or in-flight) quote priced the OLD prompt.
+                if (phase === 'estimating') promptEditedWhilePricingRef.current = true;
                 if (phase === 'quoted') {
                   setQuote(null);
                   quotedBodyRef.current = null;
