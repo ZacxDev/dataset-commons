@@ -156,11 +156,14 @@ export function Community() {
   const foldedRef = useRef<FoldedCommunity | null>(null);
   // refresh() calls are not serialized (the token effect and the Retry /
   // Enable buttons call it outside the write queue), so they can resolve out
-  // of order. Each takes a sequence number when it STARTS; a result is applied
-  // only if no later-started refresh has already been applied, so an older
-  // read can never overwrite a newer one.
+  // of order. Each takes a sequence number when it STARTS. A successful read
+  // is applied unless a later-started SUCCESS already was; a failed read is
+  // applied only if nothing later-started has been applied at all. So an
+  // older read never overwrites a newer one, and a newer failure never hides
+  // a good read that arrives after it.
   const refreshStartedRef = useRef(0);
   const refreshAppliedRef = useRef(0);
+  const refreshSucceededRef = useRef(0);
   // One shared-storage write at a time (see createSerialWriteQueue): the
   // walker's contribute -> vote -> vote cadence must not overlap mutations.
   const writeQueueRef = useRef(createSerialWriteQueue());
@@ -168,12 +171,18 @@ export function Community() {
   const viewerId = viewer?.id ?? null;
   const viewerName = viewer?.username ?? 'you';
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<void> => {
     const seq = ++refreshStartedRef.current;
     const result = await loadSharedEntries(storeRef.current);
-    // A later-started refresh already landed: this read is older, drop it.
-    if (seq < refreshAppliedRef.current) return result;
-    refreshAppliedRef.current = seq;
+    if (result.access === 'ready') {
+      // A later-started read already landed good data: this one is older.
+      if (seq < refreshSucceededRef.current) return;
+      refreshSucceededRef.current = seq;
+    } else if (seq < refreshAppliedRef.current || seq < refreshSucceededRef.current) {
+      // An older failure never replaces a newer result.
+      return;
+    }
+    refreshAppliedRef.current = Math.max(refreshAppliedRef.current, seq);
     // Update the fold ref NOW, not on the next render: the serial write queue
     // starts the next queued write as soon as this refresh resolves, before
     // React re-renders, and castVote computes its `from` vote from this ref.
@@ -182,7 +191,6 @@ export function Community() {
     foldedRef.current = next;
     setFolded(next);
     setLoadState(result.access);
-    return result;
   }, []);
 
   useEffect(() => {
