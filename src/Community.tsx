@@ -1812,13 +1812,24 @@ function LoraDetail(props: {
   const [quote, setQuote] = useState<number | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const creditedRef = useRef<string | null>(null);
+  // Every run this screen has credited: a resumed run and a new run can both
+  // succeed, and each must be credited exactly once.
+  const creditedRef = useRef<Set<string>>(new Set());
+  // The exact body the standing quote priced. Generate submits only THAT body:
+  // an edit after pricing drops the quote (the prompt's onChange), and a body
+  // that no longer matches is refused rather than charged at a stale price.
+  const quotedBodyRef = useRef<string | null>(null);
   // One run at a time: set synchronously when a submit or a resume starts, so
   // a second click (Price again, Generate, Check again) cannot start a run
   // alongside it — the phase state alone updates too late to stop a double tap.
   const runningRef = useRef(false);
-  /** The run a wait gave up on (lost contact / still running), resumable by its id. */
-  const [pendingRunId, setPendingRunId] = useState<string | null>(null);
+  /**
+   * Runs a wait gave up on (lost contact / still running), resumable by id.
+   * A list, not one id: starting a new run must not orphan an earlier one.
+   */
+  const [pendingRunIds, setPendingRunIds] = useState<string[]>([]);
+  const addPendingRun = (id: string) => setPendingRunIds((cur) => (cur.includes(id) ? cur : [...cur, id]));
+  const dropPendingRun = (id: string) => setPendingRunIds((cur) => cur.filter((x) => x !== id));
   const inFlight = phase === 'submitting' || phase === 'polling';
   // Leaving the LoRA screen mid-poll: the run is still polled to the end and its
   // tracked-credit event still written (it was charged), but no state write
@@ -1848,8 +1859,11 @@ function LoraDetail(props: {
   const doEstimate = useCallback(async () => {
     const body = buildBody();
     if (!body || runningRef.current) return;
+    // Held while pricing too, so Check again cannot run alongside an estimate.
+    runningRef.current = true;
     setPhase('estimating');
     setError(null);
+    quotedBodyRef.current = null;
     try {
       const est = await estimate(body);
       const cost = est.cost?.total;
@@ -1859,10 +1873,13 @@ function LoraDetail(props: {
         return;
       }
       setQuote(cost);
+      quotedBodyRef.current = JSON.stringify(body);
       setPhase('quoted');
     } catch {
       setError('Could not price that generation just now. No Buzz was charged.');
       setPhase('idle');
+    } finally {
+      runningRef.current = false;
     }
   }, [buildBody, estimate]);
 
@@ -1906,14 +1923,15 @@ function LoraDetail(props: {
           "Civitai couldn't confirm whether that generation started, so its charge status is unknown. Check your Buzz history before trying again.",
         );
       } else if (outcome.kind === 'lost-contact') {
-        setPendingRunId(outcome.workflowId);
+        addPendingRun(outcome.workflowId);
         setError(
           'Lost contact with Civitai while the generation ran, so its charge status is unknown. Check again to pick the run back up, or check your Buzz history before trying again.',
         );
       } else if (outcome.kind === 'still-running') {
-        setPendingRunId(outcome.workflowId);
+        addPendingRun(outcome.workflowId);
         setError('That generation is still running — check again in a moment.');
       } else {
+        dropPendingRun(outcome.snapshot.workflowId);
         setError(`That generation ${outcome.snapshot.status}. Check the run before assuming any charge.`);
       }
       setPhase('idle');
@@ -1921,7 +1939,7 @@ function LoraDetail(props: {
     }
     const snap = outcome.snapshot;
     if (live()) {
-      setPendingRunId(null);
+      dropPendingRun(snap.workflowId);
       setImageUrl(firstImageUrl(snap));
       try {
         await refetchBalance();
@@ -1930,12 +1948,12 @@ function LoraDetail(props: {
       }
     }
     const gross = snap.cost?.total;
-    if (gross != null && gross > 0 && creditedRef.current !== snap.workflowId) {
-      creditedRef.current = snap.workflowId;
+    if (gross != null && gross > 0 && !creditedRef.current.has(snap.workflowId)) {
+      creditedRef.current.add(snap.workflowId);
       try {
         await props.onLedgerEvent(generationLedgerEvent({ lora, workflowId: snap.workflowId, grossBuzz: gross }));
       } catch {
-        creditedRef.current = null;
+        creditedRef.current.delete(snap.workflowId);
         props.onNotice('The generation succeeded, but saving its tracked-credit event failed. Refresh before relying on the ledger.');
       }
     } else if (gross == null) {
@@ -1947,11 +1965,18 @@ function LoraDetail(props: {
   const onConfirm = async () => {
     const body = buildBody();
     if (!body || quote == null || insufficient || phase !== 'quoted' || runningRef.current) return;
+    if (JSON.stringify(body) !== quotedBodyRef.current) {
+      // The prompt changed after pricing: never submit at the old price.
+      setQuote(null);
+      quotedBodyRef.current = null;
+      setPhase('idle');
+      setError('The prompt changed after it was priced, so nothing was submitted. Price it again.');
+      return;
+    }
     runningRef.current = true;
     try {
       setPhase('submitting');
       setError(null);
-      setPendingRunId(null);
       // A submit outcome and a lost poll are different outcomes: see runGenerationToEnd.
       const outcome = await runGenerationToEnd(body, {
         submit,
@@ -1966,14 +1991,14 @@ function LoraDetail(props: {
     }
   };
 
-  /** Pick a run the last wait gave up on back up by its id — it may have finished (and been charged) since. */
+  /** Pick up the runs earlier waits gave up on, by id — they may have finished (and been charged) since. */
   const onCheckAgain = async () => {
-    if (pendingRunId == null || runningRef.current) return;
+    if (pendingRunIds.length === 0 || runningRef.current || phase !== 'idle') return;
     runningRef.current = true;
     try {
       setPhase('polling');
       setError(null);
-      await finishRun(await pollGenerationToEnd(pendingRunId, null, pollDeps));
+      for (const id of pendingRunIds) await finishRun(await pollGenerationToEnd(id, null, pollDeps));
     } finally {
       runningRef.current = false;
     }
@@ -2028,7 +2053,15 @@ function LoraDetail(props: {
             <input
               style={inputStyle}
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={(e) => {
+                setPrompt(e.target.value);
+                // A standing quote priced the OLD prompt.
+                if (phase === 'quoted') {
+                  setQuote(null);
+                  quotedBodyRef.current = null;
+                  setPhase('idle');
+                }
+              }}
               data-testid="dc-lora-prompt"
             />
             {phase !== 'quoted' ? (
@@ -2057,7 +2090,7 @@ function LoraDetail(props: {
                 )}
               </div>
             )}
-            {pendingRunId != null && !inFlight && (
+            {pendingRunIds.length > 0 && phase === 'idle' && (
               <span>
                 <Button size="sm" variant="light" onClick={() => void onCheckAgain()} data-testid="dc-lora-check-again">
                   Check again
