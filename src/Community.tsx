@@ -149,11 +149,9 @@ export function Community() {
   // The block token as held NOW: a consent grant re-mints it (see ensurePublishConsent).
   const tokenRawRef = useRef(token.raw);
   tokenRawRef.current = token.raw;
-  // Writes read the LATEST folded state at execution time, not the render
-  // that scheduled them: a queued vote must fold what the previous write
-  // actually landed, never a stale snapshot of the entry list.
-  const entriesRef = useRef(entries);
-  entriesRef.current = entries;
+  // The fold as of the LAST refresh, written by refresh() itself (its only
+  // writer) the moment the entries load — before React re-renders — so a
+  // write queued behind another (castVote) reads what that write landed.
   const foldedRef = useRef<FoldedCommunity | null>(null);
   // One shared-storage write at a time (see createSerialWriteQueue): the
   // walker's contribute -> vote -> vote cadence must not overlap mutations.
@@ -181,7 +179,6 @@ export function Community() {
   }, [refresh, storageReady, token.scopes]);
 
   const folded: FoldedCommunity = useMemo(() => foldSharedEntries(entries), [entries]);
-  foldedRef.current = folded;
   const view = useMemo(() => buildCommunityView(folded), [folded]);
   const viewerLedger = useMemo(
     () => buildViewerLedger(folded, viewerId, viewerName),

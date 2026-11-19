@@ -33,7 +33,9 @@ describe('two quick votes on one item', () => {
     const up = await screen.findByTestId('dc-item-item-c-up', {}, { timeout: 5000 });
     const before = fake.calls.length;
 
-    // Two clicks without waiting: the second is queued behind the first write.
+    // Two clicks without waiting. The second vote runs right after the first
+    // write and its refresh resolve — before React re-renders — which is the
+    // window where a render-time ref still held the pre-vote fold.
     await Promise.all([user.click(up), user.click(up)]);
 
     const marks = () =>
