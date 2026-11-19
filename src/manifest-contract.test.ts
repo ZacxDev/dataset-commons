@@ -75,10 +75,12 @@ describe('block.manifest.json — training contract', () => {
     // 'trainingData' }); 0.90 / blocks-react 0.83 made that upload resolve
     // [{ air }] with no url. The TrainFlow upload path is written against it.
     // 0.91 / blocks-react 0.84 added useImageUpload({ share: true }) resolving
-    // with a typed `shared`, which the Upload tab uses.
-    // (Was ^0.90.0 / ^0.83.0; ^0.77.0 / ^0.77.0; ^0.70.1 / ^0.73.2 for useImagePicker, 2026-10-15.)
+    // with a typed `shared`, which the Upload tab uses. blocks-react 0.85 forwards
+    // non-fatal errors to a host that advertises `blockErrors:v1` (a moderator's
+    // review preview); every other host gets nothing new.
+    // (Was ^0.91.0 / ^0.84.0; ^0.90.0 / ^0.83.0; ^0.77.0 / ^0.77.0; ^0.70.1 / ^0.73.2 for useImagePicker, 2026-10-15.)
     expect(pkg.dependencies['@civitai/app-sdk']).toBe('^0.91.0');
-    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.84.0');
+    expect(pkg.dependencies['@civitai/blocks-react']).toBe('^0.85.0');
     expect(pkg.dependencies['@civitai/sdk']).toBe('0.28.0');
   });
 
