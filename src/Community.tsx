@@ -47,7 +47,6 @@ import {
   type FoldedCommunity,
   type LoraRecord,
   type LoraView,
-  type SharedEntryLike,
   type VoteValue,
 } from './community.js';
 import { useCommunityStore, useKvStorage, useStorageReady } from './app-storage.js';
@@ -131,7 +130,9 @@ export function Community() {
   const { requestSignIn } = useRequestSignIn();
 
   const [route, setRoute] = useState<Route>({ name: 'explore' });
-  const [entries, setEntries] = useState<SharedEntryLike[]>([]);
+  // The folded community, computed ONCE per load inside refresh() (never
+  // re-folded on render).
+  const [folded, setFolded] = useState<FoldedCommunity>(() => foldSharedEntries([]));
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeDetail, setNoticeDetail] = useState<string | null>(null);
@@ -149,10 +150,17 @@ export function Community() {
   // The block token as held NOW: a consent grant re-mints it (see ensurePublishConsent).
   const tokenRawRef = useRef(token.raw);
   tokenRawRef.current = token.raw;
-  // The fold as of the LAST refresh, written by refresh() itself (its only
-  // writer) the moment the entries load — before React re-renders — so a
-  // write queued behind another (castVote) reads what that write landed.
+  // The fold as of the newest APPLIED refresh, written by refresh() itself
+  // (its only writer) the moment the entries load — before React re-renders —
+  // so a write queued behind another (castVote) reads what that write landed.
   const foldedRef = useRef<FoldedCommunity | null>(null);
+  // refresh() calls are not serialized (the token effect and the Retry /
+  // Enable buttons call it outside the write queue), so they can resolve out
+  // of order. Each takes a sequence number when it STARTS; a result is applied
+  // only if no later-started refresh has already been applied, so an older
+  // read can never overwrite a newer one.
+  const refreshStartedRef = useRef(0);
+  const refreshAppliedRef = useRef(0);
   // One shared-storage write at a time (see createSerialWriteQueue): the
   // walker's contribute -> vote -> vote cadence must not overlap mutations.
   const writeQueueRef = useRef(createSerialWriteQueue());
@@ -161,13 +169,18 @@ export function Community() {
   const viewerName = viewer?.username ?? 'you';
 
   const refresh = useCallback(async () => {
+    const seq = ++refreshStartedRef.current;
     const result = await loadSharedEntries(storeRef.current);
+    // A later-started refresh already landed: this read is older, drop it.
+    if (seq < refreshAppliedRef.current) return result;
+    refreshAppliedRef.current = seq;
     // Update the fold ref NOW, not on the next render: the serial write queue
     // starts the next queued write as soon as this refresh resolves, before
     // React re-renders, and castVote computes its `from` vote from this ref.
     // A stale ref there double-marked a document on a second quick vote.
-    foldedRef.current = foldSharedEntries(result.entries);
-    setEntries(result.entries);
+    const next = foldSharedEntries(result.entries);
+    foldedRef.current = next;
+    setFolded(next);
     setLoadState(result.access);
     return result;
   }, []);
@@ -178,7 +191,6 @@ export function Community() {
     void refresh();
   }, [refresh, storageReady, token.scopes]);
 
-  const folded: FoldedCommunity = useMemo(() => foldSharedEntries(entries), [entries]);
   const view = useMemo(() => buildCommunityView(folded), [folded]);
   const viewerLedger = useMemo(
     () => buildViewerLedger(folded, viewerId, viewerName),
