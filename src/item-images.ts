@@ -197,7 +197,13 @@ function catalogChunk(
     catalog(chunk, controller.signal).then(
       (body) => {
         clearTimeout(timer);
-        resolve(parseCatalogImages(body, new Set(chunk), ceiling));
+        // A body the parser throws on is a failed read, like a rejected one:
+        // resolve [] rather than leave this promise pending forever.
+        try {
+          resolve(parseCatalogImages(body, new Set(chunk), ceiling));
+        } catch {
+          resolve([]);
+        }
       },
       () => {
         clearTimeout(timer);

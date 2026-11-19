@@ -1234,18 +1234,27 @@ function ContributeForm(props: {
   onContribute: (input: { imageRef: string; imageId?: number; caption: string }) => Promise<string | null>;
   onSuccess?: () => void;
 }) {
-  // Shared with this dataset's viewers once Civitai has scanned it (PG / PG13
-  // only), read back through the gated image read (./item-images.ts). `open()`
-  // resolves `shared: true` only when the server recorded the share; it resolves
-  // `null` on a dismiss (and on the host's review-mode / pre-handshake refusals),
-  // and REJECTS on the host's no-token refusal.
-  const { open: openUpload } = useImageUpload({ share: true });
+  // An upload is PRIVATE unless the contributor ticks "Share" (default off).
+  // A shared one is shown to this dataset's viewers once Civitai has scanned it
+  // (PG / PG13 only), read back through the gated image read (./item-images.ts):
+  // `open()` resolves `shared: true` only when the server recorded the share.
+  // Both resolve `null` on a dismiss (and on the host's review-mode /
+  // pre-handshake refusals), and REJECT on the host's no-token refusal.
+  const { open: openSharedUpload } = useImageUpload({ share: true });
+  const { open: openPrivateUpload } = useImageUpload();
+  const [shareUpload, setShareUpload] = useState(false);
   const { open: openPicker } = useImagePicker();
   const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('mine');
   const [reference, setReference] = useState('');
   const [caption, setCaption] = useState('');
   const [rights, setRights] = useState(false);
-  const [uploaded, setUploaded] = useState<{ imageId: number; url: string; shared: boolean } | null>(null);
+  const [uploaded, setUploaded] = useState<{
+    imageId: number;
+    url: string;
+    shared: boolean;
+    /** Whether the contributor asked for it to be shared. */
+    shareRequested: boolean;
+  } | null>(null);
   const [picked, setPicked] = useState<{ imageId?: number; url: string; source: 'posted' | 'generated' } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -1254,9 +1263,15 @@ function ContributeForm(props: {
   const hasSelection = picked != null || uploaded != null || reference.trim().length > 0;
 
   const upload = async () => {
-    let pickedImage: Awaited<ReturnType<typeof openUpload>>;
+    const shareRequested = shareUpload;
+    let pickedImage: { imageId: number; url: string; shared: boolean } | null;
     try {
-      pickedImage = await openUpload();
+      if (shareRequested) {
+        pickedImage = await openSharedUpload();
+      } else {
+        const privateImage = await openPrivateUpload();
+        pickedImage = privateImage ? { imageId: privateImage.imageId, url: privateImage.url, shared: false } : null;
+      }
     } catch {
       // The host's no-token refusal (or a lost host) rejects: nothing was selected.
       setError(
@@ -1265,9 +1280,12 @@ function ContributeForm(props: {
       return;
     }
     if (!pickedImage) return;
-    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url, shared: pickedImage.shared });
+    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url, shared: pickedImage.shared, shareRequested });
     setPicked(null);
-    setReference(pickedImage.url);
+    // Never copy an upload's raw edge url into the Link box: from there an
+    // edit would detach it from the upload and store it as a plain link,
+    // around the id-only rule and the shared-upload refusal.
+    setReference('');
     setError(null);
   };
 
@@ -1286,6 +1304,19 @@ function ContributeForm(props: {
   const submit = async () => {
     let imageRef = reference.trim();
     let imageId: number | undefined = uploaded?.imageId;
+    // An upload is stored by its image id ONLY. Its raw edge url is unsigned,
+    // and the shared `items` document (and any snapshot frozen from it) is read
+    // by every viewer, so writing it would hand out an image the contributor
+    // kept private — or one Civitai later rates above a viewer's settings.
+    // Viewers see an uploaded item only through the host's gated read, by id.
+    if (uploaded && !picked) imageRef = '';
+    // Operator decision 2026-11-19: an upload joins a SHARED dataset only when
+    // it is shared — nobody votes on an item they can't see. A private upload
+    // (Share off, or a share Civitai didn't confirm) is refused here.
+    if (uploaded && !picked && !uploaded.shared) {
+      setError(uploaded.shareRequested ? UNCONFIRMED_SHARE_REFUSED : UNSHARED_UPLOAD_REFUSED);
+      return;
+    }
     if (picked) {
       imageRef = picked.url;
       imageId = picked.imageId;
@@ -1375,16 +1406,27 @@ function ContributeForm(props: {
           </Button>
           <span style={hintStyle} data-testid="dc-contribute-upload-note">
             {' '}
-            Your upload is not posted on Civitai. It is shared with this dataset&apos;s viewers once Civitai has
-            scanned it and rated it PG or PG-13.
+            Your upload is not posted on Civitai, and it stays private to you unless you choose to share it. Only a
+            shared upload can be added to this dataset.
           </span>
+          <label style={checkStyle}>
+            <input
+              type="checkbox"
+              checked={shareUpload}
+              onChange={(e) => setShareUpload(e.target.checked)}
+              data-testid="dc-contribute-share"
+            />
+            Share with this dataset&apos;s viewers once Civitai has scanned it and rated it PG or PG-13.
+          </label>
           {uploaded && (
             <span style={hintStyle} data-testid="dc-contribute-uploaded">
               {' '}
               Uploaded image #{uploaded.imageId} selected.{' '}
               {uploaded.shared
                 ? "It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13."
-                : "Kept private: Civitai didn't confirm sharing for this upload, so only you can see it."}
+                : uploaded.shareRequested
+                  ? "Kept private: Civitai didn't confirm sharing for this upload, so only you can see it, and it can't be added to this dataset."
+                  : "Kept private: only you can see it, so it can't be added to this dataset. To contribute it, tick Share and upload it again."}
             </span>
           )}
         </span>
@@ -1475,6 +1517,13 @@ function StoredImageRef(props: { itemId: string; imageRef: string; caption: stri
     </span>
   );
 }
+
+/** Why a private upload can't be added to a shared dataset (operator decision 2026-11-19). */
+const UNSHARED_UPLOAD_REFUSED =
+  "This upload is private, so it can't be added to this dataset: other viewers couldn't see it to vote on it. Tick Share and upload it again to contribute it.";
+/** The same refusal when Share WAS ticked but Civitai didn't confirm the share. */
+const UNCONFIRMED_SHARE_REFUSED =
+  "Civitai didn't confirm sharing this upload, so it can't be added to this dataset: other viewers couldn't see it to vote on it. Try the upload again in a moment.";
 
 /** Author display on the upstream civitai-avatar element (initials + name). */
 function AuthorByline(props: { name: string }) {
@@ -1787,13 +1836,24 @@ function LoraDetail(props: {
   const [quote, setQuote] = useState<number | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const creditedRef = useRef<string | null>(null);
+  // Every run this screen has credited: a resumed run and a new run can both
+  // succeed, and each must be credited exactly once.
+  const creditedRef = useRef<Set<string>>(new Set());
+  // The exact body the standing quote priced. Generate submits only THAT body:
+  // an edit after pricing drops the quote (the prompt's onChange), and a body
+  // that no longer matches is refused rather than charged at a stale price.
+  const quotedBodyRef = useRef<string | null>(null);
   // One run at a time: set synchronously when a submit or a resume starts, so
   // a second click (Price again, Generate, Check again) cannot start a run
   // alongside it — the phase state alone updates too late to stop a double tap.
   const runningRef = useRef(false);
-  /** The run a wait gave up on (lost contact / still running), resumable by its id. */
-  const [pendingRunId, setPendingRunId] = useState<string | null>(null);
+  /**
+   * Runs a wait gave up on (lost contact / still running), resumable by id.
+   * A list, not one id: starting a new run must not orphan an earlier one.
+   */
+  const [pendingRunIds, setPendingRunIds] = useState<string[]>([]);
+  const addPendingRun = (id: string) => setPendingRunIds((cur) => (cur.includes(id) ? cur : [...cur, id]));
+  const dropPendingRun = (id: string) => setPendingRunIds((cur) => cur.filter((x) => x !== id));
   const inFlight = phase === 'submitting' || phase === 'polling';
   // Leaving the LoRA screen mid-poll: the run is still polled to the end and its
   // tracked-credit event still written (it was charged), but no state write
@@ -1823,8 +1883,11 @@ function LoraDetail(props: {
   const doEstimate = useCallback(async () => {
     const body = buildBody();
     if (!body || runningRef.current) return;
+    // Held while pricing too, so Check again cannot run alongside an estimate.
+    runningRef.current = true;
     setPhase('estimating');
     setError(null);
+    quotedBodyRef.current = null;
     try {
       const est = await estimate(body);
       const cost = est.cost?.total;
@@ -1834,10 +1897,13 @@ function LoraDetail(props: {
         return;
       }
       setQuote(cost);
+      quotedBodyRef.current = JSON.stringify(body);
       setPhase('quoted');
     } catch {
       setError('Could not price that generation just now. No Buzz was charged.');
       setPhase('idle');
+    } finally {
+      runningRef.current = false;
     }
   }, [buildBody, estimate]);
 
@@ -1868,7 +1934,7 @@ function LoraDetail(props: {
    * and the ledger belongs to Community, still mounted), but nothing writes
    * THIS screen's state any more.
    */
-  const finishRun = async (outcome: GenerationRunOutcome) => {
+  const finishRun = async (outcome: GenerationRunOutcome, settle = true) => {
     const live = () => mountedRef.current;
     if (outcome.kind !== 'succeeded') {
       if (!live()) return;
@@ -1881,22 +1947,23 @@ function LoraDetail(props: {
           "Civitai couldn't confirm whether that generation started, so its charge status is unknown. Check your Buzz history before trying again.",
         );
       } else if (outcome.kind === 'lost-contact') {
-        setPendingRunId(outcome.workflowId);
+        addPendingRun(outcome.workflowId);
         setError(
           'Lost contact with Civitai while the generation ran, so its charge status is unknown. Check again to pick the run back up, or check your Buzz history before trying again.',
         );
       } else if (outcome.kind === 'still-running') {
-        setPendingRunId(outcome.workflowId);
+        addPendingRun(outcome.workflowId);
         setError('That generation is still running — check again in a moment.');
       } else {
+        dropPendingRun(outcome.snapshot.workflowId);
         setError(`That generation ${outcome.snapshot.status}. Check the run before assuming any charge.`);
       }
-      setPhase('idle');
+      if (settle) setPhase('idle');
       return;
     }
     const snap = outcome.snapshot;
     if (live()) {
-      setPendingRunId(null);
+      dropPendingRun(snap.workflowId);
       setImageUrl(firstImageUrl(snap));
       try {
         await refetchBalance();
@@ -1905,28 +1972,35 @@ function LoraDetail(props: {
       }
     }
     const gross = snap.cost?.total;
-    if (gross != null && gross > 0 && creditedRef.current !== snap.workflowId) {
-      creditedRef.current = snap.workflowId;
+    if (gross != null && gross > 0 && !creditedRef.current.has(snap.workflowId)) {
+      creditedRef.current.add(snap.workflowId);
       try {
         await props.onLedgerEvent(generationLedgerEvent({ lora, workflowId: snap.workflowId, grossBuzz: gross }));
       } catch {
-        creditedRef.current = null;
+        creditedRef.current.delete(snap.workflowId);
         props.onNotice('The generation succeeded, but saving its tracked-credit event failed. Refresh before relying on the ledger.');
       }
     } else if (gross == null) {
       props.onNotice('The generation finished without a reported cost, so no tracked credit was recorded for it.');
     }
-    if (live()) setPhase('idle');
+    if (live() && settle) setPhase('idle');
   };
 
   const onConfirm = async () => {
     const body = buildBody();
     if (!body || quote == null || insufficient || phase !== 'quoted' || runningRef.current) return;
+    if (JSON.stringify(body) !== quotedBodyRef.current) {
+      // The prompt changed after pricing: never submit at the old price.
+      setQuote(null);
+      quotedBodyRef.current = null;
+      setPhase('idle');
+      setError('The prompt changed after it was priced, so nothing was submitted. Price it again.');
+      return;
+    }
     runningRef.current = true;
     try {
       setPhase('submitting');
       setError(null);
-      setPendingRunId(null);
       // A submit outcome and a lost poll are different outcomes: see runGenerationToEnd.
       const outcome = await runGenerationToEnd(body, {
         submit,
@@ -1941,14 +2015,17 @@ function LoraDetail(props: {
     }
   };
 
-  /** Pick a run the last wait gave up on back up by its id — it may have finished (and been charged) since. */
+  /** Pick up the runs earlier waits gave up on, by id — they may have finished (and been charged) since. */
   const onCheckAgain = async () => {
-    if (pendingRunId == null || runningRef.current) return;
+    if (pendingRunIds.length === 0 || runningRef.current || phase !== 'idle') return;
     runningRef.current = true;
     try {
       setPhase('polling');
       setError(null);
-      await finishRun(await pollGenerationToEnd(pendingRunId, null, pollDeps));
+      // The screen stays "polling" until the LAST pending run is settled.
+      for (const [i, id] of pendingRunIds.entries()) {
+        await finishRun(await pollGenerationToEnd(id, null, pollDeps), i === pendingRunIds.length - 1);
+      }
     } finally {
       runningRef.current = false;
     }
@@ -2003,7 +2080,15 @@ function LoraDetail(props: {
             <input
               style={inputStyle}
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={(e) => {
+                setPrompt(e.target.value);
+                // A standing quote priced the OLD prompt.
+                if (phase === 'quoted') {
+                  setQuote(null);
+                  quotedBodyRef.current = null;
+                  setPhase('idle');
+                }
+              }}
               data-testid="dc-lora-prompt"
             />
             {phase !== 'quoted' ? (
@@ -2032,7 +2117,7 @@ function LoraDetail(props: {
                 )}
               </div>
             )}
-            {pendingRunId != null && !inFlight && (
+            {pendingRunIds.length > 0 && phase === 'idle' && (
               <span>
                 <Button size="sm" variant="light" onClick={() => void onCheckAgain()} data-testid="dc-lora-check-again">
                   Check again
