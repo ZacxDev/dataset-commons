@@ -142,9 +142,12 @@ export function Community() {
   // a notice and a Retry instead of the failure view.
   const [staleAfterFailure, setStaleAfterFailure] = useState(false);
   // The same, readable at write time. The kept fold may predate a write that
-  // just landed, so a vote computed from it could re-mark a document: votes
-  // refuse until a refresh succeeds again.
+  // just landed, so a write that decides from it (a vote's `from`, "is this
+  // LoRA / snapshot / ledger event already stored?") re-reads first: see
+  // foldForWrite.
   const staleAfterFailureRef = useRef(false);
+  // The access of the newest APPLIED load (a stale-kept failure leaves it).
+  const appliedAccessRef = useRef<LoadState>('loading');
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeDetail, setNoticeDetail] = useState<string | null>(null);
   const [failedRetry, setFailedRetry] = useState<{ run: () => Promise<WriteResult> } | null>(null);
@@ -202,6 +205,7 @@ export function Community() {
       return;
     }
     staleAfterFailureRef.current = false;
+    appliedAccessRef.current = result.access;
     setStaleAfterFailure(false);
     setTruncated(result.access === 'ready' && result.truncated);
     // Update the fold ref NOW, not on the next render: the serial write queue
@@ -213,6 +217,20 @@ export function Community() {
     setFolded(next);
     setLoadState(result.access);
   }, []);
+
+  /**
+   * The fold a write may decide from. Normally the newest applied fold; while
+   * the screen shows kept data after a failed refresh, a fresh read first —
+   * and if that read is not a good one, the write is refused rather than made
+   * from data that may predate the last write.
+   */
+  const foldForWrite = useCallback(async (): Promise<FoldedCommunity> => {
+    if (staleAfterFailureRef.current) await refresh();
+    if (staleAfterFailureRef.current || appliedAccessRef.current !== 'ready' || !foldedRef.current) {
+      throw new Error('the community list could not be refreshed, so this change was not saved — try again in a moment');
+    }
+    return foldedRef.current;
+  }, [refresh]);
 
   useEffect(() => {
     // Nothing can reach the store before the host has sent its origin + token.
@@ -531,10 +549,8 @@ export function Community() {
         // is whatever the previous write landed, never the render that
         // scheduled this one. A vote is the viewer's `up`/`down` MARK on the
         // target's own document — marks need no publish consent.
-        if (staleAfterFailureRef.current) {
-          throw new Error('the community list could not be refreshed, so your current vote is unknown — use Retry, then vote again');
-        }
-        const target = voteTarget(foldedRef.current?.votes ?? [], targetKind, targetId);
+        const current = await foldForWrite();
+        const target = voteTarget(current.votes, targetKind, targetId);
         if (!target) throw new Error(`that ${targetKind} is no longer available`);
         await storeRef.current.setVote(
           targetKind === 'dataset' ? 'datasets' : 'items',
@@ -544,7 +560,7 @@ export function Community() {
         );
       });
     },
-    [requireViewer, runWrite, viewerId],
+    [foldForWrite, requireViewer, runWrite, viewerId],
   );
 
   const contributeItem = useCallback(
@@ -621,7 +637,7 @@ export function Community() {
       // A re-click on the same frozen snapshot is idempotent; a stored snapshot
       // that merely shares the id is never adopted (its contributors would be
       // credited this run's fee), so the run is refused before any Buzz moves.
-      const action = snapshotPersistAction(folded.snapshots, snapshot);
+      const action = snapshotPersistAction((await foldForWrite()).snapshots, snapshot);
       if (action === 'already-stored') return;
       if (action === 'conflict') throw new Error('a different snapshot is already stored under this id');
       // Persisted BEFORE the run is charged (TrainFlow): a refusal here means no
@@ -632,13 +648,13 @@ export function Community() {
       });
       await refresh();
     },
-    [folded.snapshots, refresh, withPublishConsent],
+    [foldForWrite, refresh, withPublishConsent],
   );
 
   const persistLedgerEvent = useCallback(
     async (event: LedgerEvent) => {
       if (
-        folded.ledgerEvents.some(
+        (await foldForWrite()).ledgerEvents.some(
           (e) => e.sourceRef === event.sourceRef && e.eventType === event.eventType && e.loraId === event.loraId,
         )
       ) {
@@ -649,14 +665,15 @@ export function Community() {
       });
       await refresh();
     },
-    [folded.ledgerEvents, refresh, withPublishConsent],
+    [foldForWrite, refresh, withPublishConsent],
   );
 
   const persistRunLink = useCallback(
     async (link: TrainRunLink) => {
       const snapshot = link.snapshot;
       if (!snapshot || viewerId == null) return;
-      const existing = folded.loras.find((l) => l.workflowId === link.workflowId);
+      const current = await foldForWrite();
+      const existing = current.loras.find((l) => l.workflowId === link.workflowId);
       const now = new Date().toISOString();
       const record: LoraRecord = existing ?? {
         loraId: `lora_${link.workflowId}`,
@@ -664,7 +681,7 @@ export function Community() {
         snapshotId: snapshot.snapshotId,
         trainerId: viewerId,
         trainerName: viewerName,
-        name: `${folded.datasets.find((d) => d.datasetId === snapshot.datasetId)?.name ?? 'Dataset'} LoRA`,
+        name: `${current.datasets.find((d) => d.datasetId === snapshot.datasetId)?.name ?? 'Dataset'} LoRA`,
         workflowId: link.workflowId,
         published: false,
         createdAt: now,
@@ -690,7 +707,7 @@ export function Community() {
       });
       await refresh();
     },
-    [folded.datasets, folded.loras, refresh, viewerId, viewerName, withPublishConsent],
+    [foldForWrite, refresh, viewerId, viewerName, withPublishConsent],
   );
 
   /** Workflows already recorded as some LoRA: "Find my run" must never re-link one. */
@@ -832,8 +849,8 @@ export function Community() {
 
         {loadState === 'ready' && staleAfterFailure && (
           <Alert color="warning" title="Couldn't refresh the community" data-testid="dc-community-stale">
-            The latest read of the shared dataset list failed, so this shows the last list that loaded. Voting
-            waits until it refreshes.{' '}
+            The latest read of the shared dataset list failed, so this shows the last list that loaded. A vote
+            or save re-reads it first, and is refused while it still can&apos;t be read.{' '}
             <Button size="sm" variant="light" onClick={() => void refresh()} data-testid="dc-community-stale-retry">
               Retry
             </Button>

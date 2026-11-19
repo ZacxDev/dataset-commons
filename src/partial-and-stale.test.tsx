@@ -85,7 +85,7 @@ describe('a partial list and a failed refresh', () => {
     expect(screen.queryByTestId('dc-community-partial')).not.toBeInTheDocument();
   }, 20000);
 
-  it('when the newest refresh fails after a good load, the last good data stays and voting waits for a refresh', async () => {
+  it('when the newest refresh fails after a good load, the last good data stays and a vote re-reads before acting', async () => {
     const user = userEvent.setup();
     const fake = testDocStore();
     await seedCommunity(fake, demoSharedSeed());
@@ -115,18 +115,19 @@ describe('a partial list and a failed refresh', () => {
     expect(marks()).toEqual(['PUT up']);
 
     // The kept fold predates that vote, so a second vote must not act on it
-    // (it would PUT up again): it is refused with a reason, writing nothing.
+    // (it would PUT up again). It re-reads first; while the read still fails
+    // it is refused with a reason, writing nothing.
     await user.click(screen.getByTestId('dc-item-item-c-up'));
     expect(await screen.findByTestId('dc-community-notice-detail', {}, { timeout: 5000 })).toHaveTextContent(
       /could not be refreshed/,
     );
     expect(marks()).toEqual(['PUT up']);
 
-    // Once a refresh succeeds, the fold is current again and the vote toggles off.
+    // The store recovers. The refused vote's own "Retry save" now works on its
+    // own: it re-reads, sees the first vote, and toggles it off.
     flags.failDatasets = false;
-    await user.click(screen.getByTestId('dc-community-stale-retry'));
-    await waitFor(() => expect(screen.queryByTestId('dc-community-stale')).not.toBeInTheDocument(), { timeout: 5000 });
-    await user.click(screen.getByTestId('dc-item-item-c-up'));
+    await user.click(screen.getByTestId('dc-community-notice-retry'));
     await waitFor(() => expect(marks()).toEqual(['PUT up', 'DELETE up']), { timeout: 5000 });
+    await waitFor(() => expect(screen.queryByTestId('dc-community-stale')).not.toBeInTheDocument(), { timeout: 5000 });
   }, 20000);
 });
