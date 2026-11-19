@@ -1282,7 +1282,10 @@ function ContributeForm(props: {
     if (!pickedImage) return;
     setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url, shared: pickedImage.shared, shareRequested });
     setPicked(null);
-    setReference(pickedImage.url);
+    // Never copy an upload's raw edge url into the Link box: from there an
+    // edit would detach it from the upload and store it as a plain link,
+    // around the id-only rule and the shared-upload refusal.
+    setReference('');
     setError(null);
   };
 
@@ -1311,7 +1314,7 @@ function ContributeForm(props: {
     // it is shared — nobody votes on an item they can't see. A private upload
     // (Share off, or a share Civitai didn't confirm) is refused here.
     if (uploaded && !picked && !uploaded.shared) {
-      setError(UNSHARED_UPLOAD_REFUSED);
+      setError(uploaded.shareRequested ? UNCONFIRMED_SHARE_REFUSED : UNSHARED_UPLOAD_REFUSED);
       return;
     }
     if (picked) {
@@ -1518,6 +1521,9 @@ function StoredImageRef(props: { itemId: string; imageRef: string; caption: stri
 /** Why a private upload can't be added to a shared dataset (operator decision 2026-11-19). */
 const UNSHARED_UPLOAD_REFUSED =
   "This upload is private, so it can't be added to this dataset: other viewers couldn't see it to vote on it. Tick Share and upload it again to contribute it.";
+/** The same refusal when Share WAS ticked but Civitai didn't confirm the share. */
+const UNCONFIRMED_SHARE_REFUSED =
+  "Civitai didn't confirm sharing this upload, so it can't be added to this dataset: other viewers couldn't see it to vote on it. Try the upload again in a moment.";
 
 /** Author display on the upstream civitai-avatar element (initials + name). */
 function AuthorByline(props: { name: string }) {

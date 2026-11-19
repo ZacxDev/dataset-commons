@@ -267,9 +267,22 @@ describe('the Upload tab: private by default, shared only when chosen', () => {
     );
   }, 20000);
 
-  for (const [name, share, hostShared] of [
-    ['Share left off', false, true],
-    ["Share ticked but Civitai didn't confirm it", true, false],
+  it("an upload's url never lands in the Link box, where an edit could store it as a plain link", async () => {
+    const user = userEvent.setup();
+    const opened = await openDataset({}, { cannedImageUpload: UPLOADED, cannedImageUploadShared: false });
+    uninstall = opened.uninstall;
+
+    await clickUpload(user, { share: false });
+    await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
+    await user.click(screen.getByTestId('dc-contribute-tab-link'));
+    expect(screen.getByTestId('dc-contribute-ref')).toHaveValue('');
+  }, 20000);
+
+  const UNCONFIRMED_REFUSED_COPY =
+    "Civitai didn't confirm sharing this upload, so it can't be added to this dataset: other viewers couldn't see it to vote on it. Try the upload again in a moment.";
+  for (const [name, share, hostShared, refusal] of [
+    ['Share left off', false, true, UNSHARED_REFUSED_COPY],
+    ["Share ticked but Civitai didn't confirm it", true, false, UNCONFIRMED_REFUSED_COPY],
   ] as const) {
     it(`an unshared upload (${name}) is refused for the shared dataset, says why, and stores nothing`, async () => {
       const user = userEvent.setup();
@@ -279,7 +292,7 @@ describe('the Upload tab: private by default, shared only when chosen', () => {
       await clickUpload(user, { share });
       await contributeUpload(user);
 
-      expect(text(await screen.findByTestId('dc-contribute-error', {}, { timeout: 5000 }))).toContain(UNSHARED_REFUSED_COPY);
+      expect(text(await screen.findByTestId('dc-contribute-error', {}, { timeout: 5000 }))).toContain(refusal);
       await new Promise((resolve) => setTimeout(resolve, 500));
       expect(await storedUploads()).toEqual([]);
     }, 20000);
