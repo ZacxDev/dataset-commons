@@ -47,7 +47,6 @@ import {
   type FoldedCommunity,
   type LoraRecord,
   type LoraView,
-  type SharedEntryLike,
   type VoteValue,
 } from './community.js';
 import { useCommunityStore, useKvStorage, useStorageReady } from './app-storage.js';
@@ -131,7 +130,9 @@ export function Community() {
   const { requestSignIn } = useRequestSignIn();
 
   const [route, setRoute] = useState<Route>({ name: 'explore' });
-  const [entries, setEntries] = useState<SharedEntryLike[]>([]);
+  // The folded community, computed ONCE per load inside refresh() (never
+  // re-folded on render).
+  const [folded, setFolded] = useState<FoldedCommunity>(() => foldSharedEntries([]));
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeDetail, setNoticeDetail] = useState<string | null>(null);
@@ -149,10 +150,20 @@ export function Community() {
   // The block token as held NOW: a consent grant re-mints it (see ensurePublishConsent).
   const tokenRawRef = useRef(token.raw);
   tokenRawRef.current = token.raw;
-  // The fold as of the LAST refresh, written by refresh() itself (its only
-  // writer) the moment the entries load — before React re-renders — so a
-  // write queued behind another (castVote) reads what that write landed.
+  // The fold as of the newest APPLIED refresh, written by refresh() itself
+  // (its only writer) the moment the entries load — before React re-renders —
+  // so a write queued behind another (castVote) reads what that write landed.
   const foldedRef = useRef<FoldedCommunity | null>(null);
+  // refresh() calls are not serialized (the token effect and the Retry /
+  // Enable buttons call it outside the write queue), so they can resolve out
+  // of order. Each takes a sequence number when it STARTS. A successful read
+  // is applied unless a later-started SUCCESS already was; a failed read is
+  // applied only if nothing later-started has been applied at all. So an
+  // older read never overwrites a newer one, and a newer failure never hides
+  // a good read that arrives after it.
+  const refreshStartedRef = useRef(0);
+  const refreshAppliedRef = useRef(0);
+  const refreshSucceededRef = useRef(0);
   // One shared-storage write at a time (see createSerialWriteQueue): the
   // walker's contribute -> vote -> vote cadence must not overlap mutations.
   const writeQueueRef = useRef(createSerialWriteQueue());
@@ -160,16 +171,26 @@ export function Community() {
   const viewerId = viewer?.id ?? null;
   const viewerName = viewer?.username ?? 'you';
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<void> => {
+    const seq = ++refreshStartedRef.current;
     const result = await loadSharedEntries(storeRef.current);
+    if (result.access === 'ready') {
+      // A later-started read already landed good data: this one is older.
+      if (seq < refreshSucceededRef.current) return;
+      refreshSucceededRef.current = seq;
+    } else if (seq < refreshAppliedRef.current || seq < refreshSucceededRef.current) {
+      // An older failure never replaces a newer result.
+      return;
+    }
+    refreshAppliedRef.current = Math.max(refreshAppliedRef.current, seq);
     // Update the fold ref NOW, not on the next render: the serial write queue
     // starts the next queued write as soon as this refresh resolves, before
     // React re-renders, and castVote computes its `from` vote from this ref.
     // A stale ref there double-marked a document on a second quick vote.
-    foldedRef.current = foldSharedEntries(result.entries);
-    setEntries(result.entries);
+    const next = foldSharedEntries(result.entries);
+    foldedRef.current = next;
+    setFolded(next);
     setLoadState(result.access);
-    return result;
   }, []);
 
   useEffect(() => {
@@ -178,7 +199,6 @@ export function Community() {
     void refresh();
   }, [refresh, storageReady, token.scopes]);
 
-  const folded: FoldedCommunity = useMemo(() => foldSharedEntries(entries), [entries]);
   const view = useMemo(() => buildCommunityView(folded), [folded]);
   const viewerLedger = useMemo(
     () => buildViewerLedger(folded, viewerId, viewerName),
