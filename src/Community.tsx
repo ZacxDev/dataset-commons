@@ -1234,18 +1234,27 @@ function ContributeForm(props: {
   onContribute: (input: { imageRef: string; imageId?: number; caption: string }) => Promise<string | null>;
   onSuccess?: () => void;
 }) {
-  // Shared with this dataset's viewers once Civitai has scanned it (PG / PG13
-  // only), read back through the gated image read (./item-images.ts). `open()`
-  // resolves `shared: true` only when the server recorded the share; it resolves
-  // `null` on a dismiss (and on the host's review-mode / pre-handshake refusals),
-  // and REJECTS on the host's no-token refusal.
-  const { open: openUpload } = useImageUpload({ share: true });
+  // An upload is PRIVATE unless the contributor ticks "Share" (default off).
+  // A shared one is shown to this dataset's viewers once Civitai has scanned it
+  // (PG / PG13 only), read back through the gated image read (./item-images.ts):
+  // `open()` resolves `shared: true` only when the server recorded the share.
+  // Both resolve `null` on a dismiss (and on the host's review-mode /
+  // pre-handshake refusals), and REJECT on the host's no-token refusal.
+  const { open: openSharedUpload } = useImageUpload({ share: true });
+  const { open: openPrivateUpload } = useImageUpload();
+  const [shareUpload, setShareUpload] = useState(false);
   const { open: openPicker } = useImagePicker();
   const [tab, setTab] = useState<'mine' | 'upload' | 'link'>('mine');
   const [reference, setReference] = useState('');
   const [caption, setCaption] = useState('');
   const [rights, setRights] = useState(false);
-  const [uploaded, setUploaded] = useState<{ imageId: number; url: string; shared: boolean } | null>(null);
+  const [uploaded, setUploaded] = useState<{
+    imageId: number;
+    url: string;
+    shared: boolean;
+    /** Whether the contributor asked for it to be shared. */
+    shareRequested: boolean;
+  } | null>(null);
   const [picked, setPicked] = useState<{ imageId?: number; url: string; source: 'posted' | 'generated' } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -1254,9 +1263,15 @@ function ContributeForm(props: {
   const hasSelection = picked != null || uploaded != null || reference.trim().length > 0;
 
   const upload = async () => {
-    let pickedImage: Awaited<ReturnType<typeof openUpload>>;
+    const shareRequested = shareUpload;
+    let pickedImage: { imageId: number; url: string; shared: boolean } | null;
     try {
-      pickedImage = await openUpload();
+      if (shareRequested) {
+        pickedImage = await openSharedUpload();
+      } else {
+        const privateImage = await openPrivateUpload();
+        pickedImage = privateImage ? { imageId: privateImage.imageId, url: privateImage.url, shared: false } : null;
+      }
     } catch {
       // The host's no-token refusal (or a lost host) rejects: nothing was selected.
       setError(
@@ -1265,7 +1280,7 @@ function ContributeForm(props: {
       return;
     }
     if (!pickedImage) return;
-    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url, shared: pickedImage.shared });
+    setUploaded({ imageId: pickedImage.imageId, url: pickedImage.url, shared: pickedImage.shared, shareRequested });
     setPicked(null);
     setReference(pickedImage.url);
     setError(null);
@@ -1375,16 +1390,26 @@ function ContributeForm(props: {
           </Button>
           <span style={hintStyle} data-testid="dc-contribute-upload-note">
             {' '}
-            Your upload is not posted on Civitai. It is shared with this dataset&apos;s viewers once Civitai has
-            scanned it and rated it PG or PG-13.
+            Your upload is not posted on Civitai, and it stays private to you unless you choose to share it.
           </span>
+          <label style={checkStyle}>
+            <input
+              type="checkbox"
+              checked={shareUpload}
+              onChange={(e) => setShareUpload(e.target.checked)}
+              data-testid="dc-contribute-share"
+            />
+            Share with this dataset&apos;s viewers once Civitai has scanned it and rated it PG or PG-13.
+          </label>
           {uploaded && (
             <span style={hintStyle} data-testid="dc-contribute-uploaded">
               {' '}
               Uploaded image #{uploaded.imageId} selected.{' '}
               {uploaded.shared
                 ? "It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13."
-                : "Kept private: Civitai didn't confirm sharing for this upload, so only you can see it."}
+                : uploaded.shareRequested
+                  ? "Kept private: Civitai didn't confirm sharing for this upload, so only you can see it."
+                  : 'Kept private: only you can see it.'}
             </span>
           )}
         </span>

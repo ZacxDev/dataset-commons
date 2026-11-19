@@ -161,7 +161,7 @@ describe('posted images contributed to a dataset', () => {
     expect(await screen.findByTestId('dc-item-image-mx', {}, { timeout: 5000 })).toHaveAttribute('src', gridUrl(MATURE_X));
   }, 15000);
 
-  it('the Upload tab says the upload is shared with the dataset viewers once scanned, and not posted', async () => {
+  it('the Upload tab says the upload is not posted and stays private unless shared; Share starts off', async () => {
     const user = userEvent.setup();
     const opened = await openDataset({}, {});
     uninstall = opened.uninstall;
@@ -169,12 +169,13 @@ describe('posted images contributed to a dataset', () => {
     await user.click(await screen.findByTestId('dc-add-image'));
     await user.click(screen.getByTestId('dc-contribute-tab-upload'));
     expect(screen.getByTestId('dc-contribute-upload-note').textContent?.replace(/\s+/g, ' ').trim()).toBe(
-      "Your upload is not posted on Civitai. It is shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13.",
+      'Your upload is not posted on Civitai, and it stays private to you unless you choose to share it.',
     );
+    expect(screen.getByTestId('dc-contribute-share')).not.toBeChecked();
   }, 15000);
 });
 
-describe('the Upload tab shares the upload', () => {
+describe('the Upload tab: private by default, shared only when chosen', () => {
   let uninstall: (() => void) | undefined;
   afterEach(() => {
     uninstall?.();
@@ -193,17 +194,45 @@ describe('the Upload tab shares the upload', () => {
     "Uploaded image #7701 selected. It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13.";
   const PRIVATE_COPY =
     "Uploaded image #7701 selected. Kept private: Civitai didn't confirm sharing for this upload, so only you can see it.";
+  const PRIVATE_BY_CHOICE_COPY = 'Uploaded image #7701 selected. Kept private: only you can see it.';
   const REFUSED_COPY =
     "Civitai couldn't take this upload just now, so nothing was added. Try again, or choose an image from My Images or paste a link.";
   const text = (el: HTMLElement) => el.textContent?.replace(/\s+/g, ' ').trim();
 
-  async function clickUpload(user: ReturnType<typeof userEvent.setup>) {
+  async function clickUpload(user: ReturnType<typeof userEvent.setup>, opts: { share: boolean }) {
     await user.click(await screen.findByTestId('dc-add-image'));
     await user.click(screen.getByTestId('dc-contribute-tab-upload'));
+    if (opts.share) await user.click(screen.getByTestId('dc-contribute-share'));
     await user.click(screen.getByTestId('dc-contribute-upload'));
   }
 
-  it('asks the host for a display upload with share: true, and says it will be shared when the host echoes shared: true', async () => {
+  it('with Share left off, asks the host for a plain display upload (no share) and says it is private', async () => {
+    const user = userEvent.setup();
+    const outbound: Array<{ type: string; payload?: Record<string, unknown> }> = [];
+    // The host would echo shared: true if asked: the app must not ask.
+    const opened = await openDataset(
+      {},
+      {
+        cannedImageUpload: UPLOADED,
+        cannedImageUploadShared: true,
+        onOutbound: (message) => outbound.push(message as { type: string; payload?: Record<string, unknown> }),
+      },
+    );
+    uninstall = opened.uninstall;
+
+    await clickUpload(user, { share: false });
+
+    const uploaded = await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
+    expect(text(uploaded)).toBe(PRIVATE_BY_CHOICE_COPY);
+    const uploads = outbound.filter((m) => m.type === 'OPEN_IMAGE_UPLOAD');
+    expect(uploads).toHaveLength(1);
+    const { requestId, ...rest } = uploads[0]!.payload ?? {};
+    expect(typeof requestId).toBe('string');
+    // Not shared: no `share` on the wire at all (the SDK sends it only when true).
+    expect(rest).toEqual({});
+  }, 15000);
+
+  it('with Share ticked, asks the host for a display upload with share: true, and says it will be shared when the host echoes shared: true', async () => {
     const user = userEvent.setup();
     const outbound: Array<{ type: string; payload?: Record<string, unknown> }> = [];
     const opened = await openDataset(
@@ -216,7 +245,7 @@ describe('the Upload tab shares the upload', () => {
     );
     uninstall = opened.uninstall;
 
-    await clickUpload(user);
+    await clickUpload(user, { share: true });
 
     const uploaded = await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
     expect(text(uploaded)).toBe(SHARED_COPY);
@@ -228,12 +257,12 @@ describe('the Upload tab shares the upload', () => {
     expect(rest).toEqual({ share: true });
   }, 15000);
 
-  it('says the upload is kept private when the host answers shared: false', async () => {
+  it('with Share ticked, says the upload is kept private when the host answers shared: false', async () => {
     const user = userEvent.setup();
     const opened = await openDataset({}, { cannedImageUpload: UPLOADED, cannedImageUploadShared: false });
     uninstall = opened.uninstall;
 
-    await clickUpload(user);
+    await clickUpload(user, { share: true });
 
     const uploaded = await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
     expect(text(uploaded)).toBe(PRIVATE_COPY);
@@ -245,7 +274,7 @@ describe('the Upload tab shares the upload', () => {
     const opened = await openDataset({}, { cannedImageUpload: UPLOADED, imageUploadShareRefused: true });
     uninstall = opened.uninstall;
 
-    await clickUpload(user);
+    await clickUpload(user, { share: true });
 
     expect(text(await screen.findByTestId('dc-contribute-error', {}, { timeout: 5000 }))).toContain(REFUSED_COPY);
     expect(screen.getByTestId('dc-contribute-error')).not.toHaveTextContent(/no block token/);
