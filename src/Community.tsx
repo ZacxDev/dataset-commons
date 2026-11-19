@@ -1301,6 +1301,12 @@ function ContributeForm(props: {
   const submit = async () => {
     let imageRef = reference.trim();
     let imageId: number | undefined = uploaded?.imageId;
+    // An upload is stored by its image id ONLY. Its raw edge url is unsigned,
+    // and the shared `items` document (and any snapshot frozen from it) is read
+    // by every viewer, so writing it would hand out an image the contributor
+    // kept private — or one Civitai later rates above a viewer's settings.
+    // Viewers see an uploaded item only through the host's gated read, by id.
+    if (uploaded && !picked) imageRef = '';
     if (picked) {
       imageRef = picked.url;
       imageId = picked.imageId;
@@ -1910,7 +1916,7 @@ function LoraDetail(props: {
    * and the ledger belongs to Community, still mounted), but nothing writes
    * THIS screen's state any more.
    */
-  const finishRun = async (outcome: GenerationRunOutcome) => {
+  const finishRun = async (outcome: GenerationRunOutcome, settle = true) => {
     const live = () => mountedRef.current;
     if (outcome.kind !== 'succeeded') {
       if (!live()) return;
@@ -1934,7 +1940,7 @@ function LoraDetail(props: {
         dropPendingRun(outcome.snapshot.workflowId);
         setError(`That generation ${outcome.snapshot.status}. Check the run before assuming any charge.`);
       }
-      setPhase('idle');
+      if (settle) setPhase('idle');
       return;
     }
     const snap = outcome.snapshot;
@@ -1959,7 +1965,7 @@ function LoraDetail(props: {
     } else if (gross == null) {
       props.onNotice('The generation finished without a reported cost, so no tracked credit was recorded for it.');
     }
-    if (live()) setPhase('idle');
+    if (live() && settle) setPhase('idle');
   };
 
   const onConfirm = async () => {
@@ -1998,7 +2004,10 @@ function LoraDetail(props: {
     try {
       setPhase('polling');
       setError(null);
-      for (const id of pendingRunIds) await finishRun(await pollGenerationToEnd(id, null, pollDeps));
+      // The screen stays "polling" until the LAST pending run is settled.
+      for (const [i, id] of pendingRunIds.entries()) {
+        await finishRun(await pollGenerationToEnd(id, null, pollDeps), i === pendingRunIds.length - 1);
+      }
     } finally {
       runningRef.current = false;
     }

@@ -232,6 +232,33 @@ describe('the Upload tab: private by default, shared only when chosen', () => {
     expect(rest).toEqual({});
   }, 15000);
 
+  for (const share of [false, true]) {
+    it(`an uploaded contribution (Share ${share ? 'ticked' : 'off'}) is stored by image id only: no image url in the shared item`, async () => {
+      const user = userEvent.setup();
+      const opened = await openDataset({}, { cannedImageUpload: UPLOADED, cannedImageUploadShared: share });
+      uninstall = opened.uninstall;
+
+      await clickUpload(user, { share });
+      await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
+      await user.type(screen.getByTestId('dc-contribute-caption'), 'uploaded portrait');
+      await user.click(screen.getByTestId('dc-contribute-rights'));
+      await user.click(screen.getByTestId('dc-contribute-submit'));
+
+      // What every viewer of the dataset can read: the stored item document.
+      await waitFor(
+        async () => {
+          const docs = (await testDocStore().storage.collection('items').list()).items;
+          const mine = docs.map((d) => d.data as Record<string, unknown>).filter((d) => d.caption === 'uploaded portrait');
+          expect(mine).toHaveLength(1);
+          expect(mine[0]!.imageId).toBe(7701);
+          expect(mine[0]!.imageRef).toBe('');
+          expect(JSON.stringify(mine[0])).not.toContain('image.civitai.com');
+        },
+        { timeout: 5000 },
+      );
+    }, 20000);
+  }
+
   it('with Share ticked, asks the host for a display upload with share: true, and says it will be shared when the host echoes shared: true', async () => {
     const user = userEvent.setup();
     const outbound: Array<{ type: string; payload?: Record<string, unknown> }> = [];
