@@ -1307,6 +1307,13 @@ function ContributeForm(props: {
     // kept private — or one Civitai later rates above a viewer's settings.
     // Viewers see an uploaded item only through the host's gated read, by id.
     if (uploaded && !picked) imageRef = '';
+    // Operator decision 2026-11-19: an upload joins a SHARED dataset only when
+    // it is shared — nobody votes on an item they can't see. A private upload
+    // (Share off, or a share Civitai didn't confirm) is refused here.
+    if (uploaded && !picked && !uploaded.shared) {
+      setError(UNSHARED_UPLOAD_REFUSED);
+      return;
+    }
     if (picked) {
       imageRef = picked.url;
       imageId = picked.imageId;
@@ -1396,7 +1403,8 @@ function ContributeForm(props: {
           </Button>
           <span style={hintStyle} data-testid="dc-contribute-upload-note">
             {' '}
-            Your upload is not posted on Civitai, and it stays private to you unless you choose to share it.
+            Your upload is not posted on Civitai, and it stays private to you unless you choose to share it. Only a
+            shared upload can be added to this dataset.
           </span>
           <label style={checkStyle}>
             <input
@@ -1414,8 +1422,8 @@ function ContributeForm(props: {
               {uploaded.shared
                 ? "It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13."
                 : uploaded.shareRequested
-                  ? "Kept private: Civitai didn't confirm sharing for this upload, so only you can see it."
-                  : 'Kept private: only you can see it.'}
+                  ? "Kept private: Civitai didn't confirm sharing for this upload, so only you can see it, and it can't be added to this dataset."
+                  : "Kept private: only you can see it, so it can't be added to this dataset. To contribute it, tick Share and upload it again."}
             </span>
           )}
         </span>
@@ -1506,6 +1514,10 @@ function StoredImageRef(props: { itemId: string; imageRef: string; caption: stri
     </span>
   );
 }
+
+/** Why a private upload can't be added to a shared dataset (operator decision 2026-11-19). */
+const UNSHARED_UPLOAD_REFUSED =
+  "This upload is private, so it can't be added to this dataset: other viewers couldn't see it to vote on it. Tick Share and upload it again to contribute it.";
 
 /** Author display on the upstream civitai-avatar element (initials + name). */
 function AuthorByline(props: { name: string }) {

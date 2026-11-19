@@ -169,7 +169,7 @@ describe('posted images contributed to a dataset', () => {
     await user.click(await screen.findByTestId('dc-add-image'));
     await user.click(screen.getByTestId('dc-contribute-tab-upload'));
     expect(screen.getByTestId('dc-contribute-upload-note').textContent?.replace(/\s+/g, ' ').trim()).toBe(
-      'Your upload is not posted on Civitai, and it stays private to you unless you choose to share it.',
+      'Your upload is not posted on Civitai, and it stays private to you unless you choose to share it. Only a shared upload can be added to this dataset.',
     );
     expect(screen.getByTestId('dc-contribute-share')).not.toBeChecked();
   }, 15000);
@@ -193,8 +193,11 @@ describe('the Upload tab: private by default, shared only when chosen', () => {
   const SHARED_COPY =
     "Uploaded image #7701 selected. It will be shared with this dataset's viewers once Civitai has scanned it and rated it PG or PG-13.";
   const PRIVATE_COPY =
-    "Uploaded image #7701 selected. Kept private: Civitai didn't confirm sharing for this upload, so only you can see it.";
-  const PRIVATE_BY_CHOICE_COPY = 'Uploaded image #7701 selected. Kept private: only you can see it.';
+    "Uploaded image #7701 selected. Kept private: Civitai didn't confirm sharing for this upload, so only you can see it, and it can't be added to this dataset.";
+  const PRIVATE_BY_CHOICE_COPY =
+    "Uploaded image #7701 selected. Kept private: only you can see it, so it can't be added to this dataset. To contribute it, tick Share and upload it again.";
+  const UNSHARED_REFUSED_COPY =
+    "This upload is private, so it can't be added to this dataset: other viewers couldn't see it to vote on it. Tick Share and upload it again to contribute it.";
   const REFUSED_COPY =
     "Civitai couldn't take this upload just now, so nothing was added. Try again, or choose an image from My Images or paste a link.";
   const text = (el: HTMLElement) => el.textContent?.replace(/\s+/g, ' ').trim();
@@ -232,30 +235,53 @@ describe('the Upload tab: private by default, shared only when chosen', () => {
     expect(rest).toEqual({});
   }, 15000);
 
-  for (const share of [false, true]) {
-    it(`an uploaded contribution (Share ${share ? 'ticked' : 'off'}) is stored by image id only: no image url in the shared item`, async () => {
+  async function contributeUpload(user: ReturnType<typeof userEvent.setup>) {
+    await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
+    await user.type(screen.getByTestId('dc-contribute-caption'), 'uploaded portrait');
+    await user.click(screen.getByTestId('dc-contribute-rights'));
+    await user.click(screen.getByTestId('dc-contribute-submit'));
+  }
+  const storedUploads = async () =>
+    (await testDocStore().storage.collection('items').list()).items
+      .map((d) => d.data as Record<string, unknown>)
+      .filter((d) => d.caption === 'uploaded portrait');
+
+  it('a shared upload is contributed by image id only: no image url in the shared item', async () => {
+    const user = userEvent.setup();
+    const opened = await openDataset({}, { cannedImageUpload: UPLOADED, cannedImageUploadShared: true });
+    uninstall = opened.uninstall;
+
+    await clickUpload(user, { share: true });
+    await contributeUpload(user);
+
+    // What every viewer of the dataset can read: the stored item document.
+    await waitFor(
+      async () => {
+        const mine = await storedUploads();
+        expect(mine).toHaveLength(1);
+        expect(mine[0]!.imageId).toBe(7701);
+        expect(mine[0]!.imageRef).toBe('');
+        expect(JSON.stringify(mine[0])).not.toContain('image.civitai.com');
+      },
+      { timeout: 5000 },
+    );
+  }, 20000);
+
+  for (const [name, share, hostShared] of [
+    ['Share left off', false, true],
+    ["Share ticked but Civitai didn't confirm it", true, false],
+  ] as const) {
+    it(`an unshared upload (${name}) is refused for the shared dataset, says why, and stores nothing`, async () => {
       const user = userEvent.setup();
-      const opened = await openDataset({}, { cannedImageUpload: UPLOADED, cannedImageUploadShared: share });
+      const opened = await openDataset({}, { cannedImageUpload: UPLOADED, cannedImageUploadShared: hostShared });
       uninstall = opened.uninstall;
 
       await clickUpload(user, { share });
-      await screen.findByTestId('dc-contribute-uploaded', {}, { timeout: 5000 });
-      await user.type(screen.getByTestId('dc-contribute-caption'), 'uploaded portrait');
-      await user.click(screen.getByTestId('dc-contribute-rights'));
-      await user.click(screen.getByTestId('dc-contribute-submit'));
+      await contributeUpload(user);
 
-      // What every viewer of the dataset can read: the stored item document.
-      await waitFor(
-        async () => {
-          const docs = (await testDocStore().storage.collection('items').list()).items;
-          const mine = docs.map((d) => d.data as Record<string, unknown>).filter((d) => d.caption === 'uploaded portrait');
-          expect(mine).toHaveLength(1);
-          expect(mine[0]!.imageId).toBe(7701);
-          expect(mine[0]!.imageRef).toBe('');
-          expect(JSON.stringify(mine[0])).not.toContain('image.civitai.com');
-        },
-        { timeout: 5000 },
-      );
+      expect(text(await screen.findByTestId('dc-contribute-error', {}, { timeout: 5000 }))).toContain(UNSHARED_REFUSED_COPY);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(await storedUploads()).toEqual([]);
     }, 20000);
   }
 
